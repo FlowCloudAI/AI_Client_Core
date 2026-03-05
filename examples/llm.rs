@@ -1,14 +1,14 @@
 mod senses;
 mod apis;
 
-use flowcloudai_client::llm::types::TurnStatus;
-use flowcloudai_client::llm::types::SessionEvent;
+use crate::senses::Senses;
 use anyhow::Result;
-use futures_util::StreamExt;
+use flowcloudai_client::llm::types::SessionEvent;
+use flowcloudai_client::llm::types::TurnStatus;
 use flowcloudai_client::AIChatSession;
+use futures_util::StreamExt;
 use std::io::{stdin, stdout, Write};
 use tokio::sync::mpsc;
-use crate::senses::Senses;
 
 const SYSTEM_COLOR: &str = "\x1b[94m";
 const REASONING_COLOR: &str = "\x1b[92m";
