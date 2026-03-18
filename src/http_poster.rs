@@ -1,3 +1,4 @@
+use std::time::Duration;
 use anyhow::{Result, anyhow};
 use futures_util::{StreamExt, TryStreamExt};
 use reqwest::Client;
@@ -6,21 +7,25 @@ use serde_json::Value;
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::io::StreamReader;
 
+#[derive(Debug)]
 pub struct HttpPoster {
     client: Client,
 }
 
 impl HttpPoster {
-    pub fn new() -> Self {
-        Self {
-            client: Client::new(),
-        }
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            client: Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(120))
+                .build()?,
+        })
     }
 
     pub async fn post_json(
         &self,
-        url: String,
-        key: String,
+        url: &str,
+        key: &str,
         body: Value,
     ) -> Result<impl futures_util::Stream<Item = Result<String>>> {
         let req = self

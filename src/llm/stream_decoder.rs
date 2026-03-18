@@ -1,8 +1,7 @@
 use std::collections::HashSet;
 use crate::llm::types::{ChatResponseStream, DecoderEvent, DecoderEventPayload, EventInfo, ToolCall, TurnStatus};
 
-#[derive(Default)]
-#[allow(dead_code)]
+#[derive(Default, Debug)]
 pub struct StreamDecoder {
     seq: u64,
     turn_id: u64,
@@ -16,8 +15,6 @@ impl StreamDecoder {
         self.started.clear();
     }
 
-
-    #[allow(dead_code)]
     fn next_info(&mut self) -> EventInfo {
         self.seq += 1;
         EventInfo {
@@ -27,7 +24,6 @@ impl StreamDecoder {
         }
     }
 
-    #[allow(dead_code)]
     /// 处理流式响应
     pub fn decode(&mut self, line: &str) -> Vec<anyhow::Result<DecoderEvent>> {
         let mut out = Vec::new();

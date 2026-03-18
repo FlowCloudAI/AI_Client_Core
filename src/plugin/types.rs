@@ -1,7 +1,5 @@
-use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
-use wasmtime::component::ResourceTable;
-use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[derive(PartialEq)]
@@ -24,8 +22,11 @@ pub struct PluginInfo {
     pub name: String,
     pub description: String,
     pub kind: PluginKind,
+    pub url: String,
+    pub model_list: Vec<String>,
 }
 
+#[derive(Clone)]
 pub struct PluginMeta {
     pub id: String,
     pub name: String,
@@ -33,27 +34,9 @@ pub struct PluginMeta {
     pub author: String,
     pub version: String,
     pub kind: PluginKind,
+    pub url: String,
+    pub model_list: Vec<String>,
 
     pub fcplug_path: PathBuf,
 }
 
-pub struct HostState {
-    pub table: ResourceTable,
-    pub wasi: WasiCtx,
-}
-
-impl WasiView for HostState {
-    fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiCtxView {
-            ctx: &mut self.wasi,
-            table: &mut self.table,
-        }
-    }
-}
-
-pub(crate) mod plugin_bindings {
-    wasmtime::component::bindgen!({
-        path: "wit/plugin.wit",
-        world: "api",
-    });
-}

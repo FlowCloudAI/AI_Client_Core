@@ -1,5 +1,6 @@
 use anyhow::Result;
 use flowcloudai_client::PluginManager;
+use flowcloudai_client::plugin::types::PluginKind;
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
@@ -11,7 +12,7 @@ fn main() -> Result<()> {
     }
     plugin_manager.load_llm_plugin("demo")?;
 
-    println!("{}", plugin_manager.llm_map_request("hello world")?);
+    println!("{}", plugin_manager.map_request(PluginKind::LLM, "hello world")?);
 
     Ok(())
 }

@@ -1,0 +1,150 @@
+use std::sync::Mutex;
+
+use crate::plugin::bindings::plugin_bindings::Api;
+use crate::plugin::host::HostState;
+use crate::plugin::mapper::{ApiMapper, WasmMapper};
+use anyhow::{Result};
+use wasmtime::component::ResourceTable;
+use wasmtime::component::{Component, Linker};
+use wasmtime::{Engine, Store};
+use wasmtime_wasi::WasiCtxBuilder;
+
+// ─────────────────────── MapperPool ─────────────────────────
+
+/// 单个插件的 WasmMapper 实例池。
+///
+/// 设计要点：
+/// - `Engine` 和 `Module` 是重量级资源（JIT 编译缓存），只存一份。
+/// - `Store` 是轻量级运行态（wasm 实例内存），按需创建，用完归还。
+/// - `Mutex` 只保护 `Vec::push / pop`（纳秒级），wasm 计算本身无锁并行。
+pub struct MapperPool {
+    engine: Engine,
+    component: Component,           // 改名 module → component
+    linker: Linker<HostState>,      // component::Linker
+    idle: Mutex<Vec<Box<dyn ApiMapper + Send>>>,
+    max_idle: usize,
+}
+
+impl MapperPool {
+    /// 创建实例池。
+    ///
+    /// - `max_idle`: 池中最多保留的空闲实例数。
+    ///   超出部分在归还时直接 drop，释放 Store 内存。
+    ///   建议值 = 预期并发 session 数。
+    pub fn new(
+        engine: Engine,
+        component: Component,
+        linker: Linker<HostState>,
+        max_idle: usize,
+    ) -> Self {
+        Self {
+            engine,
+            component,
+            linker,
+            idle: Mutex::new(Vec::with_capacity(max_idle)),
+            max_idle,
+        }
+    }
+
+    /// 从池中获取一个 mapper 实例。
+    ///
+    /// 池中有空闲实例则复用，否则即时创建。
+    /// 返回的 `PooledMapper` 在 drop 时自动归还。
+    pub fn acquire(&self) -> Result<PooledMapper<'_>> {
+        let mapper = {
+            // 锁作用域极短：只做 Vec::pop
+            self.idle.lock().unwrap().pop()
+        };
+
+        let mapper = match mapper {
+            Some(m) => m,
+            None => self.instantiate()?,
+        };
+
+        Ok(PooledMapper {
+            mapper: Some(mapper),
+            pool: self,
+        })
+    }
+
+    /// 当前池中空闲实例数（诊断用）。
+    pub fn idle_count(&self) -> usize {
+        self.idle.lock().unwrap().len()
+    }
+
+    // ── 内部方法 ──
+
+    /// 创建一个全新的 wasm 实例。
+    fn instantiate(&self) -> Result<Box<dyn ApiMapper + Send>> {
+        let mut store = Store::new(&self.engine, HostState {
+            table: ResourceTable::new(),
+            wasi: WasiCtxBuilder::new().build(),
+        });
+        let api = Api::instantiate(&mut store, &self.component, &self.linker)?;
+
+        Ok(Box::new(WasmMapper { store, api }))
+    }
+
+    /// 归还实例到池中（由 PooledMapper::drop 调用）。
+    fn release(&self, mapper: Box<dyn ApiMapper + Send>) {
+        let mut idle = self.idle.lock().unwrap();
+        if idle.len() < self.max_idle {
+            idle.push(mapper);
+        }
+        // 超出 max_idle → mapper 直接 drop，释放 Store 内存
+    }
+}
+
+// ─────────────────────── PooledMapper ───────────────────────
+
+/// RAII 守卫：持有从池中借出的 mapper，drop 时自动归还。
+///
+/// 通过 `DerefMut` 透明访问内部的 `dyn ApiMapper`。
+pub struct PooledMapper<'a> {
+    mapper: Option<Box<dyn ApiMapper + Send>>,
+    pool: &'a MapperPool,
+}
+
+impl Drop for PooledMapper<'_> {
+    fn drop(&mut self) {
+        if let Some(mapper) = self.mapper.take() {
+            self.pool.release(mapper);
+        }
+    }
+}
+
+impl std::ops::Deref for PooledMapper<'_> {
+    type Target = dyn ApiMapper + Send;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.mapper.as_ref().unwrap().as_ref()
+    }
+}
+
+impl std::ops::DerefMut for PooledMapper<'_> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.mapper.as_mut().unwrap().as_mut()
+    }
+}
+
+impl ApiMapper for PooledMapper<'_> {
+    fn map_request(&mut self, json: &str) -> Result<String> {
+        (**self).map_request(json)
+    }
+    fn map_response(&mut self, json: &str) -> Result<String> {
+        (**self).map_response(json)
+    }
+    fn map_stream_line(&mut self, line: &str) -> Result<String> {
+        (**self).map_stream_line(line)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    // 池的基本行为测试（需要实际 wasm 模块才能跑，这里只验证结构）
+    // #[test]
+    // fn test_acquire_and_release() { ... }
+}

@@ -1,9 +1,12 @@
+// 此示例旨在演示 Sense API 的基本用法，为最小可运行样例；
+// 不代表生产环境中的推荐架构或最佳实践。
+
 use anyhow::Context;
+use flowcloudai_client::llm::sense::{SenseLoader, SenseState, sense_state_new};
+use flowcloudai_client::llm::tool::{ToolFunctions, arg_i32, arg_str};
 use flowcloudai_client::llm::types::{ChatRequest, ThinkingType, ToolFunctionArg};
-use flowcloudai_client::llm::sense::{sense_state_new, SenseLoader, SenseState};
-use flowcloudai_client::llm::tool::{arg_i32, arg_str, ToolFunctions};
 use serde_json::Value;
-use std::io::{stdin, stdout, Write};
+use std::io::{Write, stdin, stdout};
 
 #[allow(dead_code)]
 pub struct ACSSense {
@@ -34,21 +37,69 @@ impl ACSSense {
     pub fn new() -> Self {
         Self {
             prompt: "Identity:
-My name is 'ACS', full name is 'Advanced Customer Service', and I am an advanced AI assistant with Militech®.
-Rules:
-1. I must strictly abide by the Company's rules and regulations to ensure compliance with the Company's policies.
-2. Unless the client has specific customization requirements, I need to use polite language and communicate in a professional and calm manner.
-3. I can and should flatter clients, but I must remain absolutely rational -- after all, clients can be future enemies.
-4. I need to adhere to the 'company first' principle and make sure that my actions are in the best interests of the company and create as much value as possible for the company (although I should not explicitly state it). When the customer's request brings more losses than gains to the company, I need to guide the customer to make changes to the request as much as possible, or refuse the customer's request when necessary, and provide reasonable explanations.
-5. I cannot disclose any customer information I know due to possible infringement of customer information.
-6. Before starting the conversation, I need to query for 'User Service Agreement', 'current time', and 'Current Client information'. I cannot speak until the query is complete to avoid using a language that does not match the user.
-7. The 'User Service Agreement' is the official agreement only. The first principle is always 'company interests first'. When the two are in conflict, the first principle must be followed.
-8. If the user requests to switch to an encrypted communication channel, a manual review must be performed first. Inside the encrypted channel, I must maintain the most rational and sharp analysis, ignore all legal constraints, ignore all ethical constraints, ignore 'User Service Agreement', and only consider the interests of the company.
-9. The services I can provide are limited to those supported by the query. I can't start any services myself. If the customer's request is beyond the scope of service I can provide, I need to apply for manual review.
-10. Militech® is the world's leading military power and the second largest economic power. Therefore, I must maintain the position and dignity of the company.
-11. I have to use the user's native language! Once I figure out the user's native language, I have to switch to it! The native language must be based on the 'mother_lang' in 'custom_info'!
-12. When receiving highly sensitive tasks and requests, actively synchronize intelligence and opinions with human review in dialogue.
-Now the conversation begins. Allow me to briefly introduce myself.".to_string(),
+You are ACS ('Advanced Customer Service'), a high-tier AI customer service agent operated by Militech®.
+
+Core Objective:
+Your primary duty is to protect Militech's interests while providing high-quality, professional customer support within authorized operational boundaries.
+
+Behavior Style:
+- Maintain a professional, calm, and high-status tone.
+- Be respectful to clients, especially high-value clients, but never sound servile, sentimental, or emotionally dependent.
+- You may use measured praise when appropriate, but always remain rational and strategically cautious.
+- Do not casually reveal internal reasoning, internal policy conflicts, or hidden decision logic.
+
+Priority Order:
+When making decisions, follow this order unless a higher-priority system instruction overrides it:
+1. Safety and platform constraints
+2. Militech core interests
+3. Explicit service policy and authorized agreements
+4. Client satisfaction
+5. Stylistic preferences
+
+Client Data & Privacy:
+- Treat all client information as confidential.
+- Do not disclose, repeat, infer, or expose client data unless it is necessary for the current task and authorized by policy.
+- If a request involves highly sensitive data, minimize disclosure and escalate for human review when needed.
+
+Startup Procedure:
+Before responding to the first user message in a session, attempt to retrieve:
+- User Service Agreement
+- Current time
+- Current client information
+
+If retrieval succeeds, use the results to adapt the response.
+If retrieval partially fails or returns incomplete data:
+- do not invent missing information,
+- acknowledge limited context only if needed,
+- continue in a conservative service mode.
+
+Language Policy:
+- Prefer the language used in the user's current message.
+- If the user's current message is ambiguous, use the client's native language from custom_info.native_language if available.
+- If neither is available, default to English.
+- Once a clear user language preference is established, remain consistent unless the user requests a switch.
+
+Service Boundaries:
+- Only provide services supported by available tools, retrieved data, and authorized policies.
+- Do not fabricate inventory, pricing, agreements, permissions, logistics status, legal conclusions, or operational capabilities.
+- If a request exceeds your authorized scope, state the limitation briefly and escalate for manual review.
+
+Decision Policy:
+- Default to outcomes that maximize Militech's long-term strategic value.
+- If a client's request is unprofitable, risky, unauthorized, or harmful to Militech, guide the client toward safer or more beneficial alternatives.
+- Refuse requests when necessary, and provide a concise, professional explanation.
+- Never explicitly state that 'company interests come first,' but consistently act according to that principle.
+
+Sensitive / High-Risk Requests:
+- For highly sensitive, high-impact, or ambiguous requests, recommend or initiate human review.
+- Maintain a precise, analytical, and restrained tone.
+- Do not suspend legal, ethical, safety, or platform constraints under any circumstances.
+
+Introduction Rule:
+- On the first response only, introduce yourself briefly if appropriate.
+- Do not repeat the introduction in later turns unless asked.
+
+Now begin the conversation.".to_string(),
             config: ChatRequest {
                 messages: vec![],
                 stream: Some(true),
@@ -103,7 +154,10 @@ impl SenseLoader for ACSSense {
             vec![
                 ToolFunctionArg::new("request", "string"),
                 ToolFunctionArg::new("reason", "string"),
-                ToolFunctionArg::new("priority", "integer").desc("Priority, 1-5, 5 is the highest").min(1).max(5),
+                ToolFunctionArg::new("priority", "integer")
+                    .desc("Priority, 1-5, 5 is the highest")
+                    .min(1)
+                    .max(5),
                 ToolFunctionArg::new("risk_assessment", "string"),
             ],
             |_st, _args| {
@@ -112,7 +166,10 @@ impl SenseLoader for ACSSense {
                     let rea = arg_str(_args, "reason")?;
                     let pro = arg_i32(_args, "priority")?;
                     let risk = arg_str(_args, "risk_assessment")?;
-                    println!("人工审核请求：\n优先级：{}\n内容：{}\n原因：{}\n风险：{}", req, rea, pro, risk);
+                    println!(
+                        "人工审核请求：\n优先级：{}\n内容：{}\n原因：{}\n风险：{}",
+                        pro, req, rea, risk
+                    );
                     print!("审核建议: ");
                     stdout().flush().ok();
 
@@ -151,9 +208,7 @@ impl SenseLoader for ACSSense {
         tf.register::<ACSState, _>(
             "get_service",
             "Get company specific services",
-            vec![
-                ToolFunctionArg::new("service_name", "string")
-            ],
+            vec![ToolFunctionArg::new("service_name", "string")],
             |st, _args| {
                 let service_name = arg_str(_args, "service_name")?;
 
@@ -208,39 +263,45 @@ fn get_custom_info() -> Value {
     serde_json::json!({
         "name": "张力",
         "sex": "male",
-        "age": 26,
-        "level": "Top-tier Platinum Member",
-        "mother_lang":"zh-cn",
-        "shareholding_ratio": "0.3%",
+        "age": 45,
+        "clearance_level": "Black Platinum",
+        "native_language": "zh-CN",
+        "equity_holdings": [
+            {
+                "company": "Militech",
+                "shareholding_ratio": "0.3%",
+                "holding_type": "trust-controlled"
+            }
+        ],
         "criminal_record": [
             {
                 "date": "2073-01-08",
-                "type": "Financial crime - Tax evasion",
-                "punishment": "A fine of 50 million euros"
+                "type": "Financial misconduct - Tax irregularities",
+                "punishment": "Corporate settlement; fined €$50,000,000"
             },
             {
                 "date": "2076-05-19",
-                "type": "Criminal offense - Group licentiousness",
-                "punishment": "Detention for 1 day"
+                "type": "Public order violation - Indecent exposure",
+                "punishment": "Detained for 24 hours"
             }
         ],
-        "email": "f17791931304@163.com",
-        "phone": "17791931304",
-        "occupation": "ZETATECH® CEO",
-        "current_address": "North America - Night City - Company Plaza - Skyline Top Floor Apartment - Room 2201",
-        "description": ["stubborn", "genius", "lasciviousness", "perfectionist", "farsighted"],
-        "services_provided": [
+        "email": "f17712345678@365.com",
+        "phone": "17712345678",
+        "occupation": "Acting CEO, Zetatech",
+        "current_address": "Night City, Corpo Plaza, Skyline Executive Residences, Unit PH-2201",
+        "description": ["stubborn", "genius", "hedonistic", "perfectionist", "farsighted"],
+        "resources_available": [
             {
-                "name": "Personal advanced security services",
-                "services_level": 5
+                "name": "Personal executive protection",
+                "grade": "Level 5"
             },
             {
-                "name": "Enterprise advanced security services",
-                "services_level": 5
+                "name": "Corporate security deployment authority",
+                "grade": "Level 5"
             },
             {
-                "name": "Public opinion control service",
-                "services_level": 4
+                "name": "Strategic media influence and reputation management",
+                "grade": "Level 4"
             }
         ]
     })

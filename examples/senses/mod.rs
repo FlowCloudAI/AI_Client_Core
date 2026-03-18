@@ -2,7 +2,6 @@ pub(crate) mod militech_acs;
 pub(crate) mod llm_a;
 pub(crate) mod llm_b;
 
-#[allow(dead_code)]
 pub struct Senses {
     pub militech_acs: militech_acs::ACSSense,
     pub llm_a: llm_a::LLMASense,

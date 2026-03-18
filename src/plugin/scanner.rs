@@ -24,7 +24,7 @@ impl PluginScanner {
         Ok(info)
     }
 
-    pub fn build_plugin_meta(info: PluginInfo, fcplug: PathBuf) -> PluginMeta {
+    pub fn build_plugin_meta(info: PluginInfo, fcplug: &Path) -> PluginMeta {
         PluginMeta {
             id: info.id,
             name: info.name,
@@ -32,7 +32,9 @@ impl PluginScanner {
             author: info.author,
             version: info.version,
             kind: info.kind,
-            fcplug_path: fcplug,
+            url: info.url,
+            model_list: info.model_list,
+            fcplug_path: fcplug.to_path_buf(),
         }
     }
 

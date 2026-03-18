@@ -1,10 +1,14 @@
+// wit/plugin.wit
 package mapper:plugin;
 
 interface mapper {
-  map-request: func(input: string) -> string;
-  map-response: func(input: string) -> string;
+    map-request: func(json: string) -> string;
+
+    map-response: func(json: string) -> string;
+
+    map-stream-line: func(line: string) -> string;
 }
 
 world api {
-  export mapper;
+    export mapper;
 }

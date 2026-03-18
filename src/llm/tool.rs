@@ -6,7 +6,6 @@ use std::sync::Arc;
 use crate::llm::sense::SenseState;
 use crate::llm::types::ToolFunctionArg;
 
-#[allow(dead_code)]
 pub fn arg_i32(args: &Value, key: &str) -> anyhow::Result<i32> {
     args.get(key)
         .and_then(|v| v.as_i64())
@@ -14,7 +13,6 @@ pub fn arg_i32(args: &Value, key: &str) -> anyhow::Result<i32> {
         .ok_or_else(|| anyhow::anyhow!("缺少或非法参数: {}", key))
 }
 
-#[allow(dead_code)]
 pub fn arg_str<'a>(args: &'a Value, key: &str) -> anyhow::Result<&'a str> {
     args.get(key)
         .and_then(|v| v.as_str())
@@ -27,13 +25,11 @@ type Handler = Arc<
     + Sync,
 >;
 
-#[allow(dead_code)]
 pub struct ToolSpec {
     pub schema: Value,
     pub handler: Handler,
 }
 
-#[allow(dead_code)]
 pub struct ToolFunctions {
     registry: HashMap<String, ToolSpec>,
     state: HashMap<TypeId, Box<dyn Any + Send + Sync + 'static>>,
@@ -80,8 +76,7 @@ impl ToolFunctions {
 
         (required, properties)
     }
-
-    #[allow(dead_code)]
+    
     pub fn register<T, F>(
         &mut self,
         name: &str,
@@ -113,8 +108,7 @@ impl ToolFunctions {
 
         self._register(name, description, properties, required, wrapped);
     }
-
-    #[allow(dead_code)]
+    
     pub fn register_async<T, F>(
         &mut self,
         name: &str,
@@ -179,13 +173,11 @@ impl ToolFunctions {
             },
         );
     }
-
-    #[allow(dead_code)]
+    
     pub fn put_state<T: Any + Send + 'static + Sync>(&mut self, v: T) {
         self.state.insert(TypeId::of::<T>(), Box::new(v));
     }
-
-    #[allow(dead_code)]
+    
     pub fn schemas(&self) -> Option<Vec<Value>> {
         if self.registry.is_empty() {
             return None;
@@ -194,8 +186,7 @@ impl ToolFunctions {
         v.sort_by_key(|s| s["function"]["name"].as_str().unwrap_or("").to_string());
         Some(v)
     }
-
-    #[allow(dead_code)]
+    
     pub async fn conduct(
         &mut self,
         func_name: &str,

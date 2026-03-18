@@ -1,14 +1,14 @@
-mod senses;
 mod apis;
+mod senses;
 
-use crate::senses::Senses;
 use anyhow::Result;
 use flowcloudai_client::llm::types::SessionEvent;
 use flowcloudai_client::llm::types::TurnStatus;
-use flowcloudai_client::AIChatSession;
+use flowcloudai_client::FlowCloudAIClient;
 use futures_util::StreamExt;
 use std::io::{stdin, stdout, Write};
 use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 const SYSTEM_COLOR: &str = "\x1b[94m";
 const REASONING_COLOR: &str = "\x1b[92m";
@@ -20,29 +20,42 @@ const COLOR_RESET: &str = "\x1b[0m";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let senses: Senses = Senses::new();
+    // ── 初始化客户端，扫描 ./plugins 目录 ──
+    let mut client = FlowCloudAIClient::new()?;
 
-    let bot = AIChatSession::new()
-        .set_api(
-            apis::QWEN_LLM.url,
-            apis::QWEN_LLM.key
-        )
-        .load_sense(senses.militech_acs).await?
-        .set_model("qwen3.5-plus")
-        .set_thinking(true)
-        .set_frequency_penalty(0.0)
-        .set_stream(true);
+    // load_plugin 现在只需要 id，Kind 由插件 manifest 声明
+    client.load_plugin("deepseek-llm")?;
+
+    // api_key 在创建 session 时传入；plugin_id=None 表示直通模式
+    let mut session = client.create_llm_session("deepseek-llm", apis::DEEPSEEK.key)?;
+
+    session.load_sense(senses::Senses::new().militech_acs).await?
+        .set_model("deepseek-chat").await
+        .set_thinking(false).await
+        .set_stream(true).await
+        .set_temperature(0.75).await;
 
     let (input_tx, input_rx) = mpsc::channel::<String>(32);
 
-    let (mut event_stream, _handle) = bot.run(input_rx);
+    // run() 返回事件流 + 句柄；句柄用于在任意时刻修改对话参数
+    let (event_stream, _handle) = session.run(input_rx);
 
+
+
+    run_chat_loop(event_stream, input_tx).await?;
+
+    Ok(())
+}
+
+async fn run_chat_loop(
+    mut events: ReceiverStream<SessionEvent>,
+    input_tx: mpsc::Sender<String>,
+) -> Result<()> {
     let mut is_reasoning = false;
 
-    while let Some(ev) = event_stream.next().await {
+    while let Some(ev) = events.next().await {
         match ev {
             SessionEvent::NeedInput => {
-                // 只在 Session 需要输入时读 stdin
                 print!("User: ");
                 stdout().flush().ok();
 
@@ -54,7 +67,6 @@ async fn main() -> Result<()> {
                     break;
                 }
 
-                // 发送给 Session；如果 Session 已经结束，会 Err
                 if input_tx.send(s).await.is_err() {
                     break;
                 }
@@ -67,7 +79,6 @@ async fn main() -> Result<()> {
 
             SessionEvent::ReasoningDelta(delta) => {
                 is_reasoning = true;
-                // UI 层决定怎么展示 reasoning（这里用绿色）
                 print!("{}{}{}", REASONING_COLOR, delta, COLOR_RESET);
                 stdout().flush().ok();
             }
@@ -82,21 +93,33 @@ async fn main() -> Result<()> {
             }
 
             SessionEvent::ToolCall { index, name } => {
-                println!("\n{}[ToolCall] index={}\nname={}{}", TOOL_CALL_COLOR, index, name, COLOR_RESET);
+                println!(
+                    "\n{}[ToolCall] index={}\nname={}{}",
+                    TOOL_CALL_COLOR, index, name, COLOR_RESET
+                );
             }
 
             SessionEvent::ToolResult { index, output, is_error } => {
                 if is_error {
-                    println!("\n{}[ToolResult:{}ERR{}] index={}{}\n{}{}", TOOL_CALL_COLOR, TOOL_ERROR_COLOR, TOOL_CALL_COLOR, index, TOOL_COLOR, output, COLOR_RESET);
+                    println!(
+                        "\n{}[ToolResult:{}ERR{}] index={}{}\n{}{}",
+                        TOOL_CALL_COLOR, TOOL_ERROR_COLOR, TOOL_CALL_COLOR,
+                        index, TOOL_COLOR, output, COLOR_RESET
+                    );
                 } else {
-                    println!("\n{}[ToolResult:{}OK{}] index={}{}\n{}{}", TOOL_CALL_COLOR, TOOL_OK_COLOR, TOOL_CALL_COLOR, index, TOOL_COLOR, output, COLOR_RESET);
+                    println!(
+                        "\n{}[ToolResult:{}OK{}] index={}{}\n{}{}",
+                        TOOL_CALL_COLOR, TOOL_OK_COLOR, TOOL_CALL_COLOR,
+                        index, TOOL_COLOR, output, COLOR_RESET
+                    );
                 }
             }
 
             SessionEvent::TurnEnd { status } => {
-                println!("\n{}--- TurnEnd: {:?} ---{}", SYSTEM_COLOR, status, COLOR_RESET);
-
-                // 你可以在 cancelled/interrupted 时直接退出 UI
+                println!(
+                    "\n{}--- TurnEnd: {:?} ---{}",
+                    SYSTEM_COLOR, status, COLOR_RESET
+                );
                 match status {
                     TurnStatus::Cancelled | TurnStatus::Interrupted => break,
                     _ => {}
@@ -109,5 +132,6 @@ async fn main() -> Result<()> {
             }
         }
     }
+
     Ok(())
 }

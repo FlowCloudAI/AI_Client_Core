@@ -6,7 +6,9 @@ use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Engine, Store};
 use wasmtime_wasi::WasiCtxBuilder;
 use zip::ZipArchive;
-use crate::plugin::types::{plugin_bindings, HostState, PluginKind, PluginMeta};
+use crate::plugin::bindings::plugin_bindings;
+use crate::plugin::host::HostState;
+use crate::plugin::types::{PluginKind, PluginMeta};
 
 pub struct LoadedPlugin {
     pub kind: PluginKind,
@@ -30,6 +32,10 @@ impl LoadedPlugin {
         }
     }
 
+    pub fn is_loaded(&self) -> bool {
+        matches!(self.state, PluginState::Loaded { .. })
+    }
+
     pub fn icon(&self) -> &[u8] {
         match &self.state {
             PluginState::Loaded { icon, .. } => icon,
@@ -51,7 +57,8 @@ impl LoadedPlugin {
         &mut self,
         plugins: &HashMap<String, PluginMeta>,
         linker: &Linker<HostState>,
-        engine: &Engine, id: &str
+        engine: &Engine, 
+        id: &str
     ) -> anyhow::Result<()> {
 
         let meta = plugins
@@ -120,4 +127,14 @@ impl LoadedPlugin {
         }
     }
 
+    pub fn map_stream_line(&mut self, line: &str) -> anyhow::Result<String> {
+        match &mut self.state {
+            PluginState::Loaded { store, api, .. } => {
+                let mapper = api.mapper_plugin_mapper();
+                let result = mapper.call_map_stream_line(store, line)?;
+                Ok(result)
+            }
+            PluginState::Unloaded => Err(anyhow!("plugin not loaded"))
+        }
+    }
 }
