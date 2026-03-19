@@ -7,8 +7,9 @@ pub mod client;
 pub mod tool;
 pub mod orchestrator;
 pub mod sense;
+pub mod audio;
 
-pub const SUPPORTED_ABI_VERSION: u32 = 1;
+pub const SUPPORTED_ABI_VERSION: u32 = 2;
 
 pub use plugin::manager::PluginManager;
 pub use plugin::scanner::PluginScanner;

@@ -6,6 +6,21 @@ use std::sync::Arc;
 
 use crate::llm::types::ToolFunctionArg;
 
+// ─────────────────────── 辅助函数 ───────────────────────────
+
+pub fn arg_i32(args: &Value, key: &str) -> anyhow::Result<i32> {
+    args.get(key)
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32)
+        .ok_or_else(|| anyhow::anyhow!("缺少或非法参数: {}", key))
+}
+
+pub fn arg_str<'a>(args: &'a Value, key: &str) -> anyhow::Result<&'a str> {
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("缺少或非法参数: {}", key))
+}
+
 // ─────────────────────── Handler 类型 ───────────────────────
 
 /// 关键变化：`&ToolRegistry`（不是 `&mut`）。
@@ -73,7 +88,7 @@ impl ToolRegistry {
 
         let wrapped: Handler = Arc::new(move |reg, args| {
             let arc = reg
-                .state_or_err::<crate::llm::sense::SenseState<T>>()
+                .state_or_err::<crate::sense::SenseState<T>>()
                 .map(|x| x.clone());
             let handler = Arc::clone(&handler);
 
@@ -110,7 +125,7 @@ impl ToolRegistry {
 
         let wrapped: Handler = Arc::new(move |reg, args| {
             let arc = reg
-                .state_or_err::<crate::llm::sense::SenseState<T>>()
+                .state_or_err::<crate::sense::SenseState<T>>()
                 .map(|x| x.clone());
             let handler = Arc::clone(&handler);
 
@@ -192,6 +207,8 @@ impl ToolRegistry {
         required: Vec<String>,
         handler: Handler,
     ) {
+        println!("[debug] inserting tool: {}", name);
+        
         let pros = properties.unwrap_or(serde_json::json!({}));
 
         self.tools.insert(

@@ -3,13 +3,13 @@ use crate::llm::accumulator::ToolCallAccumulator;
 use crate::llm::config::SessionConfig;
 use crate::llm::handle::SessionHandle;
 use crate::llm::stream_decoder::StreamDecoder;
-use crate::llm::tool::ToolFunctions;
 use crate::llm::types::{
-    ChatRequest, ChatResponse, DecoderEventPayload, Message, SessionEvent, ThinkingType, ToolCall
-    , TurnStatus,
+    ChatRequest, ChatResponse, DecoderEventPayload, Message, SessionEvent, ThinkingType, ToolCall,
+    TurnStatus,
 };
-use crate::plugin::mapper::{ApiMapper, PassthroughMapper};
-use crate::plugin::registry::PluginRegistry;
+use crate::orchestrator::{AssembledTurn, TaskContext, TaskOrchestrator};
+use crate::plugin::pipeline::ApiPipeline;
+use crate::tool::registry::ToolRegistry;
 use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
 use serde_json::Value;
@@ -36,19 +36,18 @@ pub struct LLMSession {
     conversation: Arc<RwLock<ChatRequest>>,
 
     /// 工具函数管理器
-    tool: ToolFunctions,
+    tool_registry: Arc<ToolRegistry>,
 
     /// 连接配置
     config: SessionConfig,
 
     /// 插件注册中心（共享，只读，通过 acquire 借出 mapper）
-    registry: Arc<PluginRegistry>,
-
-    /// 当前使用的插件 ID（None = 直通模式）
-    plugin_id: Option<String>,
+    pipeline: ApiPipeline,
 
     /// 当前轮次 ID
     turn_id: u64,
+
+    orchestrator: Option<TaskOrchestrator>,
 }
 
 // ── 构建 & 配置 ──
@@ -56,18 +55,18 @@ pub struct LLMSession {
 impl LLMSession {
     pub fn new(
         config: SessionConfig,
-        registry: Arc<PluginRegistry>,
-        plugin_id: Option<String>,
+        pipeline: ApiPipeline,
+        tool_registry: Arc<ToolRegistry>,
     ) -> Result<Self> {
         let client = HttpPoster::new()?;
         Ok(Self {
             client,
             conversation: Arc::new(RwLock::new(ChatRequest::default())),
-            tool: ToolFunctions::new(),
+            tool_registry,
             config,
-            registry,
-            plugin_id,
+            pipeline,
             turn_id: 0,
+            orchestrator: None,
         })
     }
 
@@ -79,23 +78,22 @@ impl LLMSession {
         self.config.base_url = url.to_string();
     }
 
-    pub async fn load_sense(
-        &mut self,
-        sense: impl crate::llm::sense::SenseLoader,
-    ) -> Result<&mut Self> {
+    pub async fn load_sense(&mut self, sense: impl crate::sense::Sense) -> Result<&mut Self> {
         {
             let mut conv = self.conversation.write().await;
-            if let Some(request) = sense.get_request() {
+            if let Some(request) = sense.default_request() {
                 *conv = request;
             }
-            if let Some(prompts) = sense.get_prompt() {
-                for prompt in prompts {
-                    conv.messages.push(Message::system(prompt));
-                }
+            for prompt in sense.prompts() {
+                conv.messages.push(Message::system(prompt));
             }
         }
-        sense.install_tool(&mut self.tool)?;
-        self.conversation.write().await.tools = self.tool.schemas();
+        self.conversation.write().await.tools = self.tool_registry.schemas();
+        let schemas = self.tool_registry.schemas();
+        println!(
+            "[debug] tool schemas count: {:?}",
+            schemas.as_ref().map(|v| v.len())
+        );
         Ok(self)
     }
 
@@ -165,9 +163,9 @@ impl LLMSession {
     pub fn run(
         self,
         input_rx: mpsc::Receiver<String>,
+        ctx_rx: Option<mpsc::Receiver<TaskContext>>,
     ) -> (ReceiverStream<SessionEvent>, SessionHandle) {
-        let (event_tx, event_rx) =
-            mpsc::channel::<SessionEvent>(self.config.event_buffer);
+        let (event_tx, event_rx) = mpsc::channel::<SessionEvent>(self.config.event_buffer);
 
         let handle = SessionHandle {
             inner: Arc::clone(&self.conversation),
@@ -180,10 +178,8 @@ impl LLMSession {
                 .expect("failed to create session runtime");
 
             rt.block_on(async move {
-                if let Err(e) = self.drive(input_rx, event_tx.clone()).await {
-                    let _ = event_tx
-                        .send(SessionEvent::Error(format!("{:#}", e)))
-                        .await;
+                if let Err(e) = self.drive(input_rx, ctx_rx, event_tx.clone()).await {
+                    let _ = event_tx.send(SessionEvent::Error(format!("{:#}", e))).await;
                 }
             });
         });
@@ -195,17 +191,54 @@ impl LLMSession {
 // ── 核心状态机 ──
 
 impl LLMSession {
+    async fn apply_assembled(&self, base: &ChatRequest, turn: &AssembledTurn) -> ChatRequest {
+        let mut req = base.clone();
+
+        // 注入上下文 messages（在已有消息之前、用户最新消息之前）
+        for msg in &turn.context_messages {
+            req.messages.insert(req.messages.len().saturating_sub(1), Message::system(msg.clone()));
+        }
+
+        // 覆盖工具 schemas
+        if turn.tool_schemas.is_some() {
+            req.tools = turn.tool_schemas.clone();
+        }
+
+        // 覆盖参数
+        if let Some(ref model) = turn.model_override {
+            req.model = model.clone();
+        }
+        if let Some(temp) = turn.temperature_override {
+            req.temperature = Some(temp);
+        }
+        if let Some(max) = turn.max_tokens_override {
+            req.max_tokens = Some(max);
+        }
+
+        req
+    }
+
     async fn drive(
         mut self,
         mut input_rx: mpsc::Receiver<String>,
+        mut ctx_rx: Option<mpsc::Receiver<TaskContext>>,
         event_tx: mpsc::Sender<SessionEvent>,
     ) -> Result<()> {
+        let mut current_ctx = TaskContext::default();
+
         loop {
             if self.should_wait_for_user().await {
                 event_tx.send(SessionEvent::NeedInput).await?;
                 match input_rx.recv().await {
                     Some(input) => self.add_message(Message::user(input)).await,
                     None => return Ok(()),
+                }
+            }
+
+            // 每轮开始前尝试更新 context（非阻塞）
+            if let Some(ref mut rx) = ctx_rx {
+                while let Ok(ctx) = rx.try_recv() {
+                    current_ctx = ctx;
                 }
             }
 
@@ -218,6 +251,14 @@ impl LLMSession {
 
             let req = self.snapshot().await;
 
+            // Orchestrator 装配（如果有）
+            let req = if let Some(ref orch) = self.orchestrator {
+                let assembled = orch.assemble(&current_ctx)?;
+                self.apply_assembled(&req, &assembled).await
+            } else {
+                req
+            };
+
             let (content, reasoning, tool_calls, finish_reason, turn_status) =
                 self.send_and_process(&req, &event_tx).await?;
 
@@ -226,7 +267,7 @@ impl LLMSession {
                 Some(reasoning).filter(|s| !s.is_empty()),
                 tool_calls.clone(),
             ))
-                .await;
+            .await;
 
             if finish_reason.as_deref() == Some("tool_calls") {
                 if let Some(calls) = tool_calls {
@@ -264,37 +305,22 @@ impl LLMSession {
 // ── 插件映射（核心变化点） ──
 
 impl LLMSession {
-    /// 获取 mapper：有插件从池中借，无插件直通。
-    /// 返回的 mapper 实现了 DerefMut<Target = dyn ApiMapper>。
-    fn acquire_mapper(&self) -> Result<Box<dyn ApiMapper + Send + '_>> {
-        match &self.plugin_id {
-            Some(id) if self.registry.is_loaded(id) => {
-                let pooled = self.registry.acquire(id)?;
-                Ok(Box::new(pooled))
-            }
-            _ => Ok(Box::new(PassthroughMapper)),
-        }
-    }
 
     /// 请求转换：acquire mapper → map → release（自动）。
     fn prepare_request(&self, req: &ChatRequest) -> Result<Value> {
         let json = serde_json::to_value(req)?;
-        let mut mapper = self.acquire_mapper()?;
-        let raw = serde_json::to_string(&json)?;
-        let mapped = mapper.map_request(&raw)?;
-        Ok(serde_json::from_str(&mapped)?)
+        self.pipeline.prepare_request_json(&json)
     }
+
 
     /// 响应转换。
     fn normalize_response(&self, raw: &str) -> Result<String> {
-        let mut mapper = self.acquire_mapper()?;
-        mapper.map_response(raw)
+        self.pipeline.map_response(raw)
     }
 
     /// 流式行转换。
     fn normalize_stream_line(&self, line: &str) -> Result<String> {
-        let mut mapper = self.acquire_mapper()?;
-        mapper.map_stream_line(line)
+        self.pipeline.map_stream_line(line)
     }
 }
 
@@ -522,10 +548,11 @@ impl LLMSession {
                 serde_json::from_str(args_str)?
             };
 
-            let (output, is_error) = match self.tool.conduct(func_name, Some(&args_v)).await {
-                Ok(o) => (o, false),
-                Err(e) => (format!("工具执行失败: {}", e), true),
-            };
+            let (output, is_error) =
+                match self.tool_registry.conduct(func_name, Some(&args_v)).await {
+                    Ok(o) => (o, false),
+                    Err(e) => (format!("工具执行失败: {}", e), true),
+                };
 
             let tool_call_id = Self::synth_tool_call_id(self.turn_id, call.index);
 

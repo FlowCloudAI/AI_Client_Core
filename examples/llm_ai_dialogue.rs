@@ -5,7 +5,6 @@ use anyhow::Result;
 use flowcloudai_client::llm::types::{SessionEvent, TurnStatus};
 use flowcloudai_client::FlowCloudAIClient;
 use futures_util::StreamExt;
-use senses::Senses;
 use std::io::{stdout, Write};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -33,15 +32,20 @@ enum Active {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let senses = Senses::new();
+    let senses_a = senses::llm_a::LLMASense::new();
+    let senses_b = senses::llm_b::LLMBSense::new();
 
     // ── 初始化客户端与插件 ──
     let mut client = FlowCloudAIClient::new()?;
+    
+    client.install_sense(&senses_a)?;
+    client.install_sense(&senses_b)?;
+    
     client.load_plugin("deepseek-llm")?;
 
     // ── Bot A ──
     let mut bot_a = client.create_llm_session("deepseek-llm", apis::DEEPSEEK.key)?;
-    bot_a.load_sense(senses.llm_b).await?
+    bot_a.load_sense(senses_a).await?
         .set_model("deepseek-chat").await
         .set_thinking(false).await
         .set_stream(true).await
@@ -49,7 +53,7 @@ async fn main() -> Result<()> {
 
     // ── Bot B ──
     let mut bot_b = client.create_llm_session("deepseek-llm", apis::DEEPSEEK.key)?;
-    bot_b.load_sense(senses.llm_a).await?
+    bot_b.load_sense(senses_b).await?
         .set_model("deepseek-chat").await
         .set_thinking(false).await
         .set_stream(true).await;
@@ -57,8 +61,8 @@ async fn main() -> Result<()> {
     let (a_tx, a_rx) = mpsc::channel::<String>(32);
     let (b_tx, b_rx) = mpsc::channel::<String>(32);
 
-    let (a_stream, _a_handle) = bot_a.run(a_rx);
-    let (b_stream, _b_handle) = bot_b.run(b_rx);
+    let (a_stream, _a_handle) = bot_a.run(a_rx, None);
+    let (b_stream, _b_handle) = bot_b.run(b_rx, None);
 
     run_chat_loop(a_stream, b_stream, a_tx, b_tx).await?;
 

@@ -10,4 +10,4 @@ pub mod manager;
 pub mod scanner;
 
 pub mod loaded;
-// PluginManager（扫描 ./plugins 目录，编译 wasm）
+pub mod pipeline;

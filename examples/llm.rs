@@ -23,22 +23,30 @@ async fn main() -> Result<()> {
     // ── 初始化客户端，扫描 ./plugins 目录 ──
     let mut client = FlowCloudAIClient::new()?;
 
+    let acs_sense = senses::militech_acs::ACSSense::new();
+
     // load_plugin 现在只需要 id，Kind 由插件 manifest 声明
     client.load_plugin("deepseek-llm")?;
+
+    // 先安装工具到全局 ToolRegistry
+    client.install_sense(&acs_sense)?;
 
     // api_key 在创建 session 时传入；plugin_id=None 表示直通模式
     let mut session = client.create_llm_session("deepseek-llm", apis::DEEPSEEK.key)?;
 
-    session.load_sense(senses::Senses::new().militech_acs).await?
+    session
+        .load_sense(acs_sense).await?
         .set_model("deepseek-chat").await
         .set_thinking(false).await
         .set_stream(true).await
         .set_temperature(0.75).await;
 
+    println!("[debug] after install_sense, tool count: {:?}", client.tool_registry().tool_names());
+
     let (input_tx, input_rx) = mpsc::channel::<String>(32);
 
     // run() 返回事件流 + 句柄；句柄用于在任意时刻修改对话参数
-    let (event_stream, _handle) = session.run(input_rx);
+    let (event_stream, _handle) = session.run(input_rx, None);
 
 
 

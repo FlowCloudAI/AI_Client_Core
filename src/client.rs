@@ -1,31 +1,27 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
-
+use crate::image::ImageSession;
 use crate::llm::config::SessionConfig;
 use crate::llm::session::LLMSession;
+use crate::orchestrator::TaskOrchestrator;
 use crate::plugin::manager::PluginManager;
+use crate::plugin::pipeline::ApiPipeline;
 use crate::plugin::registry::PluginRegistry;
 use crate::plugin::types::{PluginKind, PluginMeta};
-
+use crate::sense::Sense;
+use crate::tool::registry::ToolRegistry;
+use crate::tts::TTSSession;
 // ─────────────────────── FlowCloudAIClient ──────────────────
 
-/// 顶层门面。
-///
-/// 职责：
-/// 1. 初始化插件系统（扫描 → 编译 → 注册）
-/// 2. 创建各类 Session（LLM / Image / TTS）
-/// 3. 不持有任何 Session —— Session 的生命周期由调用方管理
 pub struct FlowCloudAIClient {
-    registry: Arc<PluginRegistry>,
+    plugin_registry: Arc<PluginRegistry>,
+    tool_registry: Arc<ToolRegistry>,
 }
 
 impl FlowCloudAIClient {
-    /// 初始化客户端，扫描 `./plugins` 目录。
-    ///
-    /// 即使没有找到任何插件，也会成功返回（registry 为空）。
     pub fn new() -> Result<Self> {
-        let registry = match PluginManager::new("./plugins".into()) {
+        let plugin_registry = match PluginManager::new("./plugins".into()) {
             Ok(pm) => {
                 for (id, meta) in &pm.plugins {
                     println!("[plugin] found: {} ({:?})", id, meta.kind);
@@ -34,7 +30,7 @@ impl FlowCloudAIClient {
                     pm.engine.clone(),
                     pm.linker.clone(),
                     pm.plugins.clone(),
-                    8, // 每个插件最多 8 个空闲实例
+                    8,
                 )?
             }
             Err(e) => {
@@ -44,60 +40,69 @@ impl FlowCloudAIClient {
         };
 
         Ok(Self {
-            registry: Arc::new(registry),
+            plugin_registry: Arc::new(plugin_registry),
+            tool_registry: Arc::new(ToolRegistry::new()),
         })
     }
 
     // ── 插件管理 ──
 
-    /// 激活指定插件（创建实例池）。
-    ///
-    /// 必须在 `create_*_session` 之前调用。
-    /// 一旦有 session 持有 registry 引用，此方法会失败。
     pub fn load_plugin(&mut self, id: &str) -> Result<()> {
-        Arc::get_mut(&mut self.registry)
+        Arc::get_mut(&mut self.plugin_registry)
             .ok_or_else(|| {
                 anyhow!(
                     "cannot load plugin while sessions hold a registry reference; \
-                 call load_plugin before creating any session"
+                     call load_plugin before creating any session"
                 )
             })?
             .load(id)
     }
 
-    /// 获取所有插件元数据。
     pub fn list_plugins(&self) -> &HashMap<String, PluginMeta> {
-        self.registry.list_plugins()
+        self.plugin_registry.list_plugins()
     }
 
-    /// 按类型筛选插件。
     pub fn list_by_kind(&self, kind: PluginKind) -> Vec<(&String, &PluginMeta)> {
-        self.registry.list_by_kind(kind)
+        self.plugin_registry.list_by_kind(kind)
     }
 
-    /// 获取池状态（诊断用）。
     pub fn pool_stats(&self) -> HashMap<&str, usize> {
-        self.registry.pool_stats()
+        self.plugin_registry.pool_stats()
+    }
+
+    // ── Sense / 工具管理 ──
+
+    /// 安装一个 Sense 的工具到全局 ToolRegistry。
+    ///
+    /// 必须在 `create_llm_session` 之前调用。
+    /// 多个 Sense 可以叠加安装（工具名不冲突即可）。
+    pub fn install_sense(&mut self, sense: &dyn Sense) -> Result<()> {
+        let reg = Arc::get_mut(&mut self.tool_registry)
+            .ok_or_else(|| {
+                anyhow!(
+                    "cannot install sense while sessions hold a tool registry reference; \
+                     call install_sense before creating any session"
+                )
+            })?;
+        sense.install_tools(reg)
+    }
+
+    /// 获取 ToolRegistry 引用。
+    pub fn tool_registry(&self) -> &Arc<ToolRegistry> {
+        &self.tool_registry
     }
 
     // ── Session 工厂 ──
 
-    /// 创建 LLM 会话。
-    ///
-    /// - `plugin_id`: 使用哪个插件做请求/响应映射。None = 直通模式。
-    /// - `api_key`: API 密钥。
-    ///
-    /// 返回的 Session 持有 `Arc<PluginRegistry>` 的 clone，
-    /// 通过 `acquire()` 按需借出 mapper，用完自动归还。
+    /// 创建 LLM 会话（简单模式，兼容旧 API）。
     pub fn create_llm_session(&self, plugin_id: &str, api_key: &str) -> Result<LLMSession> {
-        let url = self.registry.get_url(plugin_id)?;
+        let url = self.plugin_registry.get_url(plugin_id)?;
         if !url.starts_with("http") {
             return Err(anyhow!("plugin '{}' has invalid URL: {}", plugin_id, url));
         }
-        let base_url = url.to_string();
 
         let config = SessionConfig {
-            base_url,
+            base_url: url.to_string(),
             api_key: api_key.to_string(),
             event_buffer: 256,
             request_timeout: 60,
@@ -105,14 +110,112 @@ impl FlowCloudAIClient {
             max_line_bytes: 1024 * 1024,
         };
 
+        // create_llm_session 里
+        let pipeline = ApiPipeline::new(
+            Arc::clone(&self.plugin_registry),
+            Some(plugin_id.to_string()),
+        );
+
         LLMSession::new(
             config,
-            Arc::clone(&self.registry),
-            Some(plugin_id.to_string()),
+            pipeline,
+            Arc::clone(&self.tool_registry),
         )
     }
 
-    // 将来扩展：
-    // pub fn create_image_session(...) -> Result<ImageSession> { ... }
-    // pub fn create_tts_session(...) -> Result<TTSSession> { ... }
+    /// 创建 LLM 会话（编排模式）。
+    ///
+    /// 返回 (Session, Orchestrator)。
+    /// Orchestrator 可在运行时 `assemble` 每轮配置。
+    pub fn create_orchestrated_session(
+        &self,
+        plugin_id: &str,
+        api_key: &str,
+        sense: Box<dyn Sense>,
+    ) -> Result<(LLMSession, TaskOrchestrator)> {
+        let url = self.plugin_registry.get_url(plugin_id)?;
+        if !url.starts_with("http") {
+            return Err(anyhow!("plugin '{}' has invalid URL: {}", plugin_id, url));
+        }
+
+        let config = SessionConfig {
+            base_url: url.to_string(),
+            api_key: api_key.to_string(),
+            event_buffer: 256,
+            request_timeout: 60,
+            max_tool_rounds: 10,
+            max_line_bytes: 1024 * 1024,
+        };
+
+        let orchestrator = TaskOrchestrator::new(
+            sense,
+            Arc::clone(&self.tool_registry),
+        );
+
+        let pipeline = ApiPipeline::new(
+            Arc::clone(&self.plugin_registry),
+            Some(plugin_id.to_string()),
+        );
+
+        let session = LLMSession::new(
+            config,
+            pipeline,
+            Arc::clone(&self.tool_registry),
+        )?;
+
+        Ok((session, orchestrator))
+    }
+
+    /// 创建 TTS 语音合成会话。
+    ///
+    /// - `plugin_id`: TTS 插件 ID。
+    /// - `api_key`: API 密钥。
+    ///
+    /// TTSSession 是无状态的，可反复调用 `synthesize`。
+    pub fn create_tts_session(&self, plugin_id: &str, api_key: &str) -> Result<TTSSession> {
+        let url = self.plugin_registry.get_url(plugin_id)?;
+        if !url.starts_with("http") {
+            return Err(anyhow!("plugin '{}' has invalid URL: {}", plugin_id, url));
+        }
+
+        let config = SessionConfig {
+            base_url: url.to_string(),
+            api_key: api_key.to_string(),
+            event_buffer: 0,          // TTS 不用事件流
+            request_timeout: 120,     // TTS 合成可能较慢
+            max_tool_rounds: 0,
+            max_line_bytes: 0,
+        };
+
+        let pipeline = ApiPipeline::new(
+            Arc::clone(&self.plugin_registry),
+            Some(plugin_id.to_string()),
+        );
+
+        TTSSession::new(config, pipeline)
+    }
+
+    /// 创建图像生成会话。
+    pub fn create_image_session(&self, plugin_id: &str, api_key: &str) -> Result<ImageSession> {
+        let url = self.plugin_registry.get_url(plugin_id)?;
+        if !url.starts_with("http") {
+            return Err(anyhow!("plugin '{}' has invalid URL: {}", plugin_id, url));
+        }
+
+        let config = SessionConfig {
+            base_url: url.to_string(),
+            api_key: api_key.to_string(),
+            event_buffer: 0,
+            request_timeout: 180,  // 图像生成较慢
+            max_tool_rounds: 0,
+            max_line_bytes: 0,
+        };
+
+        let pipeline = ApiPipeline::new(
+            Arc::clone(&self.plugin_registry),
+            Some(plugin_id.to_string()),
+        );
+
+        ImageSession::new(config, pipeline)
+    }
 }

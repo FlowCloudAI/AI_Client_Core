@@ -1,8 +1,7 @@
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use crate::llm::types::ChatRequest;
 use crate::tool::registry::ToolRegistry;
-
-/// 重新导出，保持现有代码兼容
-pub use crate::llm::sense::{SenseState, sense_state_new};
 
 /// 模式预设。
 ///
@@ -32,4 +31,10 @@ pub trait Sense: Send + Sync {
     fn tool_whitelist(&self) -> Option<Vec<String>> {
         None
     }
+}
+
+pub type SenseState<T> = Arc<Mutex<T>>;
+
+pub fn sense_state_new<T: Default>() -> SenseState<T> {
+    Arc::new(Mutex::new(T::default()))
 }

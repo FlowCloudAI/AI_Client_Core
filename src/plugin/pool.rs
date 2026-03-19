@@ -53,7 +53,14 @@ impl MapperPool {
     pub fn acquire(&self) -> Result<PooledMapper<'_>> {
         let mapper = {
             // 锁作用域极短：只做 Vec::pop
-            self.idle.lock().unwrap().pop()
+            match self.idle.lock() {
+                Ok(mut guard) => guard.pop(),
+                Err(poisoned) => {
+                    // Mutex 被 poison，获取内部锁并继续使用
+                    eprintln!("警告：MapperPool 的 Mutex 被 poison，已恢复");
+                    poisoned.into_inner().pop()
+                },
+            }
         };
 
         let mapper = match mapper {

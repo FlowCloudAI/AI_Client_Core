@@ -1,6 +1,5 @@
 pub mod registry;
-mod types;
-mod executor;
+pub(crate) mod types;
+pub(crate)mod executor;
 
-// 重新导出辅助函数，保持现有调用方式兼容
-pub use crate::llm::tool::{arg_i32, arg_str};
+pub use registry::{arg_i32, arg_str, ToolRegistry};
