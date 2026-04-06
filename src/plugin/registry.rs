@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
 use wasmtime::Engine;
@@ -16,6 +17,7 @@ use wasmtime::component::{Component, Linker};
 /// 1. 持有 wasmtime `Engine`（全局唯一，内部 Arc，clone 廉价）。
 /// 2. 持有每个插件的编译好的 `Module` + 元数据。
 /// 3. 管理 per-plugin 的 `MapperPool`，对外提供 `acquire` 接口。
+/// 4. 跟踪插件引用计数，支持安全卸载。
 ///
 /// 所有权模型：
 /// - `FlowCloudAIClient` 通过 `Arc<PluginRegistry>` 持有。
@@ -41,6 +43,10 @@ pub struct PluginRegistry {
 
     /// 每个池的最大空闲实例数
     max_idle_per_pool: usize,
+
+    /// 插件引用计数（id → 引用数）
+    /// 用于追踪有多少 session 正在使用该插件
+    ref_counts: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl PluginRegistry {
@@ -57,6 +63,7 @@ impl PluginRegistry {
             linker,
             modules: HashMap::new(),
             max_idle_per_pool: 0,
+            ref_counts: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -97,6 +104,7 @@ impl PluginRegistry {
             linker,
             modules,
             max_idle_per_pool,
+            ref_counts: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -130,14 +138,30 @@ impl PluginRegistry {
 
     /// 卸载指定插件，销毁其实例池及所有空闲实例。
     ///
-    /// 已借出的 `PooledMapper` 不受影响（它持有 pool 的引用，
-    /// 但因为我们用 HashMap::remove，归还时 pool 已不存在，
-    /// mapper 会直接 drop）。
+    /// 如果插件仍被 session 引用（ref_count > 0），返回错误。
     ///
-    /// 注意：卸载后需确保没有活跃的 PooledMapper 引用该 pool，
+    /// 注意：调用方应确保没有活跃的 PooledMapper 引用该 pool，
     /// 否则会导致悬垂引用。实践中应先停止所有使用该插件的 session。
-    pub fn unload(&mut self, id: &str) {
+    pub fn unload(&mut self, id: &str) -> Result<()> {
+        // 检查引用计数
+        let ref_counts = self.ref_counts.lock()
+            .map_err(|e| anyhow!("failed to lock ref_counts: {}", e))?;
+        
+        if let Some(&count) = ref_counts.get(id) {
+            if count > 0 {
+                return Err(anyhow!(
+                    "cannot unload plugin '{}': still in use by {} session(s)",
+                    id, count
+                ));
+            }
+        }
+        drop(ref_counts);
+
+        // 移除 pool 和 module
         self.pools.remove(id);
+        self.modules.remove(id);
+        
+        Ok(())
     }
 
     /// 插件是否已加载（有活跃的实例池）。
@@ -196,6 +220,68 @@ impl PluginRegistry {
             .iter()
             .map(|(id, pool)| (id.as_str(), pool.idle_count()))
             .collect()
+    }
+
+    // ── 引用计数管理 ──
+
+    /// 增加插件引用计数（session 创建时调用）。
+    pub fn increment_ref(&self, plugin_id: &str) {
+        if let Ok(mut counts) = self.ref_counts.lock() {
+            *counts.entry(plugin_id.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    /// 减少插件引用计数（session 销毁时调用）。
+    pub fn decrement_ref(&self, plugin_id: &str) {
+        if let Ok(mut counts) = self.ref_counts.lock() {
+            if let Some(count) = counts.get_mut(plugin_id) {
+                if *count > 0 {
+                    *count -= 1;
+                }
+            }
+        }
+    }
+
+    /// 获取插件引用计数。
+    pub fn get_ref_count(&self, plugin_id: &str) -> usize {
+        self.ref_counts
+            .lock()
+            .ok()
+            .and_then(|counts| counts.get(plugin_id).copied())
+            .unwrap_or(0)
+    }
+
+    // ── 动态模块加载 ──
+
+    /// 动态添加新插件模块（用于 install_plugin_from_path）。
+    ///
+    /// 此方法编译 wasm 并添加到 modules HashMap，但不创建 pool。
+    /// 需要后续调用 `load()` 来激活插件。
+    pub fn add_module(
+        &mut self,
+        id: String,
+        meta: PluginMeta,
+        wasm_bytes: &[u8],
+    ) -> Result<()> {
+        // 检查 ID 唯一性
+        if self.plugins.contains_key(&id) {
+            return Err(anyhow!("plugin '{}' already exists", id));
+        }
+
+        // 编译 wasm 模块
+        let module = Component::from_binary(&self.engine, wasm_bytes)
+            .map_err(|e| anyhow!("failed to compile wasm for plugin '{}': {}", id, e))?;
+
+        // 插入元数据和模块
+        self.plugins.insert(id.clone(), meta);
+        self.modules.insert(id, module);
+
+        Ok(())
+    }
+
+    /// 获取引用计数的 Arc（供 Session 持有）。
+    pub fn ref_counts(&self) -> Arc<Mutex<HashMap<String, usize>>> {
+        Arc::clone(&self.ref_counts)
     }
 }
 

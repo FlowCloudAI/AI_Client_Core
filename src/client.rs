@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use crate::image::ImageSession;
 use crate::llm::config::SessionConfig;
@@ -13,16 +13,18 @@ use crate::plugin::types::{PluginKind, PluginMeta};
 use crate::sense::Sense;
 use crate::tool::registry::ToolRegistry;
 use crate::tts::TTSSession;
+use crate::PluginScanner;
 // ─────────────────────── FlowCloudAIClient ──────────────────
 
 pub struct FlowCloudAIClient {
     plugin_registry: Arc<PluginRegistry>,
     tool_registry: Arc<ToolRegistry>,
+    plugins_dir: PathBuf,
 }
 
 impl FlowCloudAIClient {
     pub fn new(plugins_dir: PathBuf) -> Result<Self> {
-        let plugin_registry = match PluginManager::new(plugins_dir) {
+        let plugin_registry = match PluginManager::new(plugins_dir.clone()) {
             Ok(pm) => {
                 for (id, meta) in &pm.plugins {
                     println!("[plugin] found: {} ({:?})", id, meta.kind);
@@ -43,6 +45,7 @@ impl FlowCloudAIClient {
         Ok(Self {
             plugin_registry: Arc::new(plugin_registry),
             tool_registry: Arc::new(ToolRegistry::new()),
+            plugins_dir,
         })
     }
 
@@ -69,6 +72,167 @@ impl FlowCloudAIClient {
 
     pub fn pool_stats(&self) -> HashMap<&str, usize> {
         self.plugin_registry.pool_stats()
+    }
+
+    /// 返回所有已识别插件的完整元数据列表。
+    ///
+    /// 包括 id, name, version, description, author, kind, fcplug_path 等字段。
+    pub fn list_all_plugins(&self) -> Vec<PluginMeta> {
+        self.plugin_registry
+            .list_plugins()
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// 获取插件的引用计数（用于诊断）。
+    pub fn get_plugin_ref_count(&self, plugin_id: &str) -> usize {
+        self.plugin_registry.get_ref_count(plugin_id)
+    }
+
+    /// 卸载插件：从运行时移除并删除 .fcplug 文件。
+    ///
+    /// # 逻辑步骤
+    /// 1. 检查插件是否存在
+    /// 2. 检查引用计数，如果仍被 session 使用则返回错误
+    /// 3. 调用 PluginRegistry::unload(plugin_id) 销毁 WASM 实例池
+    /// 4. 从 plugins HashMap 中移除元数据
+    /// 5. 使用 std::fs::remove_file 删除磁盘上的 .fcplug 文件
+    ///
+    /// # 错误处理
+    /// - 插件不存在：返回 anyhow::Error
+    /// - 插件正在被使用：返回明确的错误提示
+    /// - 文件操作失败：转换为 anyhow::Error 并附带上下文
+    pub fn uninstall_plugin(&mut self, plugin_id: &str) -> Result<()> {
+        // 1. 检查插件是否存在
+        let meta = self
+            .plugin_registry
+            .get_meta(plugin_id)
+            .ok_or_else(|| anyhow!("plugin '{}' not found", plugin_id))?;
+
+        // 保存文件路径（因为后面要删除）
+        let fcplug_path = meta.fcplug_path.clone();
+
+        // 2. 检查引用计数
+        let ref_count = self.plugin_registry.get_ref_count(plugin_id);
+        if ref_count > 0 {
+            return Err(anyhow!(
+                "cannot uninstall plugin '{}': still in use by {} session(s). \
+                 Please close all sessions using this plugin first.",
+                plugin_id,
+                ref_count
+            ));
+        }
+
+        // 3. 获取可变引用并卸载
+        let registry = Arc::get_mut(&mut self.plugin_registry).ok_or_else(|| {
+            anyhow!(
+                "cannot uninstall plugin while sessions hold a registry reference; \
+                 call uninstall_plugin before creating any session or after all sessions are dropped"
+            )
+        })?;
+
+        // 4. 卸载插件（销毁 pool 和 module）
+        registry.unload(plugin_id)?;
+
+        // 5. 删除磁盘文件
+        std::fs::remove_file(&fcplug_path)
+            .map_err(|e| {
+                anyhow!(
+                    "failed to remove plugin file '{}': {}",
+                    fcplug_path.display(),
+                    e
+                )
+            })?;
+
+        println!("[plugin] uninstalled: {} ({})", plugin_id, fcplug_path.display());
+        Ok(())
+    }
+
+    /// 从外部路径安装插件。
+    ///
+    /// # 逻辑步骤
+    /// 1. 读取 manifest.json 校验 ABI 版本和 ID 唯一性
+    /// 2. 将文件复制到内部插件目录（plugins_dir）
+    /// 3. 更新 PluginRegistry（编译 WASM 模块）
+    /// 4. 返回新插件的 PluginMeta
+    ///
+    /// # 错误处理
+    /// - manifest.json 解析失败：返回 anyhow::Error
+    /// - ABI 版本不匹配：返回明确错误
+    /// - ID 已存在：返回重复错误
+    /// - 文件复制失败：转换为 anyhow::Error 并附带上下文
+    /// - WASM 编译失败：返回编译错误
+    pub fn install_plugin_from_path(&mut self, source_path: &Path) -> Result<PluginMeta> {
+        use crate::SUPPORTED_ABI_VERSION;
+
+        // 1. 读取 manifest.json 校验
+        let manifest = PluginScanner::read_plugin_info(source_path)
+            .map_err(|e| anyhow!("failed to read plugin manifest from {:?}: {}", source_path, e))?;
+
+        let info = &manifest.meta;
+
+        // 校验 ABI 版本
+        if info.abi_version != SUPPORTED_ABI_VERSION {
+            return Err(anyhow!(
+                "plugin '{}' ABI version mismatch: expected {}, got {}",
+                info.id,
+                SUPPORTED_ABI_VERSION,
+                info.abi_version
+            ));
+        }
+
+        // 校验 ID 唯一性
+        if self.plugin_registry.get_meta(&info.id).is_some() {
+            return Err(anyhow!("plugin '{}' already exists", info.id));
+        }
+
+        // 2. 复制文件到 plugins_dir
+        let filename = source_path
+            .file_name()
+            .ok_or_else(|| anyhow!("invalid plugin filename: {:?}", source_path))?;
+
+        let dest_path = self.plugins_dir.join(filename);
+
+        std::fs::copy(source_path, &dest_path)
+            .map_err(|e| {
+                anyhow!(
+                    "failed to copy plugin from {:?} to {:?}: {}",
+                    source_path,
+                    dest_path,
+                    e
+                )
+            })?;
+
+        // 3. 构建 PluginMeta
+        let meta = PluginScanner::build_plugin_meta(manifest.clone(), &dest_path)
+            .map_err(|e| anyhow!("failed to build plugin meta: {}", e))?;
+
+        // 4. 读取 wasm bytes 并添加到 registry
+        let wasm_bytes = {
+            let file = std::fs::File::open(&dest_path)
+                .map_err(|e| anyhow!("cannot open plugin '{}': {}", info.id, e))?;
+            let mut archive = zip::ZipArchive::new(file)
+                .map_err(|e| anyhow!("cannot read zip for plugin '{}': {}", info.id, e))?;
+            let mut entry = archive.by_name("plugin.wasm")
+                .map_err(|_| anyhow!("plugin.wasm not found in '{}'", info.id))?;
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut buf)?;
+            buf
+        };
+
+        // 获取可变引用并添加模块
+        let registry = Arc::get_mut(&mut self.plugin_registry).ok_or_else(|| {
+            anyhow!(
+                "cannot install plugin while sessions hold a registry reference; \
+                 call install_plugin_from_path before creating any session"
+            )
+        })?;
+
+        registry.add_module(info.id.clone(), meta.clone(), &wasm_bytes)?;
+
+        println!("[plugin] installed: {} ({})", info.id, dest_path.display());
+        Ok(meta)
     }
 
     // ── Sense / 工具管理 ──

@@ -15,6 +15,10 @@ pub struct ApiPipeline {
 
 impl ApiPipeline {
     pub fn new(registry: Arc<PluginRegistry>, plugin_id: Option<String>) -> Self {
+        // 如果指定了 plugin_id，增加引用计数
+        if let Some(id) = &plugin_id {
+            registry.increment_ref(id);
+        }
         Self { registry, plugin_id }
     }
 
@@ -48,5 +52,14 @@ impl ApiPipeline {
         let raw = serde_json::to_string(json)?;
         let mapped = self.map_request(&raw)?;
         Ok(serde_json::from_str(&mapped)?)
+    }
+}
+
+impl Drop for ApiPipeline {
+    fn drop(&mut self) {
+        // Session 销毁时减少引用计数
+        if let Some(id) = &self.plugin_id {
+            self.registry.decrement_ref(id);
+        }
     }
 }
