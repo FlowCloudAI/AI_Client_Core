@@ -93,6 +93,24 @@ impl FlowCloudAIClient {
         &self.tool_registry
     }
 
+    /// 安装自定义工具到全局 ToolRegistry。
+    ///
+    /// 必须在 `create_llm_session` 之前调用。
+    /// 适用于非 Sense 模式的工具注册场景。
+    pub fn install_tools<F>(&mut self, installer: F) -> Result<()>
+    where
+        F: FnOnce(&mut ToolRegistry) -> Result<()>,
+    {
+        let reg = Arc::get_mut(&mut self.tool_registry)
+            .ok_or_else(|| {
+                anyhow!(
+                    "cannot install tools while sessions hold a tool registry reference; \
+                     call install_tools before creating any session"
+                )
+            })?;
+        installer(reg)
+    }
+
     // ── Session 工厂 ──
 
     /// 创建 LLM 会话（简单模式，兼容旧 API）。
