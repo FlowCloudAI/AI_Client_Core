@@ -1,10 +1,10 @@
+use crate::llm::types::ToolFunctionArg;
 use futures_util::future::BoxFuture;
 use serde_json::Value;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::Arc;
-
-use crate::llm::types::ToolFunctionArg;
+use std::time::Duration;
 
 // ─────────────────────── 辅助函数 ───────────────────────────
 
@@ -185,6 +185,7 @@ impl ToolRegistry {
         &self,
         func_name: &str,
         args: Option<&Value>,
+        timeout: Duration,
     ) -> anyhow::Result<String> {
         let empty = serde_json::json!({});
         let args = args.unwrap_or(&empty);
@@ -194,7 +195,10 @@ impl ToolRegistry {
             None => anyhow::bail!("未知工具: {}", func_name),
         };
 
-        handler(self, args).await
+        match tokio::time::timeout(timeout, handler(self, args)).await {
+            Ok(res) => res,
+            Err(_) => anyhow::bail!("工具执行超时: {}", func_name),
+        }
     }
 
     // ── 内部方法 ──

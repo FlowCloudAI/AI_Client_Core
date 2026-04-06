@@ -14,6 +14,7 @@ use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -549,7 +550,7 @@ impl LLMSession {
             };
 
             let (output, is_error) =
-                match self.tool_registry.conduct(func_name, Some(&args_v)).await {
+                match self.tool_registry.conduct(func_name, Some(&args_v), Duration::from_secs(60)).await {
                     Ok(o) => (o, false),
                     Err(e) => (format!("工具执行失败: {}", e), true),
                 };

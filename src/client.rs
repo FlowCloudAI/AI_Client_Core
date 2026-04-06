@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use crate::image::ImageSession;
 use crate::llm::config::SessionConfig;
@@ -20,8 +21,8 @@ pub struct FlowCloudAIClient {
 }
 
 impl FlowCloudAIClient {
-    pub fn new() -> Result<Self> {
-        let plugin_registry = match PluginManager::new("./plugins".into()) {
+    pub fn new(plugins_dir: PathBuf) -> Result<Self> {
+        let plugin_registry = match PluginManager::new(plugins_dir) {
             Ok(pm) => {
                 for (id, meta) in &pm.plugins {
                     println!("[plugin] found: {} ({:?})", id, meta.kind);

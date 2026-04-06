@@ -31,8 +31,8 @@ use flowcloudai_client_core::llm::types::Message;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 1. 初始化客户端（自动加载 ./plugins 目录下的插件）
-    let client = FlowCloudAIClient::new()?;
+    // 1. 初始化客户端（传入插件目录路径）
+    let client = FlowCloudAIClient::new("/path/to/plugins")?;
 
     // 2. 列出可用的 LLM 插件
     for (id, meta) in client.list_by_kind(PluginKind::LLM) {
@@ -185,8 +185,8 @@ pub struct FlowCloudAIClient {
 }
 
 impl FlowCloudAIClient {
-    // 初始化，自动扫描 ./plugins 目录
-    pub fn new() -> Result<Self>;
+    // 初始化，传入插件目录路径（支持 Tauri 等平台的动态路径）
+    pub fn new(plugins_dir: PathBuf) -> Result<Self>;
 
     // 列出指定类型的插件（LLM / Image / TTS）
     pub fn list_by_kind(&self, kind: PluginKind) -> Vec<(&String, &PluginMeta)>;
@@ -208,7 +208,7 @@ impl FlowCloudAIClient {
 **使用示例**：
 
 ```rust
-let client = FlowCloudAIClient::new()?;
+let client = FlowCloudAIClient::new("/path/to/plugins")?;
 
 // 列出所有可用的 LLM
 for (id, meta) in client.list_by_kind(PluginKind::LLM) {
@@ -422,6 +422,7 @@ impl ToolRegistry {
         &self,
         func_name: &str,
         args: Option<&Value>,
+        timeout: Duration,
     ) -> Result<String>;
 }
 ```
@@ -1116,7 +1117,7 @@ pub fn dangerous_tool() -> Result<String> {
 **A:** 可以。ToolRegistry 被包装在 Arc 中，多个 Session 可以安全地共享。
 
 ```rust
-let client = FlowCloudAIClient::new()?;
+let client = FlowCloudAIClient::new("/path/to/plugins")?;
 let session1 = client.create_llm_session("openai", "key1")?;
 let session2 = client.create_llm_session("claude", "key2")?;
 // 两个 session 共享同一个 tool_registry
@@ -1189,7 +1190,7 @@ let (r1, r2) = tokio::join!(h1, h2);
 tracing_subscriber::fmt::init();
 
 // 关键位置会输出 debug 日志
-let client = FlowCloudAIClient::new()?;
+let client = FlowCloudAIClient::new("/path/to/plugins")?;
 // [debug] found plugin: openai (LLM)
 // [debug] found plugin: seedream (Image)
 ```

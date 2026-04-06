@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use flowcloudai_client::audio::{AudioDecoder, AudioSource};
 use flowcloudai_client::tts::{TTSRequest, AudioFormat};
 use flowcloudai_client::FlowCloudAIClient;
@@ -5,7 +6,7 @@ mod apis;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mut client = FlowCloudAIClient::new()?;
+    let mut client = FlowCloudAIClient::new(PathBuf::from("./plugins"))?;
     client.load_plugin("qwen-tts")?;
 
     let tts = client.create_tts_session("qwen-tts", apis::QWEN_LLM.key)?;

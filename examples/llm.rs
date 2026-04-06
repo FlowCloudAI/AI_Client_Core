@@ -7,6 +7,7 @@ use flowcloudai_client::llm::types::TurnStatus;
 use flowcloudai_client::FlowCloudAIClient;
 use futures_util::StreamExt;
 use std::io::{stdin, stdout, Write};
+use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -21,7 +22,7 @@ const COLOR_RESET: &str = "\x1b[0m";
 #[tokio::main]
 async fn main() -> Result<()> {
     // ── 初始化客户端，扫描 ./plugins 目录 ──
-    let mut client = FlowCloudAIClient::new()?;
+    let mut client = FlowCloudAIClient::new(PathBuf::from("./plugins"))?;
 
     let acs_sense = senses::militech_acs::ACSSense::new();
 
