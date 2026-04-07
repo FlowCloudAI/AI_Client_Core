@@ -27,12 +27,15 @@
 
 ```rust
 use flowcloudai_client_core::FlowCloudAIClient;
-use flowcloudai_client_core::llm::types::Message;
+use flowcloudai_client_core::plugin::types::PluginKind;
+use std::path::PathBuf;
+use tokio::sync::mpsc;
+use futures_util::StreamExt;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // 1. 初始化客户端（传入插件目录路径）
-    let client = FlowCloudAIClient::new("/path/to/plugins")?;
+    let client = FlowCloudAIClient::new(PathBuf::from("./plugins"))?;
 
     // 2. 列出可用的 LLM 插件
     for (id, meta) in client.list_by_kind(PluginKind::LLM) {
@@ -44,14 +47,18 @@ async fn main() -> Result<()> {
 
     // 4. 设置模型和参数
     session
-        .set_model("gpt-4")
-        .set_temperature(0.7)
-        .set_max_tokens(2000);
+        .set_model("gpt-4").await
+        .set_temperature(0.7).await
+        .set_max_tokens(2000).await;
 
-    // 5. 发送消息并流式接收
-    session.push_user("用 Markdown 写一篇关于 AI 的短文").await?;
-    
-    let mut event_stream = session.drive().await?;
+    // 5. 通过 channel 发送消息，驱动会话
+    let (input_tx, input_rx) = mpsc::channel::<String>(32);
+    let (mut event_stream, _handle) = session.run(input_rx, None);
+
+    // 发送消息
+    input_tx.send("用 Markdown 写一篇关于 AI 的短文".to_string()).await?;
+
+    // 处理事件流
     while let Some(event) = event_stream.next().await {
         match event {
             SessionEvent::ContentDelta(delta) => print!("{}", delta),
@@ -208,7 +215,7 @@ impl FlowCloudAIClient {
 **使用示例**：
 
 ```rust
-let client = FlowCloudAIClient::new("/path/to/plugins")?;
+let client = FlowCloudAIClient::new(PathBuf::from("./plugins"))?;
 
 // 列出所有可用的 LLM
 for (id, meta) in client.list_by_kind(PluginKind::LLM) {
@@ -216,7 +223,7 @@ for (id, meta) in client.list_by_kind(PluginKind::LLM) {
 }
 
 // 创建会话
-let session = client.create_llm_session("openai", "sk-xxx")?;
+let mut session = client.create_llm_session("openai", "sk-xxx")?;
 ```
 
 ### 3.2 PluginRegistry（插件注册中心）
@@ -305,13 +312,13 @@ pub struct LLMSession {
 **生命周期**：
 
 ```
-1. 创建         → LLMSession::new()
-2. 配置         → set_model(), set_temperature(), etc.
-3. 加载 Sense   → load_sense(my_sense)
-4. 推送消息     → push_user("你好")
-5. 驱动会话     → drive() 返回事件流
-6. 处理事件     → 处理 ContentDelta、ToolCall 等
-7. 响应工具结果 → tool_result() 回源
+1. 创建         → client.create_llm_session()
+2. 配置         → session.set_model().await, set_temperature().await, etc.
+3. 加载 Sense   → session.load_sense(my_sense).await?
+4. 启动会话     → session.run(input_rx, ctx_rx) 返回事件流 + 句柄
+5. 发送消息     → 通过 input_tx 发送用户输入
+6. 处理事件     → 处理 ContentDelta、ToolCall、ToolResult 等
+7. 关闭会话     → 事件流结束时自动关闭
 ```
 
 **完整使用示例**：
@@ -320,30 +327,39 @@ pub struct LLMSession {
 let mut session = client.create_llm_session("openai", "sk-xxx")?;
 
 session
-    .set_model("gpt-4")
-    .set_temperature(0.8)
-    .set_max_tokens(2000);
+    .set_model("gpt-4").await
+    .set_temperature(0.8).await
+    .set_max_tokens(2000).await;
 
 // 加载工作流模式
 session.load_sense(CreativeWritingSense).await?;
 
-// 推送用户消息
-session.push_user("帮我写一段产品文案").await?;
+// 创建消息通道，启动会话
+let (input_tx, input_rx) = mpsc::channel::<String>(32);
+let (mut event_stream, _handle) = session.run(input_rx, None);
 
-// 驱动会话（流式响应）
-let mut stream = session.drive().await?;
-while let Some(event) = stream.next().await {
+// 发送用户消息
+input_tx.send("帮我写一段产品文案".to_string()).await?;
+
+// 处理事件流（流式响应）
+while let Some(event) = event_stream.next().await {
     match event {
         SessionEvent::ContentDelta(text) => {
             println!("{}", text);
         }
-        SessionEvent::ToolCall { name, index } => {
+        SessionEvent::ToolCall { index, name } => {
             println!("调用工具: {}", name);
-            let result = execute_tool(&name).await?;
-            session.tool_result(index, &result, false).await?;
+            // 工具执行结果会自动作为 ToolResult 事件返回
+        }
+        SessionEvent::ToolResult { index, output, is_error } => {
+            if is_error {
+                eprintln!("工具执行出错: {}", output);
+            } else {
+                println!("工具结果: {}", output);
+            }
         }
         SessionEvent::TurnEnd { status } => {
-            println!("对话结束");
+            println!("对话结束: {:?}", status);
         }
         _ => {}
     }
@@ -353,32 +369,35 @@ while let Some(event) = stream.next().await {
 **流程图**：
 
 ```
-用户消息
+session.run(input_rx, ctx_rx) 启动驱动循环
    ↓
-[push_user] 追加到 conversation.messages
-   ↓
-[drive] 启动驱动循环
-   ↓
-┌─────────────────────────────┐
-│  流程 #1：第一次调用        │
-├─────────────────────────────┤
-│ 1. conversation → JSON      │
-│ 2. 插件映射 (map_request)   │
-│ 3. HTTP POST to LLM API     │
-│ 4. SSE 流解码               │
-│ 5. 发出事件                 │
-│    ├─ ContentDelta          │
-│    ├─ ReasoningDelta        │
-│    ├─ ToolCallStart/Delta   │
-│    └─ ToolCallsRequired     │
-│ 6. 追加 assistant message   │
-│    到 conversation          │
-└─────────────────────────────┘
+后台异步处理事件流
+   ├─ 等待 NeedInput 事件（请求用户输入）
+   │
+   └─ 接收用户消息 (via input_tx.send(...))
+        ↓
+     ┌─────────────────────────────┐
+     │  处理每轮对话               │
+     ├─────────────────────────────┤
+     │ 1. 追加用户消息到 conversation
+     │ 2. conversation → JSON      │
+     │ 3. 插件映射 (map_request)   │
+     │ 4. HTTP POST to LLM API     │
+     │ 5. SSE 流解码               │
+     │ 6. 发出事件                 │
+     │    ├─ ContentDelta          │
+     │    ├─ ReasoningDelta        │
+     │    ├─ ToolCall/ToolResult   │
+     │    └─ TurnEnd               │
+     │ 7. 追加 assistant 消息      │
+     │    到 conversation          │
+     └─────────────────────────────┘
    ↓
 [工具调用？]
-  ├─ Yes → [tool_result] 追加 tool message
-  │         重回 flow #1
-  └─ No  → [TurnEnd] 会话结束
+  ├─ Yes → [ToolRegistry::conduct] 自动执行工具
+  │        → [ToolResult] 事件返回结果
+  │         → 重回流程继续对话
+  └─ No  → [TurnEnd] 会话结束，等待下一条 NeedInput
 ```
 
 ### 3.4 ToolRegistry（工具库）
@@ -417,7 +436,8 @@ impl ToolRegistry {
     // 获取所有工具的 JSON Schema
     pub fn schemas(&self) -> Option<Vec<Value>>;
 
-    // 执行工具调用
+    // 执行工具调用（含超时控制）
+    /// - `timeout`: 工具执行的最大允许时间；超出时间则返回超时错误
     pub async fn conduct(
         &self,
         func_name: &str,
@@ -462,13 +482,17 @@ LLM 响应包含 tool_calls
    ↓
 [StreamDecoder] 解析，发出 ToolCall 事件
    ↓
-[LLMSession] 收到 ToolCall，追加到 conversation
+[事件流通知应用] SessionEvent::ToolCall { index, name }
    ↓
-[ToolRegistry::conduct] 执行工具处理函数
+[应用处理] 可选地获取工具调用详情
    ↓
-[session.tool_result] 追加 tool 消息
+[LLMSession 内部] 自动通过 ToolRegistry::conduct 执行工具（60s 超时）
    ↓
-[drive 重新循环] 继续与 LLM 交互
+[发出 ToolResult 事件] SessionEvent::ToolResult { index, output, is_error }
+   ↓
+[LLMSession] 追加 tool message 到 conversation
+   ↓
+[内部循环] 继续与 LLM 交互直到 TurnEnd
 ```
 
 ### 3.5 Sense（模式预设）
@@ -859,12 +883,14 @@ pub enum TurnStatus {
 
 ```rust
 let mut session = client.create_llm_session("openai", "sk-xxx")?;
-session.set_model("gpt-4");
+session.set_model("gpt-4").await;
 
-session.push_user("你好，请介绍一下 Rust").await?;
-let mut stream = session.drive().await?;
+let (input_tx, input_rx) = mpsc::channel(32);
+let (mut event_stream, _handle) = session.run(input_rx, None);
 
-while let Some(event) = stream.next().await {
+input_tx.send("你好，请介绍一下 Rust".to_string()).await?;
+
+while let Some(event) = event_stream.next().await {
     if let SessionEvent::ContentDelta(text) = event {
         print!("{}", text);
     }
@@ -874,9 +900,10 @@ while let Some(event) = stream.next().await {
 ### 场景 2：带工具调用的对话
 
 ```rust
-// 1. 先注册工具
-let mut registry = ToolRegistry::new();
-registry.register::<WebSearchState, _>(
+// 1. 先注册工具到全局 ToolRegistry
+let mut client = FlowCloudAIClient::new(PathBuf::from("./plugins"))?;
+
+client.tool_registry_mut().register::<WebSearchState, _>(
     "search_web",
     "搜索网络信息",
     Some(vec![ToolFunctionArg::new("query", "string").required(true)]),
@@ -885,22 +912,30 @@ registry.register::<WebSearchState, _>(
         let results = perform_search(query)?;
         Ok(serde_json::to_string(&results)?)
     },
-);
+)?;
 
-// 2. 创建 session，注册工具
-let session = client.create_llm_session("openai", "sk-xxx")?;
-// session 会自动使用 client.tool_registry
+// 2. 创建 session（会自动使用 client.tool_registry）
+let mut session = client.create_llm_session("openai", "sk-xxx")?;
 
-// 3. 对话中 AI 可能调用工具
-session.push_user("2024年中国经济增长率是多少？").await?;
-let mut stream = session.drive().await?;
+// 3. 启动会话
+let (input_tx, input_rx) = mpsc::channel(32);
+let (mut event_stream, _handle) = session.run(input_rx, None);
 
-while let Some(event) = stream.next().await {
+// 发送包含工具需求的问题
+input_tx.send("2024年中国经济增长率是多少？".to_string()).await?;
+
+// 4. 处理事件流，包括工具执行结果
+while let Some(event) = event_stream.next().await {
     match event {
         SessionEvent::ToolCall { name, index } => {
-            // 工具已被调用，等待手动反馈结果
-            let output = format!("Search result for: {}", name);
-            session.tool_result(index, &output, false).await?;
+            println!("[工具调用] {}", name);
+        }
+        SessionEvent::ToolResult { index, output, is_error } => {
+            if is_error {
+                eprintln!("[工具结果-错误] {}", output);
+            } else {
+                println!("[工具结果] {}", output);
+            }
         }
         SessionEvent::ContentDelta(text) => print!("{}", text),
         SessionEvent::TurnEnd { .. } => break,
@@ -909,42 +944,41 @@ while let Some(event) = stream.next().await {
 }
 ```
 
-### 场景 3：动态编排工作流
+### 场景 3：使用 Sense 工作流模式
 
 ```rust
 // 1. 定义工作流模式
 struct CodeReviewSense;
 impl Sense for CodeReviewSense {
     fn prompts(&self) -> Vec<String> {
-        vec!["你是一位资深的代码审查员".to_string()]
+        vec!["你是一位资深的代码审查员，请逐行审查代码".to_string()]
     }
     fn tool_whitelist(&self) -> Option<Vec<String>> {
         Some(vec!["lint_code".to_string(), "check_security".to_string()])
     }
     fn install_tools(&self, registry: &mut ToolRegistry) -> Result<()> {
-        // 注册相关工具
+        // 在这里注册特定工具
         Ok(())
     }
 }
 
-// 2. 创建编排器
-let orchestrator = TaskOrchestrator::new(
-    Box::new(CodeReviewSense),
-    client.tool_registry().clone(),
-);
+// 2. 创建 session 并加载 Sense
+let mut session = client.create_llm_session("openai", "sk-xxx")?;
+session.load_sense(CodeReviewSense).await?;
 
-// 3. 根据任务上下文装配
-let ctx = TaskContext {
-    task_type: "code_review".to_string(),
-    selection: Some("fn my_func() { ... }".to_string()),
-    ..Default::default()
-};
+// 3. 启动会话，开始代码审查
+let (input_tx, input_rx) = mpsc::channel(32);
+let (mut event_stream, _) = session.run(input_rx, None);
 
-let turn = orchestrator.assemble(&ctx)?;
-println!("Tools for this turn: {:?}", turn.enabled_tools);
+// 4. 发送代码进行审查
+input_tx.send("请审查以下代码: fn my_func() { ... }".to_string()).await?;
 
-// 4. 应用装配结果到 session
-session.push_system_messages(turn.context_messages).await?;
+// 处理事件流
+while let Some(event) = event_stream.next().await {
+    if let SessionEvent::ContentDelta(text) = event {
+        print!("{}", text);
+    }
+}
 ```
 
 ### 场景 4：内容创作工作流
@@ -957,9 +991,13 @@ let user_prompt = "写一篇关于 AI 伦理的文章（500字）";
 let mut session = client.create_llm_session("openai", "sk-xxx")?;
 session.load_sense(CreativeWritingSense).await?;
 
-// 推送消息并驱动
-session.push_user(user_prompt).await?;
-let mut stream = session.drive().await?;
+// 启动会话
+let (input_tx, input_rx) = mpsc::channel(32);
+let (mut event_stream, _handle) = session.run(input_rx, None);
+
+// 发送消息并处理事件
+input_tx.send(user_prompt.to_string()).await?;
+let mut stream = &mut event_stream;
 
 let mut full_response = String::new();
 while let Some(event) = stream.next().await {
@@ -1127,26 +1165,28 @@ let session2 = client.create_llm_session("claude", "key2")?;
 **A:** 只需加载不同的插件，创建不同的 Session。
 
 ```rust
-let openai = client.create_llm_session("openai", "sk-xxx")?;
-let claude = client.create_llm_session("anthropic", "sk-yyy")?;
-let qwen = client.create_llm_session("qwen", "sk-zzz")?;
+let mut openai = client.create_llm_session("openai", "sk-xxx")?;
+let mut claude = client.create_llm_session("anthropic", "sk-yyy")?;
+let mut qwen = client.create_llm_session("qwen", "sk-zzz")?;
 
 // 使用任一会话
-openai.push_user("Hello").await?;
+let (input_tx, input_rx) = mpsc::channel(32);
+let (mut event_stream, _) = openai.run(input_rx, None);
+input_tx.send("Hello".to_string()).await?;
 ```
 
 ### Q3: 工具调用失败了怎么办？
-**A:** 通过 `tool_result` 传递 `is_error=true`，AI 会看到错误并可能重试。
+**A:** 工具执行错误会自动作为 `ToolResult` 事件返回，包含 `is_error=true`。
 
 ```rust
 SessionEvent::ToolCall { index, name } => {
-    match execute_tool(&name).await {
-        Ok(output) => {
-            session.tool_result(index, &output, false).await?;
-        }
-        Err(e) => {
-            session.tool_result(index, &format!("Error: {}", e), true).await?;
-        }
+    println!("Tool called: {}", name);
+}
+SessionEvent::ToolResult { index, output, is_error } => {
+    if is_error {
+        eprintln!("Tool failed: {}", output);
+    } else {
+        println!("Tool result: {}", output);
     }
 }
 ```
@@ -1163,20 +1203,33 @@ impl Sense for MyWorkflow {
 ```
 
 ### Q5: 能否同时调用多个 Session？
-**A:** 可以。使用 `tokio::spawn` 或 `tokio::join!` 并发。
+**A:** 可以。每个 `run()` 返回的事件流可以独立处理。
 
 ```rust
-let h1 = tokio::spawn(async {
-    session1.push_user("写文章").await?;
-    session1.drive().await
+let (input_tx1, input_rx1) = mpsc::channel(32);
+let (mut stream1, _) = session1.run(input_rx1, None);
+
+let (input_tx2, input_rx2) = mpsc::channel(32);
+let (mut stream2, _) = session2.run(input_rx2, None);
+
+// 并发发送消息
+input_tx1.send("写文章".to_string()).await?;
+input_tx2.send("生成图片".to_string()).await?;
+
+// 并发处理事件流
+let h1 = tokio::spawn(async move {
+    while let Some(event) = stream1.next().await {
+        // 处理 session1 事件
+    }
 });
 
-let h2 = tokio::spawn(async {
-    session2.push_user("生成图片").await?;
-    session2.drive().await
+let h2 = tokio::spawn(async move {
+    while let Some(event) = stream2.next().await {
+        // 处理 session2 事件
+    }
 });
 
-let (r1, r2) = tokio::join!(h1, h2);
+tokio::join!(h1, h2);
 ```
 
 ---
@@ -1222,7 +1275,7 @@ println!("Tools: {:?}", conv.tools.map(|t| t.len()));
 |-----------------------|-----------|----------------------------------------------------|
 | **FlowCloudAIClient** | 初始化、工厂    | `new()`, `create_llm_session()`                    |
 | **PluginRegistry**    | WASM 插件管理 | `load()`, `acquire()`                              |
-| **LLMSession**        | 对话处理      | `push_user()`, `drive()`, `tool_result()`          |
+| **LLMSession**        | 对话处理      | `load_sense()`, `set_model()`, `run()`             |
 | **ToolRegistry**      | 工具库       | `register()`, `conduct()`                          |
 | **Sense**             | 模式预设      | `prompts()`, `install_tools()`, `tool_whitelist()` |
 | **TaskOrchestrator**  | 动态编排      | `assemble()`                                       |

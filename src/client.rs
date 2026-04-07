@@ -135,6 +135,7 @@ impl FlowCloudAIClient {
         // 4. 卸载插件（销毁 pool 和 module）
         registry.unload(plugin_id)?;
 
+
         // 5. 删除磁盘文件
         std::fs::remove_file(&fcplug_path)
             .map_err(|e| {
@@ -187,22 +188,22 @@ impl FlowCloudAIClient {
             return Err(anyhow!("plugin '{}' already exists", info.id));
         }
 
-        // 2. 复制文件到 plugins_dir
-        let filename = source_path
-            .file_name()
-            .ok_or_else(|| anyhow!("invalid plugin filename: {:?}", source_path))?;
+        // 2. 复制文件到 plugins_dir，文件名固定为 {plugin_id}.fcplug
+        let dest_path = self.plugins_dir.join(format!("{}.fcplug", info.id));
 
-        let dest_path = self.plugins_dir.join(filename);
-
-        std::fs::copy(source_path, &dest_path)
-            .map_err(|e| {
-                anyhow!(
-                    "failed to copy plugin from {:?} to {:?}: {}",
-                    source_path,
-                    dest_path,
-                    e
-                )
-            })?;
+        // 如果文件已在目标位置（直接下载到 plugins_dir 的场景），跳过复制
+        let same_file = source_path.canonicalize().ok() == dest_path.canonicalize().ok();
+        if !same_file {
+            std::fs::copy(source_path, &dest_path)
+                .map_err(|e| {
+                    anyhow!(
+                        "failed to copy plugin from {:?} to {:?}: {}",
+                        source_path,
+                        dest_path,
+                        e
+                    )
+                })?;
+        }
 
         // 3. 构建 PluginMeta
         let meta = PluginScanner::build_plugin_meta(manifest.clone(), &dest_path)

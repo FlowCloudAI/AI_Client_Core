@@ -160,6 +160,7 @@ impl PluginRegistry {
         // 移除 pool 和 module
         self.pools.remove(id);
         self.modules.remove(id);
+        self.plugins.remove(id);
         
         Ok(())
     }
