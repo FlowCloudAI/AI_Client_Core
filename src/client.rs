@@ -258,6 +258,20 @@ impl FlowCloudAIClient {
         &self.tool_registry
     }
 
+    /// 获取 ToolRegistry 的可变引用（用于运行时启用/禁用工具）。
+    ///
+    /// 必须在没有任何 Session 持有 `Arc<ToolRegistry>` 克隆时调用，
+    /// 否则返回错误。这与 `install_sense` / `install_tools` 的约束一致。
+    pub fn tool_registry_mut(&mut self) -> Result<&mut ToolRegistry> {
+        Arc::get_mut(&mut self.tool_registry)
+            .ok_or_else(|| {
+                anyhow!(
+                    "cannot mutate tool registry while sessions hold a reference; \
+                     call tool_registry_mut before creating any session or after all sessions are dropped"
+                )
+            })
+    }
+
     /// 安装自定义工具到全局 ToolRegistry。
     ///
     /// 必须在 `create_llm_session` 之前调用。
