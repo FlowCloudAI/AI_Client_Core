@@ -433,11 +433,22 @@ impl ToolRegistry {
     ) where
         F: for<'a> Fn(&mut T, &'a Value) -> BoxFuture<'a, Result<String>> + Send + Sync + 'static;
 
-    // 获取所有工具的 JSON Schema
+    // 获取所有已启用工具的 JSON Schema
     pub fn schemas(&self) -> Option<Vec<Value>>;
+
+    // 只获取指定工具名的 Schema（白名单筛选），且仅返回启用的工具
+    pub fn schemas_filtered(&self, whitelist: &[String]) -> Option<Vec<Value>>;
+
+    // 启用/禁用指定工具（返回 true 表示工具存在且操作成功）
+    pub fn enable_tool(&mut self, name: &str) -> bool;
+    pub fn disable_tool(&mut self, name: &str) -> bool;
+
+    // 查询指定工具是否启用（工具不存在视为 false）
+    pub fn is_enabled(&self, name: &str) -> bool;
 
     // 执行工具调用（含超时控制）
     /// - `timeout`: 工具执行的最大允许时间；超出时间则返回超时错误
+    /// - 若工具已禁用，返回错误 "工具已禁用: {name}"
     pub async fn conduct(
         &self,
         func_name: &str,

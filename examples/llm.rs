@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
     session
         .load_sense(acs_sense).await?
         .set_model("deepseek-chat").await
-        .set_thinking(false).await
+        .set_thinking(true).await
         .set_stream(true).await
         .set_temperature(0.75).await;
 

@@ -36,6 +36,7 @@ type Handler = Arc<
 pub struct ToolSpec {
     pub schema: Value,
     handler: Handler,
+    pub enabled: bool,
 }
 
 // ─────────────────────── ToolRegistry ────────────────────────
@@ -145,21 +146,27 @@ impl ToolRegistry {
 
     // ── Schema 查询 ──
 
-    /// 获取所有已注册工具的 JSON Schema。
+    /// 获取所有已启用工具的 JSON Schema。
     pub fn schemas(&self) -> Option<Vec<Value>> {
-        if self.tools.is_empty() {
+        let mut v: Vec<_> = self
+            .tools
+            .values()
+            .filter(|x| x.enabled)
+            .map(|x| x.schema.clone())
+            .collect();
+        if v.is_empty() {
             return None;
         }
-        let mut v: Vec<_> = self.tools.values().map(|x| x.schema.clone()).collect();
         v.sort_by_key(|s| s["function"]["name"].as_str().unwrap_or("").to_string());
         Some(v)
     }
 
-    /// 只获取指定工具名的 Schema（白名单筛选）。
+    /// 只获取指定工具名的 Schema（白名单筛选），且仅返回启用的工具。
     pub fn schemas_filtered(&self, whitelist: &[String]) -> Option<Vec<Value>> {
         let v: Vec<_> = whitelist
             .iter()
             .filter_map(|name| self.tools.get(name))
+            .filter(|spec| spec.enabled)
             .map(|spec| spec.schema.clone())
             .collect();
         if v.is_empty() { None } else { Some(v) }
@@ -173,6 +180,36 @@ impl ToolRegistry {
     /// 是否有指定工具。
     pub fn has_tool(&self, name: &str) -> bool {
         self.tools.contains_key(name)
+    }
+
+    /// 启用指定工具。返回是否成功（工具存在则成功）。
+    pub fn enable_tool(&mut self, name: &str) -> bool {
+        match self.tools.get_mut(name) {
+            Some(spec) => {
+                spec.enabled = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 禁用指定工具。返回是否成功（工具存在则成功）。
+    pub fn disable_tool(&mut self, name: &str) -> bool {
+        match self.tools.get_mut(name) {
+            Some(spec) => {
+                spec.enabled = false;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 查询指定工具是否启用（工具不存在视为未启用）。
+    pub fn is_enabled(&self, name: &str) -> bool {
+        self.tools
+            .get(name)
+            .map(|spec| spec.enabled)
+            .unwrap_or(false)
     }
 
     // ── 工具执行 ──
@@ -191,7 +228,12 @@ impl ToolRegistry {
         let args = args.unwrap_or(&empty);
 
         let handler = match self.tools.get(func_name) {
-            Some(spec) => Arc::clone(&spec.handler),
+            Some(spec) => {
+                if !spec.enabled {
+                    anyhow::bail!("工具已禁用: {}", func_name);
+                }
+                Arc::clone(&spec.handler)
+            }
             None => anyhow::bail!("未知工具: {}", func_name),
         };
 
@@ -212,7 +254,7 @@ impl ToolRegistry {
         handler: Handler,
     ) {
         println!("[debug] inserting tool: {}", name);
-        
+
         let pros = properties.unwrap_or(serde_json::json!({}));
 
         self.tools.insert(
@@ -231,6 +273,7 @@ impl ToolRegistry {
                     }
                 }),
                 handler,
+                enabled: true,
             },
         );
     }
