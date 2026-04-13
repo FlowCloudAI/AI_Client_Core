@@ -2,5 +2,5 @@ pub mod stream_decoder;
 pub mod session;
 pub mod types;
 pub(crate) mod config;
-mod handle;
+pub mod handle;
 mod accumulator;
