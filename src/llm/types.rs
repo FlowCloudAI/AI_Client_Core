@@ -369,6 +369,13 @@ pub enum DecoderEventPayload {
     },
 }
 
+/// 会话控制指令（通过 SessionHandle 发往 drive loop）
+#[derive(Debug)]
+pub(crate) enum CtrlMsg {
+    /// 切换到另一个插件（下一轮生效）
+    SwitchPlugin { plugin_id: String, api_key: String },
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum SessionEvent {

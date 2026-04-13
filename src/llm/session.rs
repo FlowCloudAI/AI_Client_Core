@@ -4,8 +4,8 @@ use crate::llm::config::SessionConfig;
 use crate::llm::handle::SessionHandle;
 use crate::llm::stream_decoder::StreamDecoder;
 use crate::llm::types::{
-    ChatRequest, ChatResponse, DecoderEventPayload, Message, SessionEvent, ThinkingType, ToolCall,
-    TurnStatus,
+    ChatRequest, ChatResponse, CtrlMsg, DecoderEventPayload, Message, SessionEvent, ThinkingType,
+    ToolCall, TurnStatus,
 };
 use crate::orchestrator::{AssembledTurn, TaskContext, TaskOrchestrator};
 use crate::plugin::pipeline::ApiPipeline;
@@ -167,9 +167,11 @@ impl LLMSession {
         ctx_rx: Option<mpsc::Receiver<TaskContext>>,
     ) -> (ReceiverStream<SessionEvent>, SessionHandle) {
         let (event_tx, event_rx) = mpsc::channel::<SessionEvent>(self.config.event_buffer);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<CtrlMsg>(8);
 
         let handle = SessionHandle {
             inner: Arc::clone(&self.conversation),
+            ctrl_tx,
         };
 
         std::thread::spawn(move || {
@@ -179,7 +181,7 @@ impl LLMSession {
                 .expect("failed to create session runtime");
 
             rt.block_on(async move {
-                if let Err(e) = self.drive(input_rx, ctx_rx, event_tx.clone()).await {
+                if let Err(e) = self.drive(input_rx, ctrl_rx, ctx_rx, event_tx.clone()).await {
                     let _ = event_tx.send(SessionEvent::Error(format!("{:#}", e))).await;
                 }
             });
@@ -219,9 +221,22 @@ impl LLMSession {
         req
     }
 
+    async fn apply_ctrl(&mut self, msg: CtrlMsg) -> Result<()> {
+        match msg {
+            CtrlMsg::SwitchPlugin { plugin_id, api_key } => {
+                let url = self.pipeline.get_url(&plugin_id)?.to_string();
+                self.config.base_url = url;
+                self.config.api_key = api_key;
+                self.pipeline.set_plugin(Some(plugin_id));
+            }
+        }
+        Ok(())
+    }
+
     async fn drive(
         mut self,
         mut input_rx: mpsc::Receiver<String>,
+        mut ctrl_rx: mpsc::Receiver<CtrlMsg>,
         mut ctx_rx: Option<mpsc::Receiver<TaskContext>>,
         event_tx: mpsc::Sender<SessionEvent>,
     ) -> Result<()> {
@@ -230,6 +245,10 @@ impl LLMSession {
         loop {
             if self.should_wait_for_user().await {
                 event_tx.send(SessionEvent::NeedInput).await?;
+                // 在等待用户输入前，先应用所有待处理的控制指令
+                while let Ok(ctrl) = ctrl_rx.try_recv() {
+                    self.apply_ctrl(ctrl).await?;
+                }
                 match input_rx.recv().await {
                     Some(input) => self.add_message(Message::user(input)).await,
                     None => return Ok(()),

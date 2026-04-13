@@ -22,6 +22,22 @@ impl ApiPipeline {
         Self { registry, plugin_id }
     }
 
+    /// 切换到另一个插件（正确维护引用计数）。
+    pub fn set_plugin(&mut self, new_plugin_id: Option<String>) {
+        if let Some(id) = &self.plugin_id {
+            self.registry.decrement_ref(id);
+        }
+        if let Some(id) = &new_plugin_id {
+            self.registry.increment_ref(id);
+        }
+        self.plugin_id = new_plugin_id;
+    }
+
+    /// 查询指定插件的 API 端点 URL。
+    pub fn get_url(&self, plugin_id: &str) -> Result<&str> {
+        self.registry.get_url(plugin_id)
+    }
+
     fn acquire_mapper(&self) -> Result<Box<dyn ApiMapper + Send + '_>> {
         match &self.plugin_id {
             Some(id) if self.registry.is_loaded(id) => {
