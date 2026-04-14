@@ -20,7 +20,7 @@
 | **流式处理** | SSE 流式响应解码，秒级反馈 |
 | **工具链** | 工具库 + 执行引擎 + 结果回源 |
 | **插件适配** | WASM 组件模型，请求/响应自动映射 |
-| **会话管理** | 对话历史、状态机、外部句柄 |
+| **会话管理** | 对话消息树、分支/回退/重说、外部句柄 |
 | **编排灵活** | Sense 预设 + TaskOrchestrator 动态装配 |
 
 ### 五分钟上手
@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
 
     // 5. 通过 channel 发送消息，驱动会话
     let (input_tx, input_rx) = mpsc::channel::<String>(32);
-    let (mut event_stream, _handle) = session.run(input_rx, None);
+    let (mut event_stream, handle) = session.run(input_rx, None);
 
     // 发送消息
     input_tx.send("用 Markdown 写一篇关于 AI 的短文".to_string()).await?;
@@ -175,7 +175,8 @@ FlowCloudAIClient (主入口)
 | **ToolRegistry** | 全局工具库，AI 可调用 | search_web, execute_code, query_database |
 | **Sense** | 模式预设（提示词 + 工具白名单） | creative_writing, proofreading, code_assistant |
 | **TaskOrchestrator** | 动态装配引擎 | 根据 TaskContext 注入上下文、筛选工具、调整参数 |
-| **SessionHandle** | 会话外部句柄 | UI 层无需持有 Session，可异步读写对话 |
+| **ConversationTree** | 消息历史树 | 链式父节点结构，checkout 任意节点实现分支/重说/回退 |
+| **SessionHandle** | 会话外部句柄 | 异步读写对话参数、切换插件、历史 checkout |
 
 ---
 
@@ -369,10 +370,16 @@ while let Some(event) = event_stream.next().await {
 **流程图**：
 
 ```
-session.run(input_rx, ctx_rx) 启动驱动循环
+session.run(input_rx, ctx_rx) 启动驱动循环，返回 (event_stream, handle)
    ↓
-后台异步处理事件流
-   ├─ 等待 NeedInput 事件（请求用户输入）
+后台线程（独立 tokio runtime）
+   │
+   ├─ 发送 NeedInput 事件（通知 UI 可以输入了）
+   │
+   ├─ [ctrl_rx.try_recv()] 处理所有待处理的控制指令
+   │   └─ SwitchPlugin { plugin_id, api_key }
+   │        → 更新 config.base_url / api_key
+   │        → pipeline.set_plugin()（维护引用计数）
    │
    └─ 接收用户消息 (via input_tx.send(...))
         ↓
@@ -385,9 +392,11 @@ session.run(input_rx, ctx_rx) 启动驱动循环
      │ 4. HTTP POST to LLM API     │
      │ 5. SSE 流解码               │
      │ 6. 发出事件                 │
+     │    ├─ TurnBegin             │
      │    ├─ ContentDelta          │
      │    ├─ ReasoningDelta        │
-     │    ├─ ToolCall/ToolResult   │
+     │    ├─ ToolCall              │
+     │    ├─ ToolResult            │
      │    └─ TurnEnd               │
      │ 7. 追加 assistant 消息      │
      │    到 conversation          │
@@ -396,8 +405,8 @@ session.run(input_rx, ctx_rx) 启动驱动循环
 [工具调用？]
   ├─ Yes → [ToolRegistry::conduct] 自动执行工具
   │        → [ToolResult] 事件返回结果
-  │         → 重回流程继续对话
-  └─ No  → [TurnEnd] 会话结束，等待下一条 NeedInput
+  │        → 重回流程继续对话
+  └─ No  → [TurnEnd] 等待下一条 NeedInput
 ```
 
 ### 3.4 ToolRegistry（工具库）
@@ -833,35 +842,79 @@ AudioDecoder::play(&audio)?;
 
 ### 7.1 SessionHandle（外部句柄）
 
-允许 UI 层无需持有 Session 的所有权，就能异步访问和修改对话。
+允许 UI 层无需持有 Session 的所有权，就能异步访问、修改对话，或向后台驱动循环发送控制指令。
 
 ```rust
-pub struct SessionHandle {
-    inner: Arc<RwLock<ChatRequest>>,
-}
-
 impl SessionHandle {
+    // ── 读取 ──────────────────────────────────────────────────
+    // 返回完整快照：对话参数 + 系统消息 + 树的线性化历史
     pub async fn get_conversation(&self) -> ChatRequest;
+
+    // ── 修改对话参数（立即生效，下一轮请求使用新值）──────────
     pub async fn set_model(&self, model: &str);
     pub async fn set_temperature(&self, v: f64);
     pub async fn set_stream(&self, v: bool);
     pub async fn set_max_tokens(&self, v: i64);
+    pub async fn set_thinking(&self, enabled: bool);
+    pub async fn set_frequency_penalty(&self, v: f64);
+    pub async fn set_presence_penalty(&self, v: f64);
+    pub async fn set_top_p(&self, v: f64);
+    pub async fn set_stop(&self, stop: Vec<String>);
+    pub async fn set_response_format(&self, format: Value);
+    pub async fn set_n(&self, n: i32);
+    pub async fn set_tool_choice(&self, choice: &str);
+    pub async fn set_logprobs(&self, v: bool);
+    pub async fn set_top_logprobs(&self, n: i64);
+    // 批量更新（单次加锁，适合同时改多个字段）
+    pub async fn update<F: FnOnce(&mut ChatRequest)>(&self, f: F);
+
+    // ── 控制指令（通过 ctrl channel 发往 drive loop）─────────
+    // 切换插件（下一轮对话生效）
+    pub async fn switch_plugin(&self, plugin_id: &str, api_key: &str) -> Result<(), String>;
+    // 将消息树 head 移动到指定节点（重说 / 分支 / 历史回退）
+    pub async fn checkout(&self, node_id: u64) -> Result<(), String>;
 }
 ```
+
+**`switch_plugin` 说明**：
+
+切换插件会同时更新三项：`base_url`、`api_key`、以及 WASM 映射器（`plugin_id`）。
+指令通过内部 ctrl channel 发送，drive loop 在下一次等待用户输入时处理，因此：
+
+- 若当前没有流式响应进行中 → 立即生效
+- 若流式响应正在输出 → 等当前轮结束后生效
+
+**`checkout` 说明**：
+
+将消息树 head 移动到任意已有节点，支持三种操作模式：
+
+| 场景 | 操作 | 说明 |
+|------|------|------|
+| **重说** | checkout 到 user 节点 → drive loop 立即继续 | 跳过等待，用同一条用户消息重新生成回答 |
+| **分支** | checkout 到 user 节点 → 发新消息 | 从同一个提问点出发产生新的对话支路 |
+| **历史回退** | checkout 到 assistant 节点 → 等待新输入 | 回到某个历史状态，继续对话 |
+
+`node_id` 来自 `TurnBegin` / `TurnEnd` 事件中的 `node_id` 字段。
 
 **使用示例**：
 
 ```rust
-// Session 启动后，返回 handle 给 UI
-let handle = session.handle();
+let (input_tx, input_rx) = mpsc::channel(32);
+let (mut event_stream, handle) = session.run(input_rx, None);
 
-// UI 线程可以随时修改参数
+// 动态修改参数（下一轮生效）
 handle.set_temperature(0.5).await;
 handle.set_max_tokens(1000).await;
 
-// 也可以读取当前对话
+// 读取当前对话快照（参数 + 完整历史）
 let conv = handle.get_conversation().await;
-println!("Current model: {}", conv.model);
+println!("当前模型: {}", conv.model);
+
+// 切换插件（下一轮生效，不影响历史）
+handle.switch_plugin("qwen", "your-qwen-api-key").await?;
+
+// 重说：checkout 到上一条用户消息，drive loop 立即以该 user 节点重新生成
+handle.checkout(last_user_node_id).await?;
 ```
 
 ### 7.2 事件流
@@ -869,12 +922,22 @@ println!("Current model: {}", conv.model);
 ```rust
 pub enum SessionEvent {
     NeedInput,
-    TurnBegin { turn_id: u64 },
+    TurnBegin {
+        turn_id: u64,
+        /// 本轮开始时的 head 节点 ID（通常是刚追加的 user 消息节点）
+        /// 用于前端记录"从哪个节点触发了这轮对话"，以便后续 checkout
+        node_id: u64,
+    },
     ReasoningDelta(String),        // 思考过程
     ContentDelta(String),          // AI 生成内容
     ToolCall { index: usize, name: String },
     ToolResult { index: usize, output: String, is_error: bool },
-    TurnEnd { status: TurnStatus },
+    TurnEnd {
+        status: TurnStatus,
+        /// 本轮助手消息的节点 ID
+        /// 保存此 ID 用于重说：handle.checkout(node_id 的父节点) 即可回到 user 节点
+        node_id: u64,
+    },
     Error(String),
 }
 
@@ -885,6 +948,32 @@ pub enum TurnStatus {
     Error(String),
 }
 ```
+
+### 7.3 ConversationTree（对话消息树）
+
+对话历史以**树**而非线性列表存储，每条消息是一个节点，记录其父节点 ID。树的"当前路径"（root → head）即发往 API 的消息序列。
+
+```
+root
+ └── [user] 解释量子纠缠          ← n1
+      ├── [assistant] 回答 A      ← n2  （旧分支，已被 checkout 离开）
+      └── [assistant] 回答 B      ← n3  ← head（当前路径）
+```
+
+**关键操作**：
+
+| 方法 | 说明 |
+|------|------|
+| `append(msg, turn_id)` | 在 head 之后追加消息，推进 head，返回新节点 ID |
+| `checkout(node_id)` | 移动 head（不删除任何节点，原路径完整保留） |
+| `linearize()` | 输出 root → head 路径的有序消息列表，供 API 调用 |
+| `path_to_head()` | 返回当前路径的节点 ID 列表 |
+| `head_role()` | 当前 head 节点的 role（用于判断是否需要等待用户输入） |
+
+**重要规则**：
+- `checkout` 永远不删除节点，所有分支始终可恢复
+- 系统消息（system prompts）存储在树外的独立列表，跨所有分支保持一致
+- `linearize()` 的结果 = `system_messages` + 当前路径消息，组合后发给 API
 
 ---
 
@@ -1029,6 +1118,99 @@ while let Some(event) = stream.next().await {
 
 println!("\nFinal text:\n{}", full_response);
 ```
+
+### 场景 5：会话内切换插件
+
+同一段对话中途更换 AI 供应商，前几轮走 OpenAI，后续换到千问（成本优化或降级场景）。
+
+```rust
+let mut session = client.create_llm_session("openai", "sk-openai-xxx")?;
+session.set_model("gpt-4o").await;
+session.set_stream(true).await;
+
+let (input_tx, input_rx) = mpsc::channel(32);
+let (mut event_stream, handle) = session.run(input_rx, None);
+
+// 第一轮：走 OpenAI
+input_tx.send("解释一下量子纠缠".to_string()).await?;
+while let Some(event) = event_stream.next().await {
+    match event {
+        SessionEvent::ContentDelta(text) => print!("{}", text),
+        SessionEvent::TurnEnd { .. } => break,
+        _ => {}
+    }
+}
+
+// 切换到千问（下一轮生效，不影响对话历史）
+handle.switch_plugin("qwen", "sk-qwen-xxx").await?;
+handle.set_model("qwen-max").await;
+
+// 第二轮：走千问，对话历史保持连续
+input_tx.send("用更简单的语言再解释一次".to_string()).await?;
+while let Some(event) = event_stream.next().await {
+    match event {
+        SessionEvent::ContentDelta(text) => print!("{}", text),
+        SessionEvent::TurnEnd { .. } => break,
+        _ => {}
+    }
+}
+```
+
+> **注意**：`switch_plugin` 不清空对话历史，切换后的轮次会把完整的历史作为上下文发送给新插件。
+> 不同供应商对 `message.role` 的支持可能有差异，切换前确认目标供应商的插件支持多轮对话格式。
+
+### 场景 6：历史回退与重说
+
+```rust
+let mut session = client.create_llm_session("openai", "sk-xxx")?;
+session.set_model("gpt-4o").await;
+session.set_stream(true).await;
+
+let (input_tx, input_rx) = mpsc::channel(32);
+let (mut event_stream, handle) = session.run(input_rx, None);
+
+// 第一轮：发送问题，记录 node_id
+let mut user_node: u64 = 0;
+let mut asst_node: u64 = 0;
+
+input_tx.send("用一句话解释递归".to_string()).await?;
+
+while let Some(event) = event_stream.next().await {
+    match event {
+        SessionEvent::TurnBegin { node_id, .. } => user_node = node_id,
+        SessionEvent::ContentDelta(text) => print!("{}", text),
+        SessionEvent::TurnEnd { node_id, .. } => { asst_node = node_id; break; }
+        _ => {}
+    }
+}
+// user_node = 用户消息节点，asst_node = 助手回答节点
+
+// ── 重说：checkout 到 user 节点，drive loop 立即重新生成（无需再发消息）──
+handle.checkout(user_node).await?;
+
+while let Some(event) = event_stream.next().await {
+    match event {
+        SessionEvent::ContentDelta(text) => print!("{}", text),
+        SessionEvent::TurnEnd { .. } => { println!("\n[重说完成]"); break; }
+        _ => {}
+    }
+}
+
+// ── 历史回退：checkout 到助手节点，继续对话 ──
+handle.checkout(asst_node).await?;
+input_tx.send("用代码示例再解释一次".to_string()).await?;
+
+while let Some(event) = event_stream.next().await {
+    match event {
+        SessionEvent::ContentDelta(text) => print!("{}", text),
+        SessionEvent::TurnEnd { .. } => break,
+        _ => {}
+    }
+}
+```
+
+> **节点 ID 的来源**：每个 `TurnBegin` 事件携带 `node_id`（本轮触发节点），每个 `TurnEnd` 事件携带 `node_id`（本轮助手消息节点）。
+> 前端只需保存这两个 ID 即可支持完整的重说 / 分支 / 回退操作。
 
 ---
 
