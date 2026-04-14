@@ -81,7 +81,7 @@ async fn run_chat_loop(
                 }
             }
 
-            SessionEvent::TurnBegin { turn_id } => {
+            SessionEvent::TurnBegin { turn_id, .. } => {
                 println!("\n{}=== Turn {} ==={}", SYSTEM_COLOR, turn_id, COLOR_RESET);
                 is_reasoning = false;
             }
@@ -124,7 +124,7 @@ async fn run_chat_loop(
                 }
             }
 
-            SessionEvent::TurnEnd { status } => {
+            SessionEvent::TurnEnd { status, .. } => {
                 println!(
                     "\n{}--- TurnEnd: {:?} ---{}",
                     SYSTEM_COLOR, status, COLOR_RESET

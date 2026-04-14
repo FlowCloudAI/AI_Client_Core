@@ -3,6 +3,7 @@ use crate::llm::accumulator::ToolCallAccumulator;
 use crate::llm::config::SessionConfig;
 use crate::llm::handle::SessionHandle;
 use crate::llm::stream_decoder::StreamDecoder;
+use crate::llm::tree::ConversationTree;
 use crate::llm::types::{
     ChatRequest, ChatResponse, CtrlMsg, DecoderEventPayload, Message, SessionEvent, ThinkingType,
     ToolCall, TurnStatus,
@@ -11,6 +12,7 @@ use crate::orchestrator::{AssembledTurn, TaskContext, TaskOrchestrator};
 use crate::plugin::pipeline::ApiPipeline;
 use crate::tool::registry::ToolRegistry;
 use anyhow::{anyhow, Context, Result};
+use futures_util::future::{self, Either};
 use futures_util::StreamExt;
 use serde_json::Value;
 use std::sync::Arc;
@@ -33,8 +35,14 @@ pub struct LLMSession {
     /// HTTP 客户端
     client: HttpPoster,
 
-    /// 对话请求与历史
+    /// 对话参数（model、temperature 等；messages 字段不再使用）
     conversation: Arc<RwLock<ChatRequest>>,
+
+    /// 消息历史树（用户/助手/工具消息）
+    tree: Arc<RwLock<ConversationTree>>,
+
+    /// 系统级消息（由 Sense 注入，跨分支保持不变）
+    system_messages: Arc<Vec<Message>>,
 
     /// 工具函数管理器
     tool_registry: Arc<ToolRegistry>,
@@ -63,6 +71,8 @@ impl LLMSession {
         Ok(Self {
             client,
             conversation: Arc::new(RwLock::new(ChatRequest::default())),
+            tree: Arc::new(RwLock::new(ConversationTree::new())),
+            system_messages: Arc::new(Vec::new()),
             tool_registry,
             config,
             pipeline,
@@ -80,15 +90,20 @@ impl LLMSession {
     }
 
     pub async fn load_sense(&mut self, sense: impl crate::sense::Sense) -> Result<&mut Self> {
+        let mut sys_msgs = Vec::new();
         {
             let mut conv = self.conversation.write().await;
-            if let Some(request) = sense.default_request() {
+            if let Some(mut request) = sense.default_request() {
+                // 将 default_request 中预置的 messages 移入 system_messages
+                sys_msgs.extend(request.messages.drain(..));
                 *conv = request;
-            }
-            for prompt in sense.prompts() {
-                conv.messages.push(Message::system(prompt));
+                conv.messages.clear();
             }
         }
+        for prompt in sense.prompts() {
+            sys_msgs.push(Message::system(prompt));
+        }
+        self.system_messages = Arc::new(sys_msgs);
         self.conversation.write().await.tools = self.tool_registry.schemas();
         let schemas = self.tool_registry.schemas();
         println!(
@@ -171,6 +186,8 @@ impl LLMSession {
 
         let handle = SessionHandle {
             inner: Arc::clone(&self.conversation),
+            tree: Arc::clone(&self.tree),
+            system_messages: Arc::clone(&self.system_messages),
             ctrl_tx,
         };
 
@@ -229,6 +246,13 @@ impl LLMSession {
                 self.config.api_key = api_key;
                 self.pipeline.set_plugin(Some(plugin_id));
             }
+            CtrlMsg::Checkout { node_id } => {
+                self.tree
+                    .write()
+                    .await
+                    .checkout(node_id)
+                    .map_err(|e| anyhow!(e))?;
+            }
         }
         Ok(())
     }
@@ -245,13 +269,29 @@ impl LLMSession {
         loop {
             if self.should_wait_for_user().await {
                 event_tx.send(SessionEvent::NeedInput).await?;
-                // 在等待用户输入前，先应用所有待处理的控制指令
-                while let Ok(ctrl) = ctrl_rx.try_recv() {
-                    self.apply_ctrl(ctrl).await?;
-                }
-                match input_rx.recv().await {
-                    Some(input) => self.add_message(Message::user(input)).await,
-                    None => return Ok(()),
+
+                // 并发等待用户输入或控制指令
+                // 收到 Checkout 后重新检查是否仍需等待，收到输入后追加消息并退出等待
+                'wait: loop {
+                    let input_fut = input_rx.recv();
+                    let ctrl_fut = ctrl_rx.recv();
+                    futures_util::pin_mut!(input_fut, ctrl_fut);
+
+                    match future::select(input_fut, ctrl_fut).await {
+                        Either::Left((Some(input), _)) => {
+                            self.add_message(Message::user(input)).await;
+                            break 'wait;
+                        }
+                        Either::Left((None, _)) => return Ok(()),
+                        Either::Right((Some(ctrl), _)) => {
+                            self.apply_ctrl(ctrl).await?;
+                            // Checkout 可能使 head 移动到 user 节点，届时无需继续等待
+                            if !self.should_wait_for_user().await {
+                                break 'wait;
+                            }
+                        }
+                        Either::Right((None, _)) => return Ok(()),
+                    }
                 }
             }
 
@@ -262,10 +302,14 @@ impl LLMSession {
                 }
             }
 
+            // 记录本轮开始时的 head 节点（用于 TurnBegin 事件）
+            let turn_head_id = self.tree.read().await.head().unwrap_or(0);
+
             self.turn_id += 1;
             event_tx
                 .send(SessionEvent::TurnBegin {
                     turn_id: self.turn_id,
+                    node_id: turn_head_id,
                 })
                 .await?;
 
@@ -282,12 +326,13 @@ impl LLMSession {
             let (content, reasoning, tool_calls, finish_reason, turn_status) =
                 self.send_and_process(&req, &event_tx).await?;
 
-            self.add_message(Message::assistant(
-                Some(content).filter(|s| !s.is_empty()),
-                Some(reasoning).filter(|s| !s.is_empty()),
-                tool_calls.clone(),
-            ))
-            .await;
+            let asst_node_id = self
+                .add_message(Message::assistant(
+                    Some(content).filter(|s| !s.is_empty()),
+                    Some(reasoning).filter(|s| !s.is_empty()),
+                    tool_calls.clone(),
+                ))
+                .await;
 
             if finish_reason.as_deref() == Some("tool_calls") {
                 if let Some(calls) = tool_calls {
@@ -299,26 +344,33 @@ impl LLMSession {
             event_tx
                 .send(SessionEvent::TurnEnd {
                     status: turn_status,
+                    node_id: asst_node_id,
                 })
                 .await?;
         }
     }
 
     async fn should_wait_for_user(&self) -> bool {
-        self.conversation
+        self.tree
             .read()
             .await
-            .messages
-            .last()
-            .map_or(true, |msg| msg.role == "assistant")
+            .head_role()
+            .map_or(true, |r| r == "assistant")
     }
 
     async fn snapshot(&self) -> ChatRequest {
-        self.conversation.read().await.clone()
+        let mut req = self.conversation.read().await.clone();
+        req.messages = self
+            .system_messages
+            .iter()
+            .cloned()
+            .chain(self.tree.read().await.linearize())
+            .collect();
+        req
     }
 
-    async fn add_message(&self, msg: Message) {
-        self.conversation.write().await.messages.push(msg);
+    async fn add_message(&self, msg: Message) -> u64 {
+        self.tree.write().await.append(msg, self.turn_id)
     }
 }
 
@@ -584,7 +636,7 @@ impl LLMSession {
                 })
                 .await?;
 
-            self.add_message(Message::tool(output, tool_call_id)).await;
+            let _ = self.add_message(Message::tool(output, tool_call_id)).await;
         }
 
         Ok(())

@@ -374,6 +374,8 @@ pub enum DecoderEventPayload {
 pub(crate) enum CtrlMsg {
     /// 切换到另一个插件（下一轮生效）
     SwitchPlugin { plugin_id: String, api_key: String },
+    /// 将消息树 head 移动到指定节点（重说 / 分支 / 历史回退）
+    Checkout { node_id: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -382,6 +384,9 @@ pub enum SessionEvent {
     NeedInput,
     TurnBegin {
         turn_id: u64,
+        /// 本轮开始时的 head 节点 ID（用户消息节点，或工具结果节点）
+        /// 树为空时为 0（实践中不会发生）
+        node_id: u64,
     },
     ReasoningDelta(String),
     ContentDelta(String),
@@ -398,6 +403,8 @@ pub enum SessionEvent {
 
     TurnEnd {
         status: TurnStatus,
+        /// 本轮助手消息节点 ID（供前端做历史导航 / 分支 / 重说）
+        node_id: u64,
     },
     Error(String),
 }

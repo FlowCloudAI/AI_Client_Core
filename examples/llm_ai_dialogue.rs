@@ -146,7 +146,7 @@ async fn handle_event(
             }
         }
 
-        SessionEvent::TurnBegin { turn_id } => {
+        SessionEvent::TurnBegin { turn_id, .. } => {
             println!(
                 "\n{}=== {:?} Turn {} ==={}",
                 SYSTEM_COLOR, me, turn_id, COLOR_RESET
@@ -210,7 +210,7 @@ async fn handle_event(
             }
         }
 
-        SessionEvent::TurnEnd { status } => {
+        SessionEvent::TurnEnd { status, .. } => {
             println!(
                 "\n{}--- {:?} TurnEnd: {:?} ---{}",
                 SYSTEM_COLOR, me, status, COLOR_RESET
