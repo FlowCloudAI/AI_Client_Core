@@ -138,6 +138,21 @@ impl StorageCtx {
         }
     }
 
+    /// 从已有对话 ID 构建上下文（续聊时使用）。
+    pub fn from_existing(
+        conversation_id: String,
+        plugin_id: String,
+        store: Arc<ConversationStore>,
+        created_at: String,
+    ) -> Self {
+        Self {
+            conversation_id,
+            plugin_id,
+            store,
+            created_at,
+        }
+    }
+
     /// 将消息列表写入磁盘。如果文件已存在，保留原标题；否则从第一条 user 消息自动生成。
     pub fn flush(
         &self,

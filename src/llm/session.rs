@@ -91,6 +91,44 @@ impl LLMSession {
         self.storage_ctx = Some(StorageCtx::new(plugin_id, store));
     }
 
+    /// 注入存储上下文，复用已有对话 ID（续聊时调用，保证写盘覆盖而非新建文件）。
+    pub fn resume_storage_ctx(
+        &mut self,
+        conversation_id: String,
+        plugin_id: String,
+        created_at: String,
+        store: std::sync::Arc<crate::storage::ConversationStore>,
+    ) {
+        self.storage_ctx = Some(StorageCtx::from_existing(
+            conversation_id,
+            plugin_id,
+            store,
+            created_at,
+        ));
+    }
+
+    /// 将已有历史消息回放到内部 ConversationTree（必须在 run() 之前调用）。
+    ///
+    /// 由 `FlowCloudAIClient::resume_llm_session` 在创建 session 后、启动前注入，
+    /// 使 tree 与磁盘上的对话历史保持一致。
+    pub fn preload_history(&mut self, messages: Vec<crate::storage::StoredMessage>) {
+        // 在 run() 调用前，只有 self 持有 Arc<RwLock<ConversationTree>>，
+        // 因此 Arc::get_mut 保证成功，避免引入 async。
+        if let Some(tree_lock) = Arc::get_mut(&mut self.tree) {
+            let tree = tree_lock.get_mut();
+            for stored in messages {
+                let msg = crate::llm::types::Message {
+                    role: stored.role,
+                    content: stored.content,
+                    reasoning_content: stored.reasoning,
+                    tool_call_id: None,
+                    tool_calls: None,
+                };
+                tree.append(msg, 0);
+            }
+        }
+    }
+
     pub fn set_api(&mut self, api_key: &str) {
         self.config.api_key = api_key.to_string();
     }
@@ -662,7 +700,7 @@ impl LLMSession {
             };
 
             let (output, is_error) =
-                match self.tool_registry.conduct(func_name, Some(&args_v), Duration::from_secs(60)).await {
+                match self.tool_registry.conduct(func_name, Some(&args_v), Duration::from_secs(600)).await {
                     Ok(o) => (o, false),
                     Err(e) => (format!("工具执行失败: {}", e), true),
                 };

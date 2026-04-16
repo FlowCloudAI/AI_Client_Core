@@ -89,22 +89,36 @@ impl ImageSession {
     // ── 内部方法 ──
 
     async fn post_and_collect(&self, json: serde_json::Value) -> Result<String> {
-        let stream = self
+        let stream = match self
             .client
             .post_json(&self.config.base_url, &self.config.api_key, json)
             .await
-            .context("Image request failed")?;
+        {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[post_and_collect] post_json failed: {}", e);
+                return Err(anyhow!("Image request failed [url={}]: {}", self.config.base_url, e));
+            }
+        };
 
         tokio::pin!(stream);
 
         let mut body = String::new();
         while let Some(chunk) = stream.next().await {
-            body.push_str(&chunk?);
+            match chunk {
+                Ok(c) => body.push_str(&c),
+                Err(e) => {
+                    eprintln!("[post_and_collect] stream chunk error: {}", e);
+                    return Err(anyhow!("Image request stream failed: {}", e));
+                }
+            }
         }
 
         if body.is_empty() {
             return Err(anyhow!("Image response empty"));
         }
+
+        println!("[post_and_collect] raw response body (first 1024 chars): {}", &body[..body.len().min(1024)]);
 
         Ok(body)
     }

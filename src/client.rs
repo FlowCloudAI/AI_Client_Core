@@ -338,6 +338,66 @@ impl FlowCloudAIClient {
         Ok(session)
     }
 
+    /// 从已有对话 ID 恢复 LLM 会话（续聊模式）。
+    ///
+    /// 与 `create_llm_session` 相比，额外做了两件事：
+    /// 1. 从 `ConversationStore` 加载历史消息并回放到 `ConversationTree`；
+    /// 2. 将 `StorageCtx` 的 `conversation_id` 设为原对话 ID，确保续聊时
+    ///    写盘覆盖原文件，而非创建新文件（避免重复对话条目）。
+    pub fn resume_llm_session(
+        &self,
+        plugin_id: &str,
+        api_key: &str,
+        conversation_id: &str,
+    ) -> Result<LLMSession> {
+        let store = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| anyhow!("storage not configured"))?;
+
+        let conv = store
+            .get(conversation_id)
+            .ok_or_else(|| anyhow!("conversation '{}' not found", conversation_id))?;
+
+        let url = self.plugin_registry.get_url(plugin_id)?;
+        if !url.starts_with("http") {
+            return Err(anyhow!("plugin '{}' has invalid URL: {}", plugin_id, url));
+        }
+
+        let config = SessionConfig {
+            base_url: url.to_string(),
+            api_key: api_key.to_string(),
+            event_buffer: 256,
+            request_timeout: 60,
+            max_tool_rounds: 10,
+            max_line_bytes: 1024 * 1024,
+        };
+
+        let pipeline = ApiPipeline::new(
+            Arc::clone(&self.plugin_registry),
+            Some(plugin_id.to_string()),
+        );
+
+        let mut session = LLMSession::new(
+            config,
+            pipeline,
+            Arc::clone(&self.tool_registry),
+        )?;
+
+        // 回放历史消息
+        session.preload_history(conv.messages);
+
+        // 绑定存储上下文（复用原对话 ID，续聊写盘不创建新文件）
+        session.resume_storage_ctx(
+            conversation_id.to_string(),
+            plugin_id.to_string(),
+            conv.meta.created_at,
+            Arc::clone(store),
+        );
+
+        Ok(session)
+    }
+
     /// 创建 LLM 会话（编排模式）。
     ///
     /// 返回 (Session, Orchestrator)。
