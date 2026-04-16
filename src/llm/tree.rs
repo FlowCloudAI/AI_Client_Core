@@ -18,6 +18,8 @@ pub struct ConversationNode {
     pub parent: Option<NodeId>,
     /// 所属轮次（Phase 3 由 drive loop 填充，Phase 1/2 填 0）
     pub turn_id: u64,
+    /// 消息创建时间，供历史恢复与排序展示使用。
+    pub timestamp: String,
 }
 
 /// 对话消息树
@@ -56,18 +58,33 @@ impl ConversationTree {
 
     /// 在当前 head 之后追加一条消息，推进 head，返回新节点 ID。
     pub fn append(&mut self, message: Message, turn_id: u64) -> NodeId {
-        let id = self.next_id;
-        self.next_id += 1;
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        self.append_existing(None, message, turn_id, Some(timestamp))
+    }
 
-        self.nodes.insert(id, ConversationNode {
-            id,
+    /// 追加一条带现有元数据的消息。
+    ///
+    /// 主要用于从磁盘回放历史，保留既有 node_id / timestamp。
+    pub fn append_existing(
+        &mut self,
+        id: Option<NodeId>,
+        message: Message,
+        turn_id: u64,
+        timestamp: Option<String>,
+    ) -> NodeId {
+        let assigned_id = id.unwrap_or(self.next_id);
+        self.next_id = self.next_id.max(assigned_id.saturating_add(1));
+
+        self.nodes.insert(assigned_id, ConversationNode {
+            id: assigned_id,
             message,
             parent: self.head,
             turn_id,
+            timestamp: timestamp.unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
         });
 
-        self.head = Some(id);
-        id
+        self.head = Some(assigned_id);
+        assigned_id
     }
 
     /// 将 head 移动到指定节点（分支、重说、历史回退的统一原语）。
@@ -121,10 +138,18 @@ impl ConversationTree {
 
     /// 将 root → head 路径线性化为消息列表，供 API 调用。
     pub fn linearize(&self) -> Vec<Message> {
+        self.linearize_nodes()
+            .into_iter()
+            .map(|n| n.message)
+            .collect()
+    }
+
+    /// 将 root → head 路径线性化为完整节点列表，保留 node_id / turn_id / timestamp。
+    pub fn linearize_nodes(&self) -> Vec<ConversationNode> {
         self.path_to_head()
             .iter()
             .filter_map(|id| self.nodes.get(id))
-            .map(|n| n.message.clone())
+            .cloned()
             .collect()
     }
 

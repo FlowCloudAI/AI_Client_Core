@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
+use tokio::sync::watch;
 use serde_json::Value;
 use crate::llm::tree::ConversationTree;
 use crate::llm::types::{ChatRequest, CtrlMsg, Message};
@@ -18,6 +19,7 @@ pub struct SessionHandle {
     pub(crate) tree: Arc<RwLock<ConversationTree>>,
     pub(crate) system_messages: Arc<Vec<Message>>,
     pub(crate) ctrl_tx: mpsc::Sender<CtrlMsg>,
+    pub(crate) cancel_tx: watch::Sender<u64>,
 }
 
 impl SessionHandle {
@@ -140,5 +142,11 @@ impl SessionHandle {
             .send(CtrlMsg::Checkout { node_id })
             .await
             .map_err(|_| "会话已关闭".to_string())
+    }
+
+    /// 取消当前进行中的轮次。
+    pub fn cancel(&self) {
+        let next = self.cancel_tx.borrow().wrapping_add(1);
+        let _ = self.cancel_tx.send(next);
     }
 }

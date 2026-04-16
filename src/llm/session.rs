@@ -16,9 +16,10 @@ use anyhow::{anyhow, Context, Result};
 use futures_util::future::{self, Either};
 use futures_util::StreamExt;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, watch, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 
 // ═════════════════════════════════════════════════════════════
@@ -91,6 +92,13 @@ impl LLMSession {
         self.storage_ctx = Some(StorageCtx::new(plugin_id, store));
     }
 
+    /// 获取当前会话对应的持久化对话 ID。
+    pub fn conversation_id(&self) -> Option<&str> {
+        self.storage_ctx
+            .as_ref()
+            .map(|ctx| ctx.conversation_id.as_str())
+    }
+
     /// 注入存储上下文，复用已有对话 ID（续聊时调用，保证写盘覆盖而非新建文件）。
     pub fn resume_storage_ctx(
         &mut self,
@@ -124,7 +132,12 @@ impl LLMSession {
                     tool_call_id: stored.tool_call_id,
                     tool_calls: stored.tool_calls,
                 };
-                tree.append(msg, 0);
+                tree.append_existing(
+                    stored.node_id,
+                    msg,
+                    stored.turn_id.unwrap_or(0),
+                    Some(stored.timestamp),
+                );
             }
         }
     }
@@ -153,11 +166,6 @@ impl LLMSession {
         }
         self.system_messages = Arc::new(sys_msgs);
         self.conversation.write().await.tools = self.tool_registry.schemas();
-        let schemas = self.tool_registry.schemas();
-        println!(
-            "[debug] tool schemas count: {:?}",
-            schemas.as_ref().map(|v| v.len())
-        );
         Ok(self)
     }
 
@@ -231,12 +239,14 @@ impl LLMSession {
     ) -> (ReceiverStream<SessionEvent>, SessionHandle) {
         let (event_tx, event_rx) = mpsc::channel::<SessionEvent>(self.config.event_buffer);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<CtrlMsg>(8);
+        let (cancel_tx, cancel_rx) = watch::channel::<u64>(0);
 
         let handle = SessionHandle {
             inner: Arc::clone(&self.conversation),
             tree: Arc::clone(&self.tree),
             system_messages: Arc::clone(&self.system_messages),
             ctrl_tx,
+            cancel_tx,
         };
 
         std::thread::spawn(move || {
@@ -246,7 +256,10 @@ impl LLMSession {
                 .expect("failed to create session runtime");
 
             rt.block_on(async move {
-                if let Err(e) = self.drive(input_rx, ctrl_rx, ctx_rx, event_tx.clone()).await {
+                if let Err(e) = self
+                    .drive(input_rx, ctrl_rx, ctx_rx, cancel_rx, event_tx.clone())
+                    .await
+                {
                     let _ = event_tx.send(SessionEvent::Error(format!("{:#}", e))).await;
                 }
             });
@@ -259,6 +272,33 @@ impl LLMSession {
 // ── 核心状态机 ──
 
 impl LLMSession {
+    fn enabled_tool_names_from_request(req: &ChatRequest) -> HashSet<String> {
+        req.tools
+            .as_ref()
+            .map(|tools| {
+                tools.iter()
+                    .filter_map(|tool| {
+                        tool.get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn is_write_like_tool(name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        [
+            "create", "update", "delete", "remove", "edit", "rename", "write",
+            "save", "apply", "confirm", "install", "uninstall", "enable", "disable",
+            "set_", "set-", "merge",
+        ]
+        .iter()
+        .any(|token| lower.contains(token))
+    }
+
     async fn apply_assembled(&self, base: &ChatRequest, turn: &AssembledTurn) -> ChatRequest {
         let mut req = base.clone();
 
@@ -310,12 +350,15 @@ impl LLMSession {
         mut input_rx: mpsc::Receiver<String>,
         mut ctrl_rx: mpsc::Receiver<CtrlMsg>,
         mut ctx_rx: Option<mpsc::Receiver<TaskContext>>,
+        cancel_rx: watch::Receiver<u64>,
         event_tx: mpsc::Sender<SessionEvent>,
     ) -> Result<()> {
         let mut current_ctx = TaskContext::default();
+        let mut tool_rounds = 0usize;
 
         loop {
             if self.should_wait_for_user().await {
+                tool_rounds = 0;
                 event_tx.send(SessionEvent::NeedInput).await?;
 
                 // 并发等待用户输入或控制指令
@@ -370,21 +413,40 @@ impl LLMSession {
             } else {
                 req
             };
+            let enabled_tools = Self::enabled_tool_names_from_request(&req);
+            let read_only = current_ctx.read_only;
 
             let (content, reasoning, tool_calls, finish_reason, turn_status) =
-                self.send_and_process(&req, &event_tx).await?;
+                self.send_and_process(&req, cancel_rx.clone(), &event_tx).await?;
 
-            let asst_node_id = self
-                .add_message(Message::assistant(
+            let asst_node_id = if matches!(turn_status, TurnStatus::Cancelled | TurnStatus::Interrupted) {
+                turn_head_id
+            } else {
+                self.add_message(Message::assistant(
                     Some(content).filter(|s| !s.is_empty()),
                     Some(reasoning).filter(|s| !s.is_empty()),
                     tool_calls.clone(),
                 ))
-                .await;
+                .await
+            };
 
             if finish_reason.as_deref() == Some("tool_calls") {
                 if let Some(calls) = tool_calls {
-                    self.execute_tool_calls(calls, &event_tx).await?;
+                    tool_rounds += 1;
+                    if tool_rounds > self.config.max_tool_rounds {
+                        let status = TurnStatus::Error(format!(
+                            "工具调用超过最大连续轮数限制: {}",
+                            self.config.max_tool_rounds
+                        ));
+                        event_tx
+                            .send(SessionEvent::TurnEnd {
+                                status,
+                                node_id: asst_node_id,
+                            })
+                            .await?;
+                        continue;
+                    }
+                    self.execute_tool_calls(calls, &enabled_tools, read_only, &event_tx).await?;
                     continue;
                 }
             }
@@ -409,20 +471,22 @@ impl LLMSession {
             return;
         };
 
-        let now = chrono::Utc::now().to_rfc3339();
         let messages: Vec<StoredMessage> = self
             .tree
             .read()
             .await
-            .linearize()
+            .linearize_nodes()
             .into_iter()
-            .map(|m| StoredMessage {
-                role: m.role,
-                content: m.content,
-                reasoning: m.reasoning_content,
-                timestamp: now.clone(),
-                tool_call_id: m.tool_call_id,
-                tool_calls: m.tool_calls,
+            .map(|node| StoredMessage {
+                message_id: Some(format!("msg_{}", node.id)),
+                node_id: Some(node.id),
+                turn_id: Some(node.turn_id),
+                role: node.message.role,
+                content: node.message.content,
+                reasoning: node.message.reasoning_content,
+                timestamp: node.timestamp,
+                tool_call_id: node.message.tool_call_id,
+                tool_calls: node.message.tool_calls,
             })
             .collect();
 
@@ -483,6 +547,7 @@ impl LLMSession {
     async fn send_and_process(
         &mut self,
         req: &ChatRequest,
+        cancel_rx: watch::Receiver<u64>,
         event_tx: &mpsc::Sender<SessionEvent>,
     ) -> Result<(
         String,
@@ -492,7 +557,7 @@ impl LLMSession {
         TurnStatus,
     )> {
         if req.stream.unwrap_or(false) {
-            self.handle_stream(req, event_tx).await
+            self.handle_stream(req, cancel_rx, event_tx).await
         } else {
             self.handle_non_stream(req, event_tx).await
         }
@@ -556,6 +621,7 @@ impl LLMSession {
                     .send(SessionEvent::ToolCall {
                         index: call.index,
                         name: call.function.name.clone(),
+                        arguments: call.function.arguments.clone(),
                     })
                     .await?;
             }
@@ -574,6 +640,7 @@ impl LLMSession {
     async fn handle_stream(
         &mut self,
         req: &ChatRequest,
+        mut cancel_rx: watch::Receiver<u64>,
         event_tx: &mpsc::Sender<SessionEvent>,
     ) -> Result<(
         String,
@@ -601,8 +668,34 @@ impl LLMSession {
         let mut finish_reason: Option<String> = None;
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut turn_status = TurnStatus::Ok;
+        let cancel_version = *cancel_rx.borrow();
 
-        'outer: while let Some(raw_line) = stream.next().await {
+        'outer: loop {
+            let raw_line = tokio::select! {
+                changed = cancel_rx.changed() => {
+                    match changed {
+                        Ok(()) if *cancel_rx.borrow() != cancel_version => {
+                            turn_status = TurnStatus::Cancelled;
+                            finish_reason = Some("cancelled".to_string());
+                            break 'outer;
+                        }
+                        Ok(()) => {
+                            continue;
+                        }
+                        Err(_) => {
+                            turn_status = TurnStatus::Cancelled;
+                            finish_reason = Some("cancelled".to_string());
+                            break 'outer;
+                        }
+                    }
+                }
+                raw_line = stream.next() => {
+                    match raw_line {
+                        Some(raw_line) => raw_line,
+                        None => break 'outer,
+                    }
+                }
+            };
             let line = raw_line?;
             if line.is_empty() {
                 continue;
@@ -635,6 +728,7 @@ impl LLMSession {
                             .send(SessionEvent::ToolCall {
                                 index,
                                 name: tool_name,
+                                arguments: String::new(),
                             })
                             .await?;
                     }
@@ -649,6 +743,15 @@ impl LLMSession {
 
                     DecoderEventPayload::ToolCallsRequired => {
                         tool_calls = acc.build_calls(self.turn_id);
+                        for call in &tool_calls {
+                            event_tx
+                                .send(SessionEvent::ToolCall {
+                                    index: call.index,
+                                    name: call.function.name.clone(),
+                                    arguments: call.function.arguments.clone(),
+                                })
+                                .await?;
+                        }
                         finish_reason = Some("tool_calls".to_string());
                         break 'outer;
                     }
@@ -667,6 +770,10 @@ impl LLMSession {
                     _ => {}
                 }
             }
+        }
+
+        if finish_reason.is_none() {
+            return Err(anyhow!("流式响应异常结束：缺少终止标记"));
         }
 
         Ok((
@@ -689,23 +796,49 @@ impl LLMSession {
     async fn execute_tool_calls(
         &mut self,
         tool_calls: Vec<ToolCall>,
+        enabled_tools: &HashSet<String>,
+        read_only: bool,
         event_tx: &mpsc::Sender<SessionEvent>,
     ) -> Result<()> {
         for call in tool_calls {
             let func_name = &call.function.name;
             let args_str = call.function.arguments.trim();
 
-            let args_v: Value = if args_str.is_empty() {
-                Value::Object(Default::default())
+            let (output, is_error) = if !enabled_tools.is_empty() && !enabled_tools.contains(func_name) {
+                (format!("工具执行失败: 本轮不允许调用工具 '{}'", func_name), true)
+            } else if read_only && Self::is_write_like_tool(func_name) {
+                (format!("工具执行失败: 只读模式下禁止调用写入类工具 '{}'", func_name), true)
             } else {
-                serde_json::from_str(args_str)?
-            };
+                let args_v: Value = if args_str.is_empty() {
+                    Value::Object(Default::default())
+                } else {
+                    match serde_json::from_str(args_str) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let output = format!("工具执行失败: 工具参数不是合法 JSON: {}", e);
+                            event_tx
+                                .send(SessionEvent::ToolResult {
+                                    index: call.index,
+                                    output: output.clone(),
+                                    is_error: true,
+                                })
+                                .await?;
+                            let tool_call_id = Self::synth_tool_call_id(self.turn_id, call.index);
+                            let _ = self.add_message(Message::tool(output, tool_call_id)).await;
+                            continue;
+                        }
+                    }
+                };
 
-            let (output, is_error) =
-                match self.tool_registry.conduct(func_name, Some(&args_v), Duration::from_secs(600)).await {
+                match self
+                    .tool_registry
+                    .conduct(func_name, Some(&args_v), Duration::from_secs(600))
+                    .await
+                {
                     Ok(o) => (o, false),
                     Err(e) => (format!("工具执行失败: {}", e), true),
-                };
+                }
+            };
 
             let tool_call_id = Self::synth_tool_call_id(self.turn_id, call.index);
 

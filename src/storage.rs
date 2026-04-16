@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::{fs, io::Write};
 
 // ═════════════════════════════════════════════════════════════
 //                      存储数据结构
@@ -21,6 +22,12 @@ pub struct ConversationMeta {
 /// 存储格式中的单条消息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredMessage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<u64>,
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
@@ -36,9 +43,15 @@ pub struct StoredMessage {
 /// 存储在磁盘上的完整对话（元信息 + 消息列表）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredConversation {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     #[serde(flatten)]
     pub meta: ConversationMeta,
     pub messages: Vec<StoredMessage>,
+}
+
+fn default_schema_version() -> u32 {
+    2
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -58,15 +71,41 @@ impl ConversationStore {
         Ok(Self { dir })
     }
 
-    fn path_for(&self, id: &str) -> PathBuf {
-        self.dir.join(format!("{}.json", id))
+    fn sanitize_id<'a>(&self, id: &'a str) -> Result<&'a str> {
+        let valid = !id.is_empty()
+            && id.len() <= 128
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'));
+        if valid {
+            Ok(id)
+        } else {
+            Err(anyhow!("invalid conversation id"))
+        }
+    }
+
+    fn path_for(&self, id: &str) -> Result<PathBuf> {
+        let safe_id = self.sanitize_id(id)?;
+        Ok(self.dir.join(format!("{}.json", safe_id)))
     }
 
     /// 保存（覆盖写入）一条对话。
     pub fn save(&self, conv: &StoredConversation) -> Result<()> {
-        let path = self.path_for(&conv.meta.id);
+        let path = self.path_for(&conv.meta.id)?;
         let json = serde_json::to_string_pretty(conv)?;
-        std::fs::write(path, json)?;
+        let temp_path = path.with_extension("json.tmp");
+
+        {
+            let mut file = fs::File::create(&temp_path)?;
+            file.write_all(json.as_bytes())?;
+            file.flush()?;
+            file.sync_all()?;
+        }
+
+        if path.exists() {
+            fs::remove_file(&path)?;
+        }
+        fs::rename(&temp_path, &path)?;
         Ok(())
     }
 
@@ -82,9 +121,12 @@ impl ConversationStore {
                 continue;
             }
             if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Ok(conv) = serde_json::from_str::<StoredConversation>(&content) {
-                    metas.push(conv.meta);
+                match serde_json::from_str::<StoredConversation>(&content) {
+                    Ok(conv) => metas.push(conv.meta),
+                    Err(err) => eprintln!("[storage] 解析对话文件失败: path={} error={}", path.display(), err),
                 }
+            } else {
+                eprintln!("[storage] 读取对话文件失败: path={}", path.display());
             }
         }
         metas.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -93,13 +135,20 @@ impl ConversationStore {
 
     /// 返回完整对话（含消息列表），未找到则返回 None。
     pub fn get(&self, id: &str) -> Option<StoredConversation> {
-        let content = std::fs::read_to_string(self.path_for(id)).ok()?;
-        serde_json::from_str(&content).ok()
+        let path = self.path_for(id).ok()?;
+        let content = std::fs::read_to_string(&path).ok()?;
+        match serde_json::from_str(&content) {
+            Ok(conv) => Some(conv),
+            Err(err) => {
+                eprintln!("[storage] 解析对话文件失败: path={} error={}", path.display(), err);
+                None
+            }
+        }
     }
 
     /// 删除指定对话文件。
     pub fn delete(&self, id: &str) -> Result<()> {
-        let path = self.path_for(id);
+        let path = self.path_for(id)?;
         if !path.exists() {
             return Err(anyhow!("conversation '{}' not found", id));
         }
@@ -187,6 +236,7 @@ impl StorageCtx {
         };
 
         let conv = StoredConversation {
+            schema_version: default_schema_version(),
             meta: ConversationMeta {
                 id: self.conversation_id.clone(),
                 title,

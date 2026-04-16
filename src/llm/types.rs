@@ -394,6 +394,7 @@ pub enum SessionEvent {
     ToolCall {
         index: usize,
         name: String,
+        arguments: String,
     },
     ToolResult {
         index: usize,

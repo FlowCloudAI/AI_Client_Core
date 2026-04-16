@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use serde_json::Value;
 use crate::llm::types::{ToolCall, ToolFunctionCall};
 
 // ═════════════════════════════════════════════════════════════
@@ -73,7 +72,7 @@ impl ToolCallAccumulator {
                 }
 
                 let mut args = self.args.get(&index).cloned().unwrap_or_default();
-                if args.trim().is_empty() || serde_json::from_str::<Value>(&args).is_err() {
+                if args.trim().is_empty() {
                     args = "{}".to_string();
                 }
 
