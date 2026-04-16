@@ -121,8 +121,8 @@ impl LLMSession {
                     role: stored.role,
                     content: stored.content,
                     reasoning_content: stored.reasoning,
-                    tool_call_id: None,
-                    tool_calls: None,
+                    tool_call_id: stored.tool_call_id,
+                    tool_calls: stored.tool_calls,
                 };
                 tree.append(msg, 0);
             }
@@ -421,6 +421,8 @@ impl LLMSession {
                 content: m.content,
                 reasoning: m.reasoning_content,
                 timestamp: now.clone(),
+                tool_call_id: m.tool_call_id,
+                tool_calls: m.tool_calls,
             })
             .collect();
 

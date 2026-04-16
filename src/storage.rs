@@ -27,6 +27,10 @@ pub struct StoredMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
     pub timestamp: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<crate::llm::types::ToolCall>>,
 }
 
 /// 存储在磁盘上的完整对话（元信息 + 消息列表）
