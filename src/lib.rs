@@ -8,6 +8,7 @@ pub mod tool;
 pub mod orchestrator;
 pub mod sense;
 pub mod audio;
+pub mod storage;
 
 pub const SUPPORTED_ABI_VERSION: u32 = 2;
 
@@ -23,3 +24,4 @@ pub use audio::{AudioDecoder, AudioSource};
 pub use image::{ImageSession};
 pub use tts::{TTSSession};
 pub use tool::ToolRegistry;
+pub use storage::{ConversationMeta, StoredConversation, StoredMessage, ConversationStore};

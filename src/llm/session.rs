@@ -10,6 +10,7 @@ use crate::llm::types::{
 };
 use crate::orchestrator::{AssembledTurn, TaskContext, TaskOrchestrator};
 use crate::plugin::pipeline::ApiPipeline;
+use crate::storage::{StorageCtx, StoredMessage};
 use crate::tool::registry::ToolRegistry;
 use anyhow::{anyhow, Context, Result};
 use futures_util::future::{self, Either};
@@ -57,6 +58,9 @@ pub struct LLMSession {
     turn_id: u64,
 
     orchestrator: Option<TaskOrchestrator>,
+
+    /// 可选的持久化上下文（storage_path 不为 None 时由 client 注入）
+    storage_ctx: Option<StorageCtx>,
 }
 
 // ── 构建 & 配置 ──
@@ -78,7 +82,13 @@ impl LLMSession {
             pipeline,
             turn_id: 0,
             orchestrator: None,
+            storage_ctx: None,
         })
+    }
+
+    /// 注入存储上下文（由 FlowCloudAIClient 在 create_llm_session 中调用）。
+    pub fn set_storage_ctx(&mut self, plugin_id: String, store: std::sync::Arc<crate::storage::ConversationStore>) {
+        self.storage_ctx = Some(StorageCtx::new(plugin_id, store));
     }
 
     pub fn set_api(&mut self, api_key: &str) {
@@ -341,13 +351,43 @@ impl LLMSession {
                 }
             }
 
+            let is_ok = matches!(turn_status, TurnStatus::Ok);
             event_tx
                 .send(SessionEvent::TurnEnd {
                     status: turn_status,
                     node_id: asst_node_id,
                 })
                 .await?;
+
+            if is_ok {
+                self.auto_save().await;
+            }
         }
+    }
+
+    /// 将当前对话树写入磁盘（仅当 storage_ctx 已注入时生效）。
+    async fn auto_save(&self) {
+        let Some(ref ctx) = self.storage_ctx else {
+            return;
+        };
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let messages: Vec<StoredMessage> = self
+            .tree
+            .read()
+            .await
+            .linearize()
+            .into_iter()
+            .map(|m| StoredMessage {
+                role: m.role,
+                content: m.content,
+                reasoning: m.reasoning_content,
+                timestamp: now.clone(),
+            })
+            .collect();
+
+        let model = self.conversation.read().await.model.clone();
+        ctx.flush(messages, &model);
     }
 
     async fn should_wait_for_user(&self) -> bool {

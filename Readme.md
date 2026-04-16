@@ -34,8 +34,11 @@ use futures_util::StreamExt;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 1. 初始化客户端（传入插件目录路径）
-    let client = FlowCloudAIClient::new(PathBuf::from("./plugins"))?;
+    // 1. 初始化客户端（插件目录 + 可选的对话存储目录）
+    let client = FlowCloudAIClient::new(
+        PathBuf::from("./plugins"),
+        Some(PathBuf::from("./conversations")), // None = 不持久化
+    )?;
 
     // 2. 列出可用的 LLM 插件
     for (id, meta) in client.list_by_kind(PluginKind::LLM) {
@@ -88,8 +91,11 @@ FlowCloudAIClient (主入口)
   │   ├── Tool #2
   │   └── ...
   │
+  ├── ConversationStore (对话持久化，可选)
+  │   └── {conversation_id}.json × N
+  │
   └── Session 工厂
-      ├── LLMSession (对话)
+      ├── LLMSession (对话，TurnEnd Ok 时自动写盘)
       ├── ImageSession (图像)
       ├── TTSSession (语音)
       └── AudioDecoder (音频)
@@ -184,22 +190,23 @@ FlowCloudAIClient (主入口)
 
 ### 3.1 FlowCloudAIClient（主入口）
 
-**职责**：初始化系统、加载插件、创建各类 Session
+**职责**：初始化系统、加载插件、创建各类 Session、管理对话历史
 
 ```rust
 pub struct FlowCloudAIClient {
     plugin_registry: Arc<PluginRegistry>,
     tool_registry: Arc<ToolRegistry>,
+    storage: Option<Arc<ConversationStore>>,  // 新增
 }
 
 impl FlowCloudAIClient {
-    // 初始化，传入插件目录路径（支持 Tauri 等平台的动态路径）
-    pub fn new(plugins_dir: PathBuf) -> Result<Self>;
+    // 初始化。storage_path = Some(dir) 时启用本地持久化，None 时关闭
+    pub fn new(plugins_dir: PathBuf, storage_path: Option<PathBuf>) -> Result<Self>;
 
     // 列出指定类型的插件（LLM / Image / TTS）
     pub fn list_by_kind(&self, kind: PluginKind) -> Vec<(&String, &PluginMeta)>;
 
-    // 创建 LLM 会话
+    // 创建 LLM 会话（已启用 storage 时自动注入存储上下文）
     pub fn create_llm_session(&self, plugin_id: &str, api_key: &str) -> Result<LLMSession>;
 
     // 创建图像会话
@@ -210,21 +217,47 @@ impl FlowCloudAIClient {
 
     // 安装工具到全局库
     pub fn install_sense(&mut self, sense: &dyn Sense) -> Result<()>;
+
+    // ── 对话历史管理（需 storage_path 已配置）──────────────────
+
+    // 列出所有已保存对话的元信息，按 updated_at 降序
+    pub fn ai_list_conversations(&self) -> Vec<ConversationMeta>;
+
+    // 返回完整对话（含消息列表），未找到返回 None
+    pub fn ai_get_conversation(&self, id: &str) -> Option<StoredConversation>;
+
+    // 删除对话文件
+    pub fn ai_delete_conversation(&self, id: &str) -> Result<()>;
+
+    // 重命名对话（修改 title + 更新 updated_at）
+    pub fn ai_rename_conversation(&self, id: &str, title: String) -> Result<()>;
 }
 ```
 
 **使用示例**：
 
 ```rust
-let client = FlowCloudAIClient::new(PathBuf::from("./plugins"))?;
+// 启用持久化
+let client = FlowCloudAIClient::new(
+    PathBuf::from("./plugins"),
+    Some(PathBuf::from("./conversations")),
+)?;
 
-// 列出所有可用的 LLM
-for (id, meta) in client.list_by_kind(PluginKind::LLM) {
-    println!("Plugin: {}", id);
+// 创建会话（自动在每轮成功结束后写盘）
+let mut session = client.create_llm_session("openai", "sk-xxx")?;
+
+// 查询历史
+let list = client.ai_list_conversations();
+for meta in &list {
+    println!("{} — {} ({})", meta.id, meta.title, meta.updated_at);
 }
 
-// 创建会话
-let mut session = client.create_llm_session("openai", "sk-xxx")?;
+// 读取完整对话
+if let Some(conv) = client.ai_get_conversation(&list[0].id) {
+    for msg in &conv.messages {
+        println!("[{}] {}", msg.role, msg.content.as_deref().unwrap_or(""));
+    }
+}
 ```
 
 ### 3.2 PluginRegistry（插件注册中心）
@@ -1462,19 +1495,114 @@ println!("Tools: {:?}", conv.tools.map(|t| t.len()));
 
 ---
 
+## 十三、对话本地持久化
+
+### 13.1 存储数据结构
+
+```rust
+/// 对话元信息（ai_list_conversations 返回此结构，不含消息体）
+pub struct ConversationMeta {
+    pub id: String,          // 毫秒级时间戳，如 "20260416152345678"
+    pub title: String,       // 首次保存时从第一条 user 消息自动截取（50字），可 rename
+    pub plugin_id: String,   // 会话使用的插件 ID
+    pub model: String,       // 最后一次使用的模型名
+    pub created_at: String,  // ISO 8601
+    pub updated_at: String,  // ISO 8601，每次 TurnEnd Ok 更新
+}
+
+/// 存储格式中的单条消息
+pub struct StoredMessage {
+    pub role: String,              // "user" / "assistant" / "tool"
+    pub content: Option<String>,
+    pub reasoning: Option<String>, // 思考链（DeepSeek/o1 等模型）
+    pub timestamp: String,         // 本条消息的保存时间（ISO 8601）
+}
+
+/// 磁盘文件的完整结构（{id}.json）
+pub struct StoredConversation {
+    // flatten：顶层字段包含 ConversationMeta 的所有字段
+    pub meta: ConversationMeta,
+    pub messages: Vec<StoredMessage>,
+}
+```
+
+**JSON 文件示例**（`conversations/20260416152345678.json`）：
+
+```json
+{
+  "id": "20260416152345678",
+  "title": "解释量子纠缠",
+  "plugin_id": "openai",
+  "model": "gpt-4o",
+  "created_at": "2026-04-16T15:23:45.678+00:00",
+  "updated_at": "2026-04-16T15:24:12.001+00:00",
+  "messages": [
+    {
+      "role": "user",
+      "content": "解释量子纠缠",
+      "timestamp": "2026-04-16T15:24:12.001+00:00"
+    },
+    {
+      "role": "assistant",
+      "content": "量子纠缠是指…",
+      "timestamp": "2026-04-16T15:24:12.001+00:00"
+    }
+  ]
+}
+```
+
+### 13.2 自动保存时机
+
+- 每次 `TurnEnd { status: TurnStatus::Ok }` 事件发出后触发
+- 工具调用轮次（`finish_reason = "tool_calls"`）不会触发，只有最终轮次（模型真正停止输出）才写盘
+- 写盘失败时只打印 stderr 警告，不影响会话继续
+
+### 13.3 标题生成规则
+
+| 场景 | 行为 |
+|------|------|
+| 首次保存 | 从消息列表中找第一条 `user` 消息，截取前 50 个字符作为标题，超出时追加 `…` |
+| 后续保存 | 重读文件，保留已有标题（保证 `ai_rename_conversation` 的修改不被覆盖） |
+| 找不到 user 消息 | 使用 `"新对话"` 作为默认标题 |
+
+### 13.4 ConversationStore（直接使用）
+
+如需在 `FlowCloudAIClient` 之外单独操作存储：
+
+```rust
+use flowcloudai_client::ConversationStore;
+
+let store = ConversationStore::new(PathBuf::from("./conversations"))?;
+
+// 列出所有对话
+let list = store.list();  // Vec<ConversationMeta>，按 updated_at 降序
+
+// 读取完整对话
+let conv = store.get("20260416152345678");  // Option<StoredConversation>
+
+// 删除
+store.delete("20260416152345678")?;
+
+// 重命名
+store.rename("20260416152345678", "新标题".to_string())?;
+```
+
+---
+
 ## 总结
 
-| 组件                    | 职责        | 核心方法                                               |
-|-----------------------|-----------|----------------------------------------------------|
-| **FlowCloudAIClient** | 初始化、工厂    | `new()`, `create_llm_session()`                    |
-| **PluginRegistry**    | WASM 插件管理 | `load()`, `acquire()`                              |
-| **LLMSession**        | 对话处理      | `load_sense()`, `set_model()`, `run()`             |
-| **ToolRegistry**      | 工具库       | `register()`, `conduct()`                          |
-| **Sense**             | 模式预设      | `prompts()`, `install_tools()`, `tool_whitelist()` |
-| **TaskOrchestrator**  | 动态编排      | `assemble()`                                       |
-| **ImageSession**      | 图像生成      | `generate()`, `text_to_image()`                    |
-| **TTSSession**        | 语音合成      | `synthesize()`, `speak()`                          |
-| **AudioDecoder**      | 音频解码播放    | `decode()`, `play()`                               |
+| 组件                    | 职责           | 核心方法                                                                   |
+|-----------------------|--------------|------------------------------------------------------------------------|
+| **FlowCloudAIClient** | 初始化、工厂、历史管理  | `new()`, `create_llm_session()`, `ai_list_conversations()`, `ai_get_conversation()` |
+| **PluginRegistry**    | WASM 插件管理    | `load()`, `acquire()`                                                  |
+| **LLMSession**        | 对话处理         | `load_sense()`, `set_model()`, `run()`                                 |
+| **ToolRegistry**      | 工具库          | `register()`, `conduct()`                                              |
+| **Sense**             | 模式预设         | `prompts()`, `install_tools()`, `tool_whitelist()`                     |
+| **TaskOrchestrator**  | 动态编排         | `assemble()`                                                           |
+| **ConversationStore** | JSON 文件持久化   | `list()`, `get()`, `delete()`, `rename()`                              |
+| **ImageSession**      | 图像生成         | `generate()`, `text_to_image()`                                        |
+| **TTSSession**        | 语音合成         | `synthesize()`, `speak()`                                              |
+| **AudioDecoder**      | 音频解码播放       | `decode()`, `play()`                                                   |
 
 **设计原则**：
 - ✅ **插件隔离**：WASM 沙箱执行，互不影响
@@ -1483,10 +1611,11 @@ println!("Tools: {:?}", conv.tools.map(|t| t.len()));
 - ✅ **流式优先**：原生支持 SSE，秒级反馈
 - ✅ **编排灵活**：Sense + TaskOrchestrator 动态装配
 - ✅ **多模态统一**：LLM、Image、TTS、Audio 统一管理
+- ✅ **持久化可选**：JSON 文件存储，按需开启，不改变核心流程
 
 ---
 
-**文档版本**：1.0  
-**最后更新**：2026-03-23  
+**文档版本**：1.1  
+**最后更新**：2026-04-16  
 **项目**：flowcloudai_client_core  
 **维护者**：FlowCloud 团队
