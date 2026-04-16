@@ -22,7 +22,7 @@ const COLOR_RESET: &str = "\x1b[0m";
 #[tokio::main]
 async fn main() -> Result<()> {
     // ── 初始化客户端，扫描 ./plugins 目录 ──
-    let mut client = FlowCloudAIClient::new(PathBuf::from("./plugins"))?;
+    let mut client = FlowCloudAIClient::new(PathBuf::from("./plugins"), None)?;
 
     let acs_sense = senses::militech_acs::ACSSense::new();
 

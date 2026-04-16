@@ -12,7 +12,7 @@ use std::path::PathBuf;
 fn main() -> Result<()> {
     // 初始化客户端
     let plugins_dir = PathBuf::from("./plugins");
-    let client = FlowCloudAIClient::new(plugins_dir.clone())?;
+    let client = FlowCloudAIClient::new(plugins_dir.clone(), None)?;
 
     println!("=== 1. 列出所有已识别插件 ===");
     let plugins = client.list_all_plugins();

@@ -406,6 +406,7 @@ impl LLMSession {
             .cloned()
             .chain(self.tree.read().await.linearize())
             .collect();
+        req.tools = self.tool_registry.schemas();
         req
     }
 
