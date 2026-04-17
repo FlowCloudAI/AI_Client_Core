@@ -36,12 +36,20 @@ impl FlowCloudAIClient {
                 for (id, meta) in &pm.plugins {
                     println!("[plugin] found: {} ({:?})", id, meta.kind);
                 }
-                PluginRegistry::build(
+                let mut registry = PluginRegistry::build(
                     pm.engine.clone(),
                     pm.linker.clone(),
                     pm.plugins.clone(),
                     8,
-                )?
+                )?;
+
+                // 扫描到的插件默认自动激活，避免 session 在未显式 load_plugin 时退回直通模式。
+                let plugin_ids: Vec<String> = registry.list_plugins().keys().cloned().collect();
+                for id in plugin_ids {
+                    registry.load(&id)?;
+                }
+
+                registry
             }
             Err(e) => {
                 println!("[plugin] no plugins loaded: {}", e);
@@ -243,6 +251,7 @@ impl FlowCloudAIClient {
         })?;
 
         registry.add_module(info.id.clone(), meta.clone(), &wasm_bytes)?;
+        registry.load(&info.id)?;
 
         println!("[plugin] installed: {} ({})", info.id, dest_path.display());
         Ok(meta)

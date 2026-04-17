@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use anyhow::Context;
 use flowcloudai_client::FlowCloudAIClient;
 use flowcloudai_client::image::ImageRequest;
 
@@ -14,17 +15,17 @@ async fn main() -> anyhow::Result<()> {
     // 文生图
     let result = img.text_to_image("qwen-image-plus", "一只猫在月光下散步").await?;
 
-    let mut reference_image_url:String = "".to_string();
-
     for image in &result.images {
         println!("URL: {:?}, size: {:?}", image.url, image.size);
-        match image.url.clone() {
-            Some(url) => {
-                reference_image_url = url;
-            }
-            None => {}
-        }
     }
+
+    let reference_image_url = result
+        .images
+        .iter()
+        .find_map(|image| image.url.clone())
+        .context("首张文生图结果缺少 URL，无法继续执行图生图示例")?;
+
+    println!("使用参考图进行编辑: {}", reference_image_url);
 
     // 图文生图
     let result = img.edit_image(

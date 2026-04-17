@@ -101,7 +101,7 @@ async fn run_chat_loop(
                 stdout().flush().ok();
             }
 
-            SessionEvent::ToolCall { index, name } => {
+            SessionEvent::ToolCall { index, name, .. } => {
                 println!(
                     "\n{}[ToolCall] index={}\nname={}{}",
                     TOOL_CALL_COLOR, index, name, COLOR_RESET
