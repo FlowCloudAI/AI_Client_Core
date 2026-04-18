@@ -25,3 +25,4 @@ pub use image::{ImageSession};
 pub use tts::{TTSSession};
 pub use tool::ToolRegistry;
 pub use storage::{ConversationMeta, StoredConversation, StoredMessage, ConversationStore};
+pub use orchestrator::{Orchestrate, TaskContext, AssembledTurn, DefaultOrchestrator};

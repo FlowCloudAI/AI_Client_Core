@@ -47,7 +47,7 @@ async fn main() -> Result<()> {
     let (input_tx, input_rx) = mpsc::channel::<String>(32);
 
     // run() 返回事件流 + 句柄；句柄用于在任意时刻修改对话参数
-    let (event_stream, _handle) = session.run(input_rx, None);
+    let (event_stream, _handle) = session.run(input_rx);
 
 
 

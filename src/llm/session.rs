@@ -8,7 +8,7 @@ use crate::llm::types::{
     ChatRequest, ChatResponse, CtrlMsg, DecoderEventPayload, Message, SessionEvent, ThinkingType,
     ToolCall, TurnStatus,
 };
-use crate::orchestrator::{AssembledTurn, TaskContext, TaskOrchestrator};
+use crate::orchestrator::{AssembledTurn, Orchestrate, TaskContext};
 use crate::plugin::pipeline::ApiPipeline;
 use crate::storage::{StorageCtx, StoredMessage};
 use crate::tool::registry::ToolRegistry;
@@ -58,7 +58,7 @@ pub struct LLMSession {
     /// 当前轮次 ID
     turn_id: u64,
 
-    orchestrator: Option<TaskOrchestrator>,
+    orchestrator: Option<Box<dyn Orchestrate>>,
 
     /// 可选的持久化上下文（storage_path 不为 None 时由 client 注入）
     storage_ctx: Option<StorageCtx>,
@@ -227,6 +227,24 @@ impl LLMSession {
         self.conversation.write().await.n = Some(n);
         self
     }
+
+    // ── 编排器 ──
+
+    /// 设置编排器（装箱类型，直接接受 `Box<dyn Orchestrate>`）。
+    ///
+    /// 适合调用方手里已经持有 trait object 的场景。
+    pub fn set_orchestrator(&mut self, orch: Box<dyn Orchestrate>) -> &mut Self {
+        self.orchestrator = Some(orch);
+        self
+    }
+
+    /// 设置编排器（泛型便捷版，自动装箱）。
+    ///
+    /// 适合直接传入具体类型（如 `DefaultOrchestrator`）的场景。
+    pub fn with_orchestrator<T: Orchestrate + 'static>(&mut self, orch: T) -> &mut Self {
+        self.orchestrator = Some(Box::new(orch));
+        self
+    }
 }
 
 // ── 启动 ──
@@ -235,11 +253,11 @@ impl LLMSession {
     pub fn run(
         self,
         input_rx: mpsc::Receiver<String>,
-        ctx_rx: Option<mpsc::Receiver<TaskContext>>,
     ) -> (ReceiverStream<SessionEvent>, SessionHandle) {
         let (event_tx, event_rx) = mpsc::channel::<SessionEvent>(self.config.event_buffer);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<CtrlMsg>(8);
         let (cancel_tx, cancel_rx) = watch::channel::<u64>(0);
+        let (ctx_tx, ctx_rx) = mpsc::channel::<TaskContext>(16);
 
         let handle = SessionHandle {
             inner: Arc::clone(&self.conversation),
@@ -247,6 +265,7 @@ impl LLMSession {
             system_messages: Arc::clone(&self.system_messages),
             ctrl_tx,
             cancel_tx,
+            ctx_tx,
         };
 
         std::thread::spawn(move || {
@@ -257,7 +276,68 @@ impl LLMSession {
 
             rt.block_on(async move {
                 if let Err(e) = self
-                    .drive(input_rx, ctrl_rx, ctx_rx, cancel_rx, event_tx.clone())
+                    .drive(input_rx, ctrl_rx, Some(ctx_rx), cancel_rx, event_tx.clone())
+                    .await
+                {
+                    let _ = event_tx.send(SessionEvent::Error(format!("{:#}", e))).await;
+                }
+            });
+        });
+
+        (ReceiverStream::new(event_rx), handle)
+    }
+
+    /// 底层版本：接受调用方自持的 ctx 接收端，适合将上下文流接入已有系统。
+    ///
+    /// 与 `run()` 的区别：
+    /// - 调用方自己持有 `mpsc::Sender<TaskContext>`，可从任意异步上下文推送
+    /// - `SessionHandle::set_task_context` 依然可用（内部合并两路来源）
+    /// - 两路上下文均在每轮 assemble 前以 `try_recv` 排空，取最新值
+    ///
+    /// # 示例
+    /// ```rust
+    /// let (ctx_tx, ctx_rx) = mpsc::channel::<TaskContext>(16);
+    /// let (events, handle) = session.run_with_context_channel(input_rx, ctx_rx);
+    /// // 外部推送（等价于 handle.set_task_context，但可跨模块持有 tx）
+    /// ctx_tx.send(my_ctx).await?;
+    /// ```
+    pub fn run_with_context_channel(
+        self,
+        input_rx: mpsc::Receiver<String>,
+        mut ext_ctx_rx: mpsc::Receiver<TaskContext>,
+    ) -> (ReceiverStream<SessionEvent>, SessionHandle) {
+        let (event_tx, event_rx) = mpsc::channel::<SessionEvent>(self.config.event_buffer);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<CtrlMsg>(8);
+        let (cancel_tx, cancel_rx) = watch::channel::<u64>(0);
+        let (ctx_tx, ctx_rx) = mpsc::channel::<TaskContext>(16);
+
+        let handle = SessionHandle {
+            inner: Arc::clone(&self.conversation),
+            tree: Arc::clone(&self.tree),
+            system_messages: Arc::clone(&self.system_messages),
+            ctrl_tx,
+            cancel_tx,
+            ctx_tx: ctx_tx.clone(),
+        };
+
+        // 将外部 ctx_rx 转发到内部 channel，与 handle.set_task_context 合并为同一路输入
+        tokio::spawn(async move {
+            while let Some(ctx) = ext_ctx_rx.recv().await {
+                if ctx_tx.send(ctx).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to create session runtime");
+
+            rt.block_on(async move {
+                if let Err(e) = self
+                    .drive(input_rx, ctrl_rx, Some(ctx_rx), cancel_rx, event_tx.clone())
                     .await
                 {
                     let _ = event_tx.send(SessionEvent::Error(format!("{:#}", e))).await;
@@ -307,7 +387,10 @@ impl LLMSession {
             req.messages.insert(req.messages.len().saturating_sub(1), Message::system(msg.clone()));
         }
 
-        // 覆盖工具 schemas
+        // 工具 schemas 三态：
+        //   None          → 不干预，保持 snapshot 的工具配置
+        //   Some(vec![])  → 显式禁用全部工具
+        //   Some(schemas) → 显式覆盖为给定工具集
         if turn.tool_schemas.is_some() {
             req.tools = turn.tool_schemas.clone();
         }
@@ -407,14 +490,17 @@ impl LLMSession {
             let req = self.snapshot().await;
 
             // Orchestrator 装配（如果有）
-            let req = if let Some(ref orch) = self.orchestrator {
+            // Session 永远只读 AssembledTurn::read_only，不感知 TaskContext 业务字段。
+            // 无编排器时使用 AssembledTurn::default()，read_only = false。
+            let (req, read_only) = if let Some(ref orch) = self.orchestrator {
                 let assembled = orch.assemble(&current_ctx)?;
-                self.apply_assembled(&req, &assembled).await
+                let read_only = assembled.read_only;
+                let req = self.apply_assembled(&req, &assembled).await;
+                (req, read_only)
             } else {
-                req
+                (req, AssembledTurn::default().read_only)
             };
             let enabled_tools = Self::enabled_tool_names_from_request(&req);
-            let read_only = current_ctx.read_only;
 
             let (content, reasoning, tool_calls, finish_reason, turn_status) =
                 self.send_and_process(&req, cancel_rx.clone(), &event_tx).await?;

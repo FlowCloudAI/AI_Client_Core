@@ -62,8 +62,8 @@ async fn main() -> Result<()> {
     let (a_tx, a_rx) = mpsc::channel::<String>(32);
     let (b_tx, b_rx) = mpsc::channel::<String>(32);
 
-    let (a_stream, _a_handle) = bot_a.run(a_rx, None);
-    let (b_stream, _b_handle) = bot_b.run(b_rx, None);
+    let (a_stream, _a_handle) = bot_a.run(a_rx);
+    let (b_stream, _b_handle) = bot_b.run(b_rx);
 
     run_chat_loop(a_stream, b_stream, a_tx, b_tx).await?;
 

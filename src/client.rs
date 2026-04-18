@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::image::ImageSession;
 use crate::llm::config::SessionConfig;
 use crate::llm::session::LLMSession;
-use crate::orchestrator::TaskOrchestrator;
+use crate::orchestrator::Orchestrate;
 use crate::plugin::manager::PluginManager;
 use crate::plugin::pipeline::ApiPipeline;
 use crate::plugin::registry::PluginRegistry;
@@ -409,14 +409,23 @@ impl FlowCloudAIClient {
 
     /// 创建 LLM 会话（编排模式）。
     ///
-    /// 返回 (Session, Orchestrator)。
-    /// Orchestrator 可在运行时 `assemble` 每轮配置。
+    /// 传入任意 `Box<dyn Orchestrate>` 实现，编排器将嵌入 Session 内部，
+    /// 每轮对话开始前自动调用 `assemble`。
+    ///
+    /// 使用内置策略时，可通过 `DefaultOrchestrator::new(registry)` 构建：
+    /// ```rust
+    /// let orch = DefaultOrchestrator::new(client.tool_registry().clone())
+    ///     .with_whitelist(my_sense.tool_whitelist());
+    /// let session = client.create_orchestrated_session(plugin_id, api_key, Box::new(orch))?;
+    /// ```
+    ///
+    /// 若需要同时加载 Sense，使用 `create_orchestrated_session_with_sense`（async）。
     pub fn create_orchestrated_session(
         &self,
         plugin_id: &str,
         api_key: &str,
-        sense: Box<dyn Sense>,
-    ) -> Result<(LLMSession, TaskOrchestrator)> {
+        orchestrator: Box<dyn Orchestrate>,
+    ) -> Result<LLMSession> {
         let url = self.plugin_registry.get_url(plugin_id)?;
         if !url.starts_with("http") {
             return Err(anyhow!("plugin '{}' has invalid URL: {}", plugin_id, url));
@@ -431,11 +440,6 @@ impl FlowCloudAIClient {
             max_line_bytes: 1024 * 1024,
         };
 
-        let orchestrator = TaskOrchestrator::new(
-            sense,
-            Arc::clone(&self.tool_registry),
-        );
-
         let pipeline = ApiPipeline::new(
             Arc::clone(&self.plugin_registry),
             Some(plugin_id.to_string()),
@@ -447,11 +451,40 @@ impl FlowCloudAIClient {
             Arc::clone(&self.tool_registry),
         )?;
 
+        session.set_orchestrator(orchestrator);
+
         if let Some(ref store) = self.storage {
             session.set_storage_ctx(plugin_id.to_string(), Arc::clone(store));
         }
 
-        Ok((session, orchestrator))
+        Ok(session)
+    }
+
+    /// 创建 LLM 会话（编排模式，同时加载 Sense）。
+    ///
+    /// 等价于：
+    /// ```rust
+    /// let mut session = client.create_orchestrated_session(plugin_id, api_key, orchestrator)?;
+    /// session.load_sense(sense).await?;
+    /// ```
+    ///
+    /// `Sense` 只进入 `load_sense()`（系统提示 + 工具安装），不进入编排器。
+    /// 若需要编排器感知工具白名单，在构建 `DefaultOrchestrator` 时显式传入：
+    /// ```rust
+    /// let orch = DefaultOrchestrator::new(client.tool_registry().clone())
+    ///     .with_whitelist(my_sense.tool_whitelist());
+    /// client.create_orchestrated_session_with_sense(plugin_id, api_key, my_sense, Box::new(orch)).await?;
+    /// ```
+    pub async fn create_orchestrated_session_with_sense(
+        &self,
+        plugin_id: &str,
+        api_key: &str,
+        sense: impl crate::sense::Sense,
+        orchestrator: Box<dyn Orchestrate>,
+    ) -> Result<LLMSession> {
+        let mut session = self.create_orchestrated_session(plugin_id, api_key, orchestrator)?;
+        session.load_sense(sense).await?;
+        Ok(session)
     }
 
     /// 创建 TTS 语音合成会话。

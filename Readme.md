@@ -21,7 +21,7 @@
 | **工具链** | 工具库 + 执行引擎 + 结果回源 |
 | **插件适配** | WASM 组件模型，请求/响应自动映射 |
 | **会话管理** | 对话消息树、分支/回退/重说、外部句柄 |
-| **编排灵活** | Sense 预设 + TaskOrchestrator 动态装配 |
+| **编排灵活** | Sense 预设 + `Orchestrate` trait 动态装配，完全可自定义 |
 
 ### 五分钟上手
 
@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
 
     // 5. 通过 channel 发送消息，驱动会话
     let (input_tx, input_rx) = mpsc::channel::<String>(32);
-    let (mut event_stream, handle) = session.run(input_rx, None);
+    let (mut event_stream, handle) = session.run(input_rx);
 
     // 发送消息
     input_tx.send("用 Markdown 写一篇关于 AI 的短文".to_string()).await?;
@@ -162,7 +162,7 @@ FlowCloudAIClient (主入口)
 │  ┌────┴────────────────────────────────────┐  │
 │  │  PluginRegistry（注册中心 + 实例池）    │  │
 │  │  ToolRegistry（工具库）                 │  │
-│  │  TaskOrchestrator（编排引擎）          │  │
+│  │  Orchestrate trait / DefaultOrchestrator │  │
 │  └────────────────────────────────────────┘  │
 └────────────────────┬────────────────────────────┘
                      │
@@ -180,7 +180,8 @@ FlowCloudAIClient (主入口)
 | **Session** | 无状态的单次请求处理器 | LLMSession、ImageSession、TTSSession |
 | **ToolRegistry** | 全局工具库，AI 可调用 | search_web, execute_code, query_database |
 | **Sense** | 模式预设（提示词 + 工具白名单） | creative_writing, proofreading, code_assistant |
-| **TaskOrchestrator** | 动态装配引擎 | 根据 TaskContext 注入上下文、筛选工具、调整参数 |
+| **Orchestrate** | 动态装配接口（trait） | 实现 `assemble(ctx)` 即可完全自定义每轮配置 |
+| **DefaultOrchestrator** | 内置编排实现 | 基于 Sense 白名单 + task_type 的标准策略 |
 | **ConversationTree** | 消息历史树 | 链式父节点结构，checkout 任意节点实现分支/重说/回退 |
 | **SessionHandle** | 会话外部句柄 | 异步读写对话参数、切换插件、历史 checkout |
 
@@ -208,6 +209,19 @@ impl FlowCloudAIClient {
 
     // 创建 LLM 会话（已启用 storage 时自动注入存储上下文）
     pub fn create_llm_session(&self, plugin_id: &str, api_key: &str) -> Result<LLMSession>;
+
+    // 创建编排模式 LLM 会话（编排器嵌入 session，每轮自动 assemble）
+    pub fn create_orchestrated_session(
+        &self, plugin_id: &str, api_key: &str,
+        orchestrator: Box<dyn Orchestrate>,
+    ) -> Result<LLMSession>;
+
+    // 同上 + 同时加载 Sense（async，内部顺序执行 load_sense）
+    pub async fn create_orchestrated_session_with_sense(
+        &self, plugin_id: &str, api_key: &str,
+        sense: impl Sense,
+        orchestrator: Box<dyn Orchestrate>,
+    ) -> Result<LLMSession>;
 
     // 创建图像会话
     pub fn create_image_session(&self, plugin_id: &str, api_key: &str) -> Result<ImageSession>;
@@ -339,7 +353,7 @@ pub struct LLMSession {
     config: SessionConfig,
     pipeline: ApiPipeline,
     turn_id: u64,
-    orchestrator: Option<TaskOrchestrator>,
+    orchestrator: Option<Box<dyn Orchestrate>>,  // trait object，可自定义
 }
 ```
 
@@ -347,12 +361,16 @@ pub struct LLMSession {
 
 ```
 1. 创建         → client.create_llm_session()
+                  或 client.create_orchestrated_session(..., Box::new(orch))
 2. 配置         → session.set_model().await, set_temperature().await, etc.
 3. 加载 Sense   → session.load_sense(my_sense).await?
-4. 启动会话     → session.run(input_rx, ctx_rx) 返回事件流 + 句柄
-5. 发送消息     → 通过 input_tx 发送用户输入
-6. 处理事件     → 处理 ContentDelta、ToolCall、ToolResult 等
-7. 关闭会话     → 事件流结束时自动关闭
+4. 设置编排器   → session.set_orchestrator(orch) 或 session.with_orchestrator(orch)
+                  （create_orchestrated_session 已自动完成此步）
+5. 启动会话     → session.run(input_rx) 返回事件流 + 句柄
+6. 发送消息     → 通过 input_tx 发送用户输入
+7. 推送上下文   → handle.set_task_context(ctx).await（可选，每轮前更新）
+8. 处理事件     → 处理 ContentDelta、ToolCall、ToolResult 等
+9. 关闭会话     → 事件流结束时自动关闭
 ```
 
 **完整使用示例**：
@@ -370,7 +388,7 @@ session.load_sense(CreativeWritingSense).await?;
 
 // 创建消息通道，启动会话
 let (input_tx, input_rx) = mpsc::channel::<String>(32);
-let (mut event_stream, _handle) = session.run(input_rx, None);
+let (mut event_stream, _handle) = session.run(input_rx);
 
 // 发送用户消息
 input_tx.send("帮我写一段产品文案".to_string()).await?;
@@ -403,7 +421,7 @@ while let Some(event) = event_stream.next().await {
 **流程图**：
 
 ```
-session.run(input_rx, ctx_rx) 启动驱动循环，返回 (event_stream, handle)
+session.run(input_rx) 启动驱动循环，返回 (event_stream, handle)
    ↓
 后台线程（独立 tokio runtime）
    │
@@ -609,60 +627,147 @@ impl Sense for CreativeWritingSense {
 session.load_sense(CreativeWritingSense).await?;
 ```
 
-### 3.6 TaskOrchestrator（任务编排器）
+### 3.6 Orchestrate（任务编排接口）
 
-**职责**：根据 TaskContext 动态装配每轮的 Prompt、工具、参数
+**职责**：每轮对话开始前，根据 `TaskContext` 动态装配 Prompt、工具权限、参数覆盖。
+
+`Orchestrate` 是 **trait**，调用方可完全自定义装配逻辑；`DefaultOrchestrator` 是库内置的标准实现。
+
+#### Orchestrate trait
 
 ```rust
-pub struct TaskOrchestrator {
-    sense: Box<dyn Sense>,
-    registry: Arc<ToolRegistry>,
+pub trait Orchestrate: Send + Sync {
+    /// 根据当前上下文装配本轮配置。返回值是最终裁决，优先级高于 Sense 默认值。
+    fn assemble(&self, ctx: &TaskContext) -> Result<AssembledTurn>;
 }
+```
 
-impl TaskOrchestrator {
-    pub fn new(sense: Box<dyn Sense>, registry: Arc<ToolRegistry>) -> Self;
+#### TaskContext（上下文输入）
 
-    /// 根据任务上下文装配本轮配置
-    pub fn assemble(&self, ctx: &TaskContext) -> Result<AssembledTurn>;
-}
-
+```rust
 pub struct TaskContext {
-    pub task_type: String,        // "creative_writing", "proofreading"
+    // ── 推荐：中性扩展字段 ──
+    pub attributes: HashMap<String, String>,  // 任意字符串键值对
+    pub flags: HashMap<String, bool>,         // 任意布尔标志
+    pub payload: Option<serde_json::Value>,   // 非结构化附加数据
+
+    // ── 遗留字段（DefaultOrchestrator 使用） ──
+    pub task_type: String,         // "creative_writing" / "proofreading" / "code_generation"
     pub project_id: Option<String>,
     pub selection: Option<String>, // 当前编辑的文本
-    pub entities: Vec<String>,    // 相关实体
-    pub read_only: bool,
-    pub extra: HashMap<String, String>,
+    pub entities: Vec<String>,     // 相关实体
+    pub read_only: bool,           // DefaultOrchestrator 传播到 AssembledTurn::read_only
 }
+```
 
+#### AssembledTurn（装配输出）
+
+```rust
 pub struct AssembledTurn {
-    pub context_messages: Vec<String>, // 要注入的额外 system msg
-    pub tool_schemas: Option<Vec<Value>>, // 筛选后的工具 schemas
-    pub enabled_tools: Vec<String>,    // 启用的工具名
+    pub context_messages: Vec<String>,    // 额外注入的 system 片段
+    pub tool_schemas: Option<Vec<Value>>, // 三态：None=不干预 / Some([])=禁用全部 / Some(v)=覆盖
+    pub enabled_tools: Vec<String>,       // 执行时白名单校验用
+    pub read_only: bool,                  // 禁止写入类工具（Session 执行前检查）
     pub model_override: Option<String>,
     pub temperature_override: Option<f64>,
+    pub max_tokens_override: Option<i64>,
 }
 ```
 
-**装配流程**：
+**`tool_schemas` 三态语义**（严格区分，不要混用）：
+
+| 值 | 含义 |
+|---|---|
+| `None` | 不干预，沿用 Session 当前工具配置（snapshot 阶段的 ToolRegistry） |
+| `Some(vec![])` | 显式禁用全部工具（LLM 本轮不可调用任何工具） |
+| `Some(schemas)` | 显式覆盖为给定工具集，替换 Session 当前配置 |
+
+#### DefaultOrchestrator（内置实现）
+
+不持有 `Sense`——`Sense` 只通过 `session.load_sense()` 进入静态层，两者职责不重叠。
+
+```rust
+pub struct DefaultOrchestrator { /* registry + whitelist */ }
+
+impl DefaultOrchestrator {
+    // 构建，whitelist = None 时启用全量工具
+    pub fn new(registry: Arc<ToolRegistry>) -> Self;
+
+    // 设置工具白名单（builder 风格）
+    // 通常从 Sense::tool_whitelist() 取值传入
+    pub fn with_whitelist(self, whitelist: Option<Vec<String>>) -> Self;
+}
+```
+
+**工具决策优先级**：
+```
+Sense::tool_whitelist()（初始化时显式传入 DefaultOrchestrator）
+    → DefaultOrchestrator::assemble()（每轮最终裁决）
+        → AssembledTurn.tool_schemas（Session 实际发出的值）
+```
+
+#### LLMSession 注入与启动接口
+
+```rust
+// 注入编排器（装箱类型）
+pub fn set_orchestrator(&mut self, orch: Box<dyn Orchestrate>) -> &mut Self;
+
+// 注入编排器（泛型便捷版，自动装箱）
+pub fn with_orchestrator<T: Orchestrate + 'static>(&mut self, orch: T) -> &mut Self;
+
+// 标准启动：ctx channel 由 Session 内部创建，通过 SessionHandle::set_task_context 推送
+pub fn run(self, input_rx: mpsc::Receiver<String>) -> (ReceiverStream<SessionEvent>, SessionHandle);
+
+// 底层启动：调用方自持 ctx_tx，两路来源在内部合并（handle.set_task_context 仍可用）
+pub fn run_with_context_channel(
+    self,
+    input_rx: mpsc::Receiver<String>,
+    ext_ctx_rx: mpsc::Receiver<TaskContext>,
+) -> (ReceiverStream<SessionEvent>, SessionHandle);
+```
+
+#### 装配流程示意
 
 ```
-TaskContext
-  ├─ task_type = "creative_writing"
-  ├─ selection = "用户选中的文本"
-  └─ entities = ["角色A", "地点B"]
+TaskContext { task_type: "creative_writing", selection: "...", flags: {"read_only": false} }
        ↓
-  [Orchestrator::assemble]
+  [Orchestrate::assemble]
        ↓
-AssembledTurn
-  ├─ context_messages = [
-  │    "[Task type: creative_writing]",
-  │    "[Current selection]\n用户选中的文本",
-  │    "[Related entities: 角色A, 地点B]"
-  │  ]
-  ├─ tool_schemas = [search, generate_ideas, ...]
-  ├─ enabled_tools = ["search", "generate_ideas"]
-  └─ temperature_override = Some(0.85)
+AssembledTurn {
+  context_messages: ["[Task type: creative_writing]", "[Current selection]\n..."],
+  tool_schemas:     [search, generate_ideas, ...],     ← Sense 白名单筛选结果
+  enabled_tools:    ["search", "generate_ideas"],
+  read_only:        false,
+  temperature_override: Some(0.85),                    ← task_type 策略
+}
+```
+
+#### 自定义 Orchestrate 示例
+
+```rust
+use flowcloudai_client::{Orchestrate, TaskContext, AssembledTurn};
+use anyhow::Result;
+
+struct MyOrchestrator;
+
+impl Orchestrate for MyOrchestrator {
+    fn assemble(&self, ctx: &TaskContext) -> Result<AssembledTurn> {
+        let scene = ctx.attr("scene").unwrap_or("default");
+        Ok(AssembledTurn {
+            read_only: ctx.flag("read_only"),
+            temperature_override: match scene {
+                "editor" => Some(0.3),
+                "chat"   => Some(0.7),
+                _        => None,
+            },
+            context_messages: vec![format!("当前场景：{}", scene)],
+            ..Default::default()  // tool_schemas = None → 不干预工具选择
+        })
+    }
+}
+
+// 注入到 session
+session.with_orchestrator(MyOrchestrator);
 ```
 
 ### 3.7 WASM 插件系统
@@ -901,6 +1006,10 @@ impl SessionHandle {
     // 批量更新（单次加锁，适合同时改多个字段）
     pub async fn update<F: FnOnce(&mut ChatRequest)>(&self, f: F);
 
+    // ── 编排上下文（发往 orchestrate channel）────────────────
+    // 更新当前任务上下文（下一轮 assemble 时生效，多次调用取最后一个值）
+    pub async fn set_task_context(&self, ctx: TaskContext) -> Result<(), String>;
+
     // ── 控制指令（通过 ctrl channel 发往 drive loop）─────────
     // 切换插件（下一轮对话生效）
     pub async fn switch_plugin(&self, plugin_id: &str, api_key: &str) -> Result<(), String>;
@@ -933,7 +1042,7 @@ impl SessionHandle {
 
 ```rust
 let (input_tx, input_rx) = mpsc::channel(32);
-let (mut event_stream, handle) = session.run(input_rx, None);
+let (mut event_stream, handle) = session.run(input_rx);
 
 // 动态修改参数（下一轮生效）
 handle.set_temperature(0.5).await;
@@ -1019,7 +1128,7 @@ let mut session = client.create_llm_session("openai", "sk-xxx")?;
 session.set_model("gpt-4").await;
 
 let (input_tx, input_rx) = mpsc::channel(32);
-let (mut event_stream, _handle) = session.run(input_rx, None);
+let (mut event_stream, _handle) = session.run(input_rx);
 
 input_tx.send("你好，请介绍一下 Rust".to_string()).await?;
 
@@ -1052,7 +1161,7 @@ let mut session = client.create_llm_session("openai", "sk-xxx")?;
 
 // 3. 启动会话
 let (input_tx, input_rx) = mpsc::channel(32);
-let (mut event_stream, _handle) = session.run(input_rx, None);
+let (mut event_stream, _handle) = session.run(input_rx);
 
 // 发送包含工具需求的问题
 input_tx.send("2024年中国经济增长率是多少？".to_string()).await?;
@@ -1101,7 +1210,7 @@ session.load_sense(CodeReviewSense).await?;
 
 // 3. 启动会话，开始代码审查
 let (input_tx, input_rx) = mpsc::channel(32);
-let (mut event_stream, _) = session.run(input_rx, None);
+let (mut event_stream, _) = session.run(input_rx);
 
 // 4. 发送代码进行审查
 input_tx.send("请审查以下代码: fn my_func() { ... }".to_string()).await?;
@@ -1126,7 +1235,7 @@ session.load_sense(CreativeWritingSense).await?;
 
 // 启动会话
 let (input_tx, input_rx) = mpsc::channel(32);
-let (mut event_stream, _handle) = session.run(input_rx, None);
+let (mut event_stream, _handle) = session.run(input_rx);
 
 // 发送消息并处理事件
 input_tx.send(user_prompt.to_string()).await?;
@@ -1162,7 +1271,7 @@ session.set_model("gpt-4o").await;
 session.set_stream(true).await;
 
 let (input_tx, input_rx) = mpsc::channel(32);
-let (mut event_stream, handle) = session.run(input_rx, None);
+let (mut event_stream, handle) = session.run(input_rx);
 
 // 第一轮：走 OpenAI
 input_tx.send("解释一下量子纠缠".to_string()).await?;
@@ -1173,6 +1282,12 @@ while let Some(event) = event_stream.next().await {
         _ => {}
     }
 }
+
+// 更新编排上下文（下一轮 assemble 生效）
+handle.set_task_context(TaskContext {
+    task_type: "proofreading".to_string(),
+    ..Default::default()
+}).await?;
 
 // 切换到千问（下一轮生效，不影响对话历史）
 handle.switch_plugin("qwen", "sk-qwen-xxx").await?;
@@ -1200,7 +1315,7 @@ session.set_model("gpt-4o").await;
 session.set_stream(true).await;
 
 let (input_tx, input_rx) = mpsc::channel(32);
-let (mut event_stream, handle) = session.run(input_rx, None);
+let (mut event_stream, handle) = session.run(input_rx);
 
 // 第一轮：发送问题，记录 node_id
 let mut user_node: u64 = 0;
@@ -1397,7 +1512,7 @@ let mut qwen = client.create_llm_session("qwen", "sk-zzz")?;
 
 // 使用任一会话
 let (input_tx, input_rx) = mpsc::channel(32);
-let (mut event_stream, _) = openai.run(input_rx, None);
+let (mut event_stream, _) = openai.run(input_rx);
 input_tx.send("Hello".to_string()).await?;
 ```
 
@@ -1433,10 +1548,10 @@ impl Sense for MyWorkflow {
 
 ```rust
 let (input_tx1, input_rx1) = mpsc::channel(32);
-let (mut stream1, _) = session1.run(input_rx1, None);
+let (mut stream1, _) = session1.run(input_rx1);
 
 let (input_tx2, input_rx2) = mpsc::channel(32);
-let (mut stream2, _) = session2.run(input_rx2, None);
+let (mut stream2, _) = session2.run(input_rx2);
 
 // 并发发送消息
 input_tx1.send("写文章".to_string()).await?;
@@ -1598,7 +1713,8 @@ store.rename("20260416152345678", "新标题".to_string())?;
 | **LLMSession**        | 对话处理         | `load_sense()`, `set_model()`, `run()`                                 |
 | **ToolRegistry**      | 工具库          | `register()`, `conduct()`                                              |
 | **Sense**             | 模式预设         | `prompts()`, `install_tools()`, `tool_whitelist()`                     |
-| **TaskOrchestrator**  | 动态编排         | `assemble()`                                                           |
+| **Orchestrate**       | 动态编排接口（trait） | `assemble(ctx) -> AssembledTurn`                                   |
+| **DefaultOrchestrator** | 内置编排实现   | `new(registry)`, `with_whitelist()`                                    |
 | **ConversationStore** | JSON 文件持久化   | `list()`, `get()`, `delete()`, `rename()`                              |
 | **ImageSession**      | 图像生成         | `generate()`, `text_to_image()`                                        |
 | **TTSSession**        | 语音合成         | `synthesize()`, `speak()`                                              |
@@ -1609,7 +1725,7 @@ store.rename("20260416152345678", "新标题".to_string())?;
 - ✅ **会话无状态**：ImageSession、TTSSession 可重复使用
 - ✅ **工具解耦**：ToolRegistry 独立于 Session
 - ✅ **流式优先**：原生支持 SSE，秒级反馈
-- ✅ **编排灵活**：Sense + TaskOrchestrator 动态装配
+- ✅ **编排灵活**：`Orchestrate` trait 完全可自定义，`DefaultOrchestrator` 开箱即用
 - ✅ **多模态统一**：LLM、Image、TTS、Audio 统一管理
 - ✅ **持久化可选**：JSON 文件存储，按需开启，不改变核心流程
 
