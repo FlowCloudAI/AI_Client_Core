@@ -88,7 +88,15 @@ impl TaskContext {
 /// `Orchestrate` 实现是最终裁决层，此结构中的值优先级高于 Sense 默认值。
 #[derive(Clone, Debug, Default)]
 pub struct AssembledTurn {
-    /// 额外注入的 system messages（在 Sense prompt 之后、用户消息之前）。
+    /// 额外注入的 system messages。
+    ///
+    /// 插入位置语义由 Session 固定定义为：
+    /// - 优先插在“最后一个待续会话块”之前；
+    /// - 若不存在待续会话块，则退化为插在最新用户消息之前。
+    ///
+    /// 其中“待续会话块”当前指请求尾部的
+    /// `assistant(tool_calls) + tool...` 连续片段，
+    /// 用于保证工具续轮时不破坏模型要求的相邻顺序。
     pub context_messages: Vec<String>,
 
     /// 本轮工具配置，三种语义严格区分：

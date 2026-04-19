@@ -381,10 +381,13 @@ impl LLMSession {
 
     async fn apply_assembled(&self, base: &ChatRequest, turn: &AssembledTurn) -> ChatRequest {
         let mut req = base.clone();
+        let insert_at = Self::context_insert_index_before_pending_block(&req.messages);
 
-        // 注入上下文 messages（在已有消息之前、用户最新消息之前）
+        // 注入上下文 messages。
+        // 规则固定为“插在最后一个待续会话块之前”；
+        // 若当前不存在待续会话块，则退化为插在最新用户消息之前。
         for msg in &turn.context_messages {
-            req.messages.insert(req.messages.len().saturating_sub(1), Message::system(msg.clone()));
+            req.messages.insert(insert_at, Message::system(msg.clone()));
         }
 
         // 工具 schemas 三态：
@@ -407,6 +410,36 @@ impl LLMSession {
         }
 
         req
+    }
+
+    /// 计算 context_messages 的稳定插入点。
+    ///
+    /// “待续会话块”当前定义为请求尾部的
+    /// `assistant(tool_calls) + tool...` 连续片段。
+    /// 若检测到该片段，则返回其起始位置；
+    /// 否则退化为“最新一条消息之前”，保持普通用户轮行为不变。
+    fn context_insert_index_before_pending_block(messages: &[Message]) -> usize {
+        if messages.is_empty() {
+            return 0;
+        }
+
+        let mut tail_start = messages.len();
+        while tail_start > 0 && messages[tail_start - 1].role == "tool" {
+            tail_start -= 1;
+        }
+
+        if tail_start < messages.len()
+            && tail_start > 0
+            && messages[tail_start - 1].role == "assistant"
+            && messages[tail_start - 1]
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| !calls.is_empty())
+        {
+            return tail_start - 1;
+        }
+
+        messages.len().saturating_sub(1)
     }
 
     async fn apply_ctrl(&mut self, msg: CtrlMsg) -> Result<()> {
@@ -945,5 +978,92 @@ impl LLMSession {
     #[inline]
     fn synth_tool_call_id(turn_id: u64, index: usize) -> String {
         format!("t{}:idx:{}", turn_id, index)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LLMSession;
+    use crate::llm::types::{Message, ToolCall, ToolFunctionCall};
+
+    #[test]
+    fn context_insert_index_before_pending_block_keeps_latest_user_anchor() {
+        let messages = vec![
+            Message::system("基础系统提示"),
+            Message::user("旧问题"),
+            Message::assistant(Some("旧回答"), None::<String>, None),
+            Message::user("新问题"),
+        ];
+
+        assert_eq!(
+            LLMSession::context_insert_index_before_pending_block(&messages),
+            3
+        );
+    }
+
+    #[test]
+    fn context_insert_index_before_pending_block_keeps_tool_call_block_adjacent() {
+        let messages = vec![
+            Message::system("基础系统提示"),
+            Message::user("帮我查天气"),
+            Message::assistant(
+                None::<String>,
+                None::<String>,
+                Some(vec![ToolCall {
+                    id: Some("call_1".to_string()),
+                    call_type: Some("function".to_string()),
+                    function: ToolFunctionCall {
+                        name: "get_weather".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                    index: 0,
+                }]),
+            ),
+            Message::tool("晴天", "call_1"),
+        ];
+
+        assert_eq!(
+            LLMSession::context_insert_index_before_pending_block(&messages),
+            2
+        );
+    }
+
+    #[test]
+    fn context_insert_index_before_pending_block_keeps_multi_tool_results_adjacent() {
+        let messages = vec![
+            Message::system("基础系统提示"),
+            Message::user("帮我同时查天气和汇率"),
+            Message::assistant(
+                None::<String>,
+                None::<String>,
+                Some(vec![
+                    ToolCall {
+                        id: Some("call_1".to_string()),
+                        call_type: Some("function".to_string()),
+                        function: ToolFunctionCall {
+                            name: "get_weather".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                        index: 0,
+                    },
+                    ToolCall {
+                        id: Some("call_2".to_string()),
+                        call_type: Some("function".to_string()),
+                        function: ToolFunctionCall {
+                            name: "get_fx_rate".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                        index: 1,
+                    },
+                ]),
+            ),
+            Message::tool("晴天", "call_1"),
+            Message::tool("7.25", "call_2"),
+        ];
+
+        assert_eq!(
+            LLMSession::context_insert_index_before_pending_block(&messages),
+            2
+        );
     }
 }
