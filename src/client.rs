@@ -314,20 +314,23 @@ impl FlowCloudAIClient {
     // ── Session 工厂 ──
 
     /// 创建 LLM 会话（简单模式）。
-    pub fn create_llm_session(&self, plugin_id: &str, api_key: &str) -> Result<LLMSession> {
+    ///
+    /// - `config_override`: 可选的 `SessionConfig` 覆盖。传 `None` 时使用默认值：
+    ///   - `event_buffer`: 256, `request_timeout`: 60s, `max_tool_rounds`: 10, `max_line_bytes`: 1MB
+    pub fn create_llm_session(
+        &self,
+        plugin_id: &str,
+        api_key: &str,
+        config_override: Option<SessionConfig>,
+    ) -> Result<LLMSession> {
         let url = self.plugin_registry.get_url(plugin_id)?;
         if !url.starts_with("http") {
             return Err(anyhow!("plugin '{}' has invalid URL: {}", plugin_id, url));
         }
 
-        let config = SessionConfig {
-            base_url: url.to_string(),
-            api_key: api_key.to_string(),
-            event_buffer: 256,
-            request_timeout: 60,
-            max_tool_rounds: 10,
-            max_line_bytes: 1024 * 1024,
-        };
+        let mut config = config_override.unwrap_or_default();
+        config.base_url = url.to_string();
+        config.api_key = api_key.to_string();
 
         let pipeline = ApiPipeline::new(
             Arc::clone(&self.plugin_registry),
@@ -353,11 +356,14 @@ impl FlowCloudAIClient {
     /// 1. 从 `ConversationStore` 加载历史消息并回放到 `ConversationTree`；
     /// 2. 将 `StorageCtx` 的 `conversation_id` 设为原对话 ID，确保续聊时
     ///    写盘覆盖原文件，而非创建新文件（避免重复对话条目）。
+    ///
+    /// - `config_override`: 可选的 `SessionConfig` 覆盖。传 `None` 时使用默认值。
     pub fn resume_llm_session(
         &self,
         plugin_id: &str,
         api_key: &str,
         conversation_id: &str,
+        config_override: Option<SessionConfig>,
     ) -> Result<LLMSession> {
         let store = self
             .storage
@@ -373,14 +379,9 @@ impl FlowCloudAIClient {
             return Err(anyhow!("plugin '{}' has invalid URL: {}", plugin_id, url));
         }
 
-        let config = SessionConfig {
-            base_url: url.to_string(),
-            api_key: api_key.to_string(),
-            event_buffer: 256,
-            request_timeout: 60,
-            max_tool_rounds: 10,
-            max_line_bytes: 1024 * 1024,
-        };
+        let mut config = config_override.unwrap_or_default();
+        config.base_url = url.to_string();
+        config.api_key = api_key.to_string();
 
         let pipeline = ApiPipeline::new(
             Arc::clone(&self.plugin_registry),
@@ -416,29 +417,27 @@ impl FlowCloudAIClient {
     /// ```rust
     /// let orch = DefaultOrchestrator::new(client.tool_registry().clone())
     ///     .with_whitelist(my_sense.tool_whitelist());
-    /// let session = client.create_orchestrated_session(plugin_id, api_key, Box::new(orch))?;
+    /// let session = client.create_orchestrated_session(plugin_id, api_key, Box::new(orch), None)?;
     /// ```
     ///
     /// 若需要同时加载 Sense，使用 `create_orchestrated_session_with_sense`（async）。
+    ///
+    /// - `config_override`: 可选的 `SessionConfig` 覆盖。传 `None` 时使用默认值。
     pub fn create_orchestrated_session(
         &self,
         plugin_id: &str,
         api_key: &str,
         orchestrator: Box<dyn Orchestrate>,
+        config_override: Option<SessionConfig>,
     ) -> Result<LLMSession> {
         let url = self.plugin_registry.get_url(plugin_id)?;
         if !url.starts_with("http") {
             return Err(anyhow!("plugin '{}' has invalid URL: {}", plugin_id, url));
         }
 
-        let config = SessionConfig {
-            base_url: url.to_string(),
-            api_key: api_key.to_string(),
-            event_buffer: 256,
-            request_timeout: 60,
-            max_tool_rounds: 10,
-            max_line_bytes: 1024 * 1024,
-        };
+        let mut config = config_override.unwrap_or_default();
+        config.base_url = url.to_string();
+        config.api_key = api_key.to_string();
 
         let pipeline = ApiPipeline::new(
             Arc::clone(&self.plugin_registry),
@@ -464,7 +463,7 @@ impl FlowCloudAIClient {
     ///
     /// 等价于：
     /// ```rust
-    /// let mut session = client.create_orchestrated_session(plugin_id, api_key, orchestrator)?;
+    /// let mut session = client.create_orchestrated_session(plugin_id, api_key, orchestrator, config_override)?;
     /// session.load_sense(sense).await?;
     /// ```
     ///
@@ -473,16 +472,19 @@ impl FlowCloudAIClient {
     /// ```rust
     /// let orch = DefaultOrchestrator::new(client.tool_registry().clone())
     ///     .with_whitelist(my_sense.tool_whitelist());
-    /// client.create_orchestrated_session_with_sense(plugin_id, api_key, my_sense, Box::new(orch)).await?;
+    /// client.create_orchestrated_session_with_sense(plugin_id, api_key, my_sense, Box::new(orch), None).await?;
     /// ```
+    ///
+    /// - `config_override`: 可选的 `SessionConfig` 覆盖。传 `None` 时使用默认值。
     pub async fn create_orchestrated_session_with_sense(
         &self,
         plugin_id: &str,
         api_key: &str,
         sense: impl crate::sense::Sense,
         orchestrator: Box<dyn Orchestrate>,
+        config_override: Option<SessionConfig>,
     ) -> Result<LLMSession> {
-        let mut session = self.create_orchestrated_session(plugin_id, api_key, orchestrator)?;
+        let mut session = self.create_orchestrated_session(plugin_id, api_key, orchestrator, config_override)?;
         session.load_sense(sense).await?;
         Ok(session)
     }
@@ -493,20 +495,31 @@ impl FlowCloudAIClient {
     /// - `api_key`: API 密钥。
     ///
     /// TTSSession 是无状态的，可反复调用 `synthesize`。
-    pub fn create_tts_session(&self, plugin_id: &str, api_key: &str) -> Result<TTSSession> {
+    ///
+    /// - `config_override`: 可选的 `SessionConfig` 覆盖。传 `None` 时使用 TTS 专用默认值：
+    ///   - `request_timeout`: 120s, 其余字段为 0
+    pub fn create_tts_session(
+        &self,
+        plugin_id: &str,
+        api_key: &str,
+        config_override: Option<SessionConfig>,
+    ) -> Result<TTSSession> {
         let url = self.plugin_registry.get_url(plugin_id)?;
         if !url.starts_with("http") {
             return Err(anyhow!("plugin '{}' has invalid URL: {}", plugin_id, url));
         }
 
-        let config = SessionConfig {
+        let mut config = config_override.unwrap_or_else(|| SessionConfig {
             base_url: url.to_string(),
             api_key: api_key.to_string(),
             event_buffer: 0,          // TTS 不用事件流
             request_timeout: 120,     // TTS 合成可能较慢
             max_tool_rounds: 0,
             max_line_bytes: 0,
-        };
+        });
+        // 如果调用方传入了自定义 config，仍需覆盖 url 和 api_key
+        config.base_url = url.to_string();
+        config.api_key = api_key.to_string();
 
         let pipeline = ApiPipeline::new(
             Arc::clone(&self.plugin_registry),
@@ -549,20 +562,31 @@ impl FlowCloudAIClient {
     }
 
     /// 创建图像生成会话。
-    pub fn create_image_session(&self, plugin_id: &str, api_key: &str) -> Result<ImageSession> {
+    ///
+    /// - `config_override`: 可选的 `SessionConfig` 覆盖。传 `None` 时使用图像生成专用默认值：
+    ///   - `request_timeout`: 180s, 其余字段为 0
+    pub fn create_image_session(
+        &self,
+        plugin_id: &str,
+        api_key: &str,
+        config_override: Option<SessionConfig>,
+    ) -> Result<ImageSession> {
         let url = self.plugin_registry.get_url(plugin_id)?;
         if !url.starts_with("http") {
             return Err(anyhow!("plugin '{}' has invalid URL: {}", plugin_id, url));
         }
 
-        let config = SessionConfig {
+        let mut config = config_override.unwrap_or_else(|| SessionConfig {
             base_url: url.to_string(),
             api_key: api_key.to_string(),
             event_buffer: 0,
             request_timeout: 180,  // 图像生成较慢
             max_tool_rounds: 0,
             max_line_bytes: 0,
-        };
+        });
+        // 如果调用方传入了自定义 config，仍需覆盖 url 和 api_key
+        config.base_url = url.to_string();
+        config.api_key = api_key.to_string();
 
         let pipeline = ApiPipeline::new(
             Arc::clone(&self.plugin_registry),

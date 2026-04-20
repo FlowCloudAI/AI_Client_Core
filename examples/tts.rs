@@ -9,7 +9,7 @@ async fn main() -> anyhow::Result<()> {
     let mut client = FlowCloudAIClient::new(PathBuf::from("./plugins"), None)?;
     client.load_plugin("qwen-tts")?;
 
-    let tts = client.create_tts_session("qwen-tts", apis::QWEN_LLM.key)?;
+    let tts = client.create_tts_session("qwen-tts", apis::QWEN_LLM.key, None)?;
 
     // ── 方式 1：最简调用 + 播放 ──
     let result = tts.speak("qwen3-tts-flash", "你好，世界。", "Ethan").await?;

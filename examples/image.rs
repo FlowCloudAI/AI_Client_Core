@@ -10,7 +10,7 @@ async fn main() -> anyhow::Result<()> {
     let mut client = FlowCloudAIClient::new(PathBuf::from("./plugins"), None)?;
     client.load_plugin("qwen-image")?;
 
-    let img = client.create_image_session("qwen-image", apis::QWEN_LLM.key)?;
+    let img = client.create_image_session("qwen-image", apis::QWEN_LLM.key, None)?;
 
     // 文生图
     let result = img.text_to_image("qwen-image-plus", "一只猫在月光下散步").await?;

@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
     client.install_sense(&acs_sense)?;
 
     // api_key 在创建 session 时传入；plugin_id=None 表示直通模式
-    let mut session = client.create_llm_session("deepseek-llm", apis::DEEPSEEK.key)?;
+    let mut session = client.create_llm_session("deepseek-llm", apis::DEEPSEEK.key, None)?;
 
     session
         .load_sense(acs_sense).await?

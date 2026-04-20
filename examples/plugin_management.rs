@@ -50,7 +50,7 @@ fn main() -> Result<()> {
     // println!("\n=== 4. 尝试卸载正在使用的插件 ===");
     // if let Some(first_plugin) = plugins.first() {
     //     // 先创建一个 session（会增加引用计数）
-    //     let _session = client.create_llm_session(&first_plugin.id, "test-key")?;
+    //     let _session = client.create_llm_session(&first_plugin.id, "test-key", None)?;
     //     
     //     // 尝试卸载（应该失败，因为引用计数 > 0）
     //     match client.uninstall_plugin(&first_plugin.id) {

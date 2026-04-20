@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
     client.load_plugin("deepseek-llm")?;
 
     // ── Bot A ──
-    let mut bot_a = client.create_llm_session("deepseek-llm", apis::DEEPSEEK.key)?;
+    let mut bot_a = client.create_llm_session("deepseek-llm", apis::DEEPSEEK.key, None)?;
     bot_a.load_sense(senses_a).await?
         .set_model("deepseek-chat").await
         .set_thinking(false).await
@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
         .set_frequency_penalty(0.0).await;
 
     // ── Bot B ──
-    let mut bot_b = client.create_llm_session("deepseek-llm", apis::DEEPSEEK.key)?;
+    let mut bot_b = client.create_llm_session("deepseek-llm", apis::DEEPSEEK.key, None)?;
     bot_b.load_sense(senses_b).await?
         .set_model("deepseek-chat").await
         .set_thinking(false).await

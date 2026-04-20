@@ -83,12 +83,12 @@ async fn main() -> Result<()> {
     //       Arc::clone(client.tool_registry()),
     //   );
     //   let mut session = client
-    //       .create_orchestrated_session("deepseek-llm", apis::DEEPSEEK.key, Box::new(orch))?;
+    //       .create_orchestrated_session("deepseek-llm", apis::DEEPSEEK.key, Box::new(orch), None)?;
 
     // ── 方式 B：自定义 ModeOrchestrator（本示例实际运行）─────────────────────
     let orch = ModeOrchestrator::new("你是一个通用助手，请用中文回复。");
     let mut session = client
-        .create_orchestrated_session("deepseek-llm", apis::DEEPSEEK.key, Box::new(orch))?;
+        .create_orchestrated_session("deepseek-llm", apis::DEEPSEEK.key, Box::new(orch), None)?;
 
     session
         .set_model("deepseek-chat").await
