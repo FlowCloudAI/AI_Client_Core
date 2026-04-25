@@ -539,7 +539,14 @@ impl LLMSession {
                 self.send_and_process(&req, cancel_rx.clone(), &event_tx).await?;
 
             let asst_node_id = if matches!(turn_status, TurnStatus::Cancelled | TurnStatus::Interrupted) {
-                turn_head_id
+                // 将已生成的部分内容保存为 assistant 节点，使 head 推进到 "assistant"，
+                // 确保 should_wait_for_user() 返回 true，避免 drive 循环立即重试。
+                self.add_message(Message::assistant(
+                    Some(content).filter(|s| !s.is_empty()),
+                    Some(reasoning).filter(|s| !s.is_empty()),
+                    None,
+                ))
+                .await
             } else {
                 self.add_message(Message::assistant(
                     Some(content).filter(|s| !s.is_empty()),

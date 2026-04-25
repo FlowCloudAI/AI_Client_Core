@@ -26,8 +26,8 @@
 ### 五分钟上手
 
 ```rust
-use flowcloudai_client_core::FlowCloudAIClient;
-use flowcloudai_client_core::plugin::types::PluginKind;
+use flowcloudai_client::FlowCloudAIClient;
+use flowcloudai_client::plugin::types::PluginKind;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use futures_util::StreamExt;
@@ -48,15 +48,14 @@ async fn main() -> Result<()> {
     // 3. 创建 LLM 会话
     let mut session = client.create_llm_session("openai", "sk-...")?;
 
-    // 4. 设置模型和参数
-    session
-        .set_model("gpt-4").await
-        .set_temperature(0.7).await
-        .set_max_tokens(2000).await;
-
-    // 5. 通过 channel 发送消息，驱动会话
+    // 4. 启动会话（通过 SessionHandle 设置模型和参数）
     let (input_tx, input_rx) = mpsc::channel::<String>(32);
     let (mut event_stream, handle) = session.run(input_rx);
+
+    // 5. 通过 handle 异步设置模型和参数
+    handle.set_model("gpt-4").await?;
+    handle.set_temperature(0.7).await?;
+    handle.set_max_tokens(2000).await?;
 
     // 发送消息
     input_tx.send("用 Markdown 写一篇关于 AI 的短文".to_string()).await?;
@@ -378,16 +377,17 @@ pub struct LLMSession {
 ```rust
 let mut session = client.create_llm_session("openai", "sk-xxx")?;
 
-session
-    .set_model("gpt-4").await
-    .set_temperature(0.8).await
-    .set_max_tokens(2000).await;
-
 // 加载工作流模式
 session.load_sense(CreativeWritingSense).await?;
 
 // 创建消息通道，启动会话
 let (input_tx, input_rx) = mpsc::channel::<String>(32);
+let (mut event_stream, handle) = session.run(input_rx);
+
+// 通过 handle 设置模型和参数
+handle.set_model("gpt-4").await?;
+handle.set_temperature(0.8).await?;
+handle.set_max_tokens(2000).await?;
 let (mut event_stream, _handle) = session.run(input_rx);
 
 // 发送用户消息
@@ -1125,7 +1125,9 @@ root
 
 ```rust
 let mut session = client.create_llm_session("openai", "sk-xxx")?;
-session.set_model("gpt-4").await;
+let (input_tx, input_rx) = mpsc::channel(32);
+let (mut event_stream, handle) = session.run(input_rx);
+handle.set_model("gpt-4").await?;
 
 let (input_tx, input_rx) = mpsc::channel(32);
 let (mut event_stream, _handle) = session.run(input_rx);
@@ -1143,9 +1145,9 @@ while let Some(event) = event_stream.next().await {
 
 ```rust
 // 1. 先注册工具到全局 ToolRegistry
-let mut client = FlowCloudAIClient::new(PathBuf::from("./plugins"))?;
+let mut client = FlowCloudAIClient::new(PathBuf::from("./plugins"), None)?;
 
-client.tool_registry_mut().register::<WebSearchState, _>(
+client.tool_registry_mut()?.register::<WebSearchState, _>(
     "search_web",
     "搜索网络信息",
     Some(vec![ToolFunctionArg::new("query", "string").required(true)]),
@@ -1249,9 +1251,9 @@ while let Some(event) = stream.next().await {
             print!("{}", delta);
         }
         SessionEvent::ToolCall { name, index } => {
-            // 比如调用 search_references
-            let results = search_references(&name).await?;
-            session.tool_result(index, &serde_json::to_string(&results)?, false).await?;
+            // 工具调用由 LLMSession 内部通过 ToolRegistry::conduct 自动执行，
+            // 结果以 SessionEvent::ToolResult 事件推送，无需手动调用。
+            println!("[工具调用] {} (index: {})", name, index);
         }
         SessionEvent::TurnEnd { .. } => break,
         _ => {}
@@ -1267,11 +1269,12 @@ println!("\nFinal text:\n{}", full_response);
 
 ```rust
 let mut session = client.create_llm_session("openai", "sk-openai-xxx")?;
-session.set_model("gpt-4o").await;
-session.set_stream(true).await;
 
 let (input_tx, input_rx) = mpsc::channel(32);
 let (mut event_stream, handle) = session.run(input_rx);
+
+handle.set_model("gpt-4o").await?;
+handle.set_stream(true).await?;
 
 // 第一轮：走 OpenAI
 input_tx.send("解释一下量子纠缠".to_string()).await?;
@@ -1291,7 +1294,7 @@ handle.set_task_context(TaskContext {
 
 // 切换到千问（下一轮生效，不影响对话历史）
 handle.switch_plugin("qwen", "sk-qwen-xxx").await?;
-handle.set_model("qwen-max").await;
+handle.set_model("qwen-max").await?;
 
 // 第二轮：走千问，对话历史保持连续
 input_tx.send("用更简单的语言再解释一次".to_string()).await?;
@@ -1311,11 +1314,12 @@ while let Some(event) = event_stream.next().await {
 
 ```rust
 let mut session = client.create_llm_session("openai", "sk-xxx")?;
-session.set_model("gpt-4o").await;
-session.set_stream(true).await;
 
 let (input_tx, input_rx) = mpsc::channel(32);
 let (mut event_stream, handle) = session.run(input_rx);
+
+handle.set_model("gpt-4o").await?;
+handle.set_stream(true).await?;
 
 // 第一轮：发送问题，记录 node_id
 let mut user_node: u64 = 0;
@@ -1496,7 +1500,7 @@ pub fn dangerous_tool() -> Result<String> {
 **A:** 可以。ToolRegistry 被包装在 Arc 中，多个 Session 可以安全地共享。
 
 ```rust
-let client = FlowCloudAIClient::new("/path/to/plugins")?;
+let client = FlowCloudAIClient::new(PathBuf::from("/path/to/plugins"), None)?;
 let session1 = client.create_llm_session("openai", "key1")?;
 let session2 = client.create_llm_session("claude", "key2")?;
 // 两个 session 共享同一个 tool_registry

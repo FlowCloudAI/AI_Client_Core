@@ -78,13 +78,12 @@ src/
 │
 ├── tool/                  # 工具调用框架
 │   ├── mod.rs
-│   ├── registry.rs        # ToolRegistry：注册/启用/禁用/执行工具
-│   ├── types.rs           # ToolSpec / ToolFunctionArg
-│   └── executor.rs        # 工具执行器（超时控制等）
+│   └── registry.rs        # ToolRegistry：注册/启用/禁用/执行工具（含超时控制）
 │
 ├── orchestrator/          # 任务编排
 │   ├── mod.rs
 │   ├── orchestrator.rs    # TaskOrchestrator：根据 TaskContext 装配 AssembledTurn
+│   ├── orchestrate.rs     # Orchestrate trait 定义
 │   └── context.rs         # TaskContext / AssembledTurn
 │
 └── sense/                 # 模式预设（Sense trait）
@@ -93,6 +92,8 @@ src/
 
 `examples/` 目录包含大量可运行的示例：
 - `main.rs`、`plugin_management.rs`、`llm.rs`、`llm_ai_dialogue.rs`、`image.rs`、`tts.rs`
+- `orchestrate.rs` — 编排器用法演示
+- `apis/mod.rs` — 共享 API key 模块
 - `senses/` 下有几个 Sense 实现示例（`llm_a.rs`、`llm_b.rs`、`militech_acs.rs`）
 
 ---
@@ -177,7 +178,7 @@ interface mapper {
 ### 7.2 插件包格式
 `.fcplug` 本质是一个 ZIP 文件，内部必须包含：
 - `manifest.json` — 元数据（id、kind、version、abi-version、url 等）
-- `plugin.wasm` — 编译好的 WASM 组件（target: `wasm32-wasip1`）
+- `plugin.wasm` — 编译好的 WASM 组件（target: `wasm32-wasip1`，ABI 版本 2）
 - `icon.png` — 可选图标
 
 当前 ABI 版本：`SUPPORTED_ABI_VERSION = 2`（定义在 `src/lib.rs`）。
