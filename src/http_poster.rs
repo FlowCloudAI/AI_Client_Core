@@ -18,6 +18,11 @@ impl HttpPoster {
             client: Client::builder()
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(120))
+                // SSE 流式传输禁用自动解压，防止 Qwen 等会返回
+                // gzip 压缩响应的 API 出现 "error decoding response body"
+                .no_gzip()
+                .no_brotli()
+                .no_deflate()
                 .build()?,
         })
     }
