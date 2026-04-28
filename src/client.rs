@@ -395,7 +395,7 @@ impl FlowCloudAIClient {
         )?;
 
         // 回放历史消息
-        session.preload_history(conv.messages);
+        session.preload_history(conv.messages, conv.head);
 
         // 绑定存储上下文（复用原对话 ID，续聊写盘不创建新文件）
         session.resume_storage_ctx(

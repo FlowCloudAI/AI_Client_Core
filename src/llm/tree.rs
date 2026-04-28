@@ -99,6 +99,38 @@ impl ConversationTree {
         }
     }
 
+    /// 直接设置 head（用于从磁盘恢复）。
+    pub fn set_head(&mut self, node_id: NodeId) -> Result<(), String> {
+        if self.nodes.contains_key(&node_id) {
+            self.head = Some(node_id);
+            Ok(())
+        } else {
+            Err(format!("节点 {} 不存在", node_id))
+        }
+    }
+
+    /// 插入一个节点（带显式 parent），不移动 head。
+    ///
+    /// 用于从磁盘恢复分支拓扑。
+    pub fn insert_node(
+        &mut self,
+        id: NodeId,
+        parent: Option<NodeId>,
+        message: Message,
+        turn_id: u64,
+        timestamp: String,
+    ) -> NodeId {
+        self.next_id = self.next_id.max(id.saturating_add(1));
+        self.nodes.insert(id, ConversationNode {
+            id,
+            message,
+            parent,
+            turn_id,
+            timestamp,
+        });
+        id
+    }
+
     // ── 读操作 ──────────────────────────────────────────────
 
     /// 当前 head 节点 ID。
@@ -160,6 +192,25 @@ impl ConversationTree {
 
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
+    }
+
+    /// 下一个可用的节点 ID（供外部在插入前查询）。
+    pub fn next_id(&self) -> NodeId {
+        self.next_id
+    }
+
+    /// 返回树中所有节点的引用（含所有分支，不限于当前路径）。
+    pub fn all_nodes(&self) -> Vec<&ConversationNode> {
+        self.nodes.values().collect()
+    }
+
+    /// 返回指定节点的直接子节点 ID 列表。
+    pub fn children_of(&self, node_id: NodeId) -> Vec<NodeId> {
+        self.nodes
+            .values()
+            .filter(|n| n.parent == Some(node_id))
+            .map(|n| n.id)
+            .collect()
     }
 }
 
@@ -320,6 +371,43 @@ mod tests {
         assert_eq!(tree.get_node(n1).unwrap().parent, None);
         assert_eq!(tree.get_node(n2).unwrap().parent, Some(n1));
         assert_eq!(tree.get_node(n3).unwrap().parent, Some(n2));
+    }
+
+    // ── all_nodes / children_of ──
+
+    #[test]
+    fn all_nodes_includes_branches() {
+        let mut tree = ConversationTree::new();
+        let n1 = tree.append(u("q"), 1);
+        let _n2 = tree.append(a("A1"), 1);
+        tree.checkout(n1).unwrap();
+        let _n3 = tree.append(a("A2"), 2);
+
+        let all = tree.all_nodes();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn children_of_returns_direct_children() {
+        let mut tree = ConversationTree::new();
+        let n1 = tree.append(u("q"), 1);
+        let n2 = tree.append(a("A1"), 1);
+        tree.checkout(n1).unwrap();
+        let n3 = tree.append(a("A2"), 2);
+
+        let children = tree.children_of(n1);
+        assert_eq!(children.len(), 2);
+        assert!(children.contains(&n2));
+        assert!(children.contains(&n3));
+    }
+
+    #[test]
+    fn children_of_leaf_returns_empty() {
+        let mut tree = ConversationTree::new();
+        let _n1 = tree.append(u("q"), 1);
+        let n2 = tree.append(a("A1"), 1);
+
+        assert!(tree.children_of(n2).is_empty());
     }
 
     // ── 连续 checkout + append（模拟重说场景）──

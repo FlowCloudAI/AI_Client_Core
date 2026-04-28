@@ -119,11 +119,20 @@ impl LLMSession {
     ///
     /// 由 `FlowCloudAIClient::resume_llm_session` 在创建 session 后、启动前注入，
     /// 使 tree 与磁盘上的对话历史保持一致。
-    pub fn preload_history(&mut self, messages: Vec<crate::storage::StoredMessage>) {
+    ///
+    /// `head` 为 v3 持久化格式中的当前活跃节点；旧格式（v2）无此字段传 `None`，
+    /// 此时退化为以最后一条消息为 head。
+    pub fn preload_history(
+        &mut self,
+        messages: Vec<crate::storage::StoredMessage>,
+        head: Option<u64>,
+    ) {
         // 在 run() 调用前，只有 self 持有 Arc<RwLock<ConversationTree>>，
         // 因此 Arc::get_mut 保证成功，避免引入 async。
         if let Some(tree_lock) = Arc::get_mut(&mut self.tree) {
             let tree = tree_lock.get_mut();
+            let mut prev_id: Option<u64> = None;
+            let mut last_id: Option<u64> = None;
             for stored in messages {
                 let msg = crate::llm::types::Message {
                     role: stored.role,
@@ -132,12 +141,22 @@ impl LLMSession {
                     tool_call_id: stored.tool_call_id,
                     tool_calls: stored.tool_calls,
                 };
-                tree.append_existing(
-                    stored.node_id,
+                let parent = stored.parent.or(prev_id);
+                let id = stored.node_id.unwrap_or(tree.next_id());
+                tree.insert_node(
+                    id,
+                    parent,
                     msg,
                     stored.turn_id.unwrap_or(0),
-                    Some(stored.timestamp),
+                    stored.timestamp,
                 );
+                prev_id = Some(id);
+                last_id = Some(id);
+            }
+            // 设置 head：优先使用显式 head，其次退化为最后一条消息
+            let effective_head = head.or(last_id);
+            if let Some(h) = effective_head {
+                let _ = tree.set_head(h);
             }
         }
     }
@@ -442,7 +461,11 @@ impl LLMSession {
         messages.len().saturating_sub(1)
     }
 
-    async fn apply_ctrl(&mut self, msg: CtrlMsg) -> Result<()> {
+    async fn apply_ctrl(
+        &mut self,
+        msg: CtrlMsg,
+        event_tx: &mpsc::Sender<SessionEvent>,
+    ) -> Result<()> {
         match msg {
             CtrlMsg::SwitchPlugin { plugin_id, api_key } => {
                 let url = self.pipeline.get_url(&plugin_id)?.to_string();
@@ -456,6 +479,9 @@ impl LLMSession {
                     .await
                     .checkout(node_id)
                     .map_err(|e| anyhow!(e))?;
+                event_tx
+                    .send(SessionEvent::BranchChanged { node_id })
+                    .await?;
             }
         }
         Ok(())
@@ -491,7 +517,7 @@ impl LLMSession {
                         }
                         Either::Left((None, _)) => return Ok(()),
                         Either::Right((Some(ctrl), _)) => {
-                            self.apply_ctrl(ctrl).await?;
+                            self.apply_ctrl(ctrl, &event_tx).await?;
                             // Checkout 可能使 head 移动到 user 节点，届时无需继续等待
                             if !self.should_wait_for_user().await {
                                 break 'wait;
@@ -597,27 +623,27 @@ impl LLMSession {
             return;
         };
 
-        let messages: Vec<StoredMessage> = self
-            .tree
-            .read()
-            .await
-            .linearize_nodes()
+        let tree = self.tree.read().await;
+        let head = tree.head();
+        let messages: Vec<StoredMessage> = tree
+            .all_nodes()
             .into_iter()
             .map(|node| StoredMessage {
                 message_id: Some(format!("msg_{}", node.id)),
                 node_id: Some(node.id),
                 turn_id: Some(node.turn_id),
-                role: node.message.role,
-                content: node.message.content,
-                reasoning: node.message.reasoning_content,
-                timestamp: node.timestamp,
-                tool_call_id: node.message.tool_call_id,
-                tool_calls: node.message.tool_calls,
+                parent: node.parent,
+                role: node.message.role.clone(),
+                content: node.message.content.clone(),
+                reasoning: node.message.reasoning_content.clone(),
+                timestamp: node.timestamp.clone(),
+                tool_call_id: node.message.tool_call_id.clone(),
+                tool_calls: node.message.tool_calls.clone(),
             })
             .collect();
 
         let model = self.conversation.read().await.model.clone();
-        ctx.flush(messages, &model);
+        ctx.flush(messages, &model, head);
     }
 
     async fn should_wait_for_user(&self) -> bool {

@@ -407,5 +407,7 @@ pub enum SessionEvent {
         /// 本轮助手消息节点 ID（供前端做历史导航 / 分支 / 重说）
         node_id: u64,
     },
+    /// 分支切换完成（checkout 成功）。
+    BranchChanged { node_id: u64 },
     Error(String),
 }

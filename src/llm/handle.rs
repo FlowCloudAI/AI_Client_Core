@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 use tokio::sync::watch;
 use serde_json::Value;
-use crate::llm::tree::ConversationTree;
+use crate::llm::tree::{ConversationNode, ConversationTree};
 use crate::llm::types::{ChatRequest, CtrlMsg, Message};
 use crate::orchestrator::TaskContext;
 use crate::ThinkingType;
@@ -144,6 +144,26 @@ impl SessionHandle {
             .send(CtrlMsg::Checkout { node_id })
             .await
             .map_err(|_| "会话已关闭".to_string())
+    }
+
+    /// 获取树中所有节点（含所有分支，不限于当前路径）。
+    pub async fn get_all_nodes(&self) -> Vec<ConversationNode> {
+        self.tree.read().await.all_nodes().into_iter().cloned().collect()
+    }
+
+    /// 获取指定节点详情。
+    pub async fn get_node(&self, id: u64) -> Option<ConversationNode> {
+        self.tree.read().await.get_node(id).cloned()
+    }
+
+    /// 获取指定节点的直接子节点 ID 列表。
+    pub async fn get_children(&self, node_id: u64) -> Vec<u64> {
+        self.tree.read().await.children_of(node_id)
+    }
+
+    /// 获取当前 head 节点 ID。
+    pub async fn head(&self) -> Option<u64> {
+        self.tree.read().await.head()
     }
 
     /// 取消当前进行中的轮次。

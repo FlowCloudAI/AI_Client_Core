@@ -28,6 +28,8 @@ pub struct StoredMessage {
     pub node_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<u64>,
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
@@ -48,10 +50,13 @@ pub struct StoredConversation {
     #[serde(flatten)]
     pub meta: ConversationMeta,
     pub messages: Vec<StoredMessage>,
+    /// 当前 head 节点 ID（v3 新增，旧文件默认为 None）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head: Option<u64>,
 }
 
 fn default_schema_version() -> u32 {
-    2
+    3
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -211,6 +216,7 @@ impl StorageCtx {
         &self,
         messages: Vec<StoredMessage>,
         model: &str,
+        head: Option<u64>,
     ) {
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -246,6 +252,7 @@ impl StorageCtx {
                 updated_at: now,
             },
             messages,
+            head,
         };
 
         if let Err(e) = self.store.save(&conv) {
