@@ -34,7 +34,7 @@ impl ApiPipeline {
     }
 
     /// 查询指定插件的 API 端点 URL。
-    pub fn get_url(&self, plugin_id: &str) -> Result<&str> {
+    pub fn get_url(&self, plugin_id: &str) -> Result<String> {
         self.registry.get_url(plugin_id)
     }
 

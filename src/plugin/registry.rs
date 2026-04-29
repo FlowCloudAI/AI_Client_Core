@@ -9,6 +9,15 @@ use crate::plugin::pool::{MapperPool, PooledMapper};
 use crate::plugin::types::{PluginKind, PluginMeta};
 use wasmtime::component::{Component, Linker};
 
+// ─────────────────────── RegistryState ──────────────────────
+
+/// PluginRegistry 的可变内部状态，由 Mutex 保护。
+struct RegistryState {
+    plugins: HashMap<String, PluginMeta>,
+    modules: HashMap<String, Component>,
+    pools: HashMap<String, Arc<MapperPool>>,
+}
+
 // ─────────────────────── PluginRegistry ─────────────────────
 
 /// 插件注册中心。
@@ -23,23 +32,16 @@ use wasmtime::component::{Component, Linker};
 /// - `FlowCloudAIClient` 通过 `Arc<PluginRegistry>` 持有。
 /// - 各 Session 持有 `Arc<PluginRegistry>` 的 clone。
 /// - Session 通过 `acquire()` 借出 `PooledMapper`，用完自动归还。
-/// - `PluginRegistry` 本身是 `Sync`（内部只有 Mutex<Vec>），可安全跨线程共享。
+/// - `PluginRegistry` 本身是 `Sync`（内部由 Mutex 保护），可安全跨线程共享。
 pub struct PluginRegistry {
-    /// 插件元数据（id → meta）
-    plugins: HashMap<String, PluginMeta>,
-
-    /// 按 plugin_id 索引的实例池
-    /// 只有已加载（load）的插件才会有对应的 pool
-    pools: HashMap<String, MapperPool>,
+    /// 可变内部状态（plugins / modules / pools），由 Mutex 保护。
+    state: Mutex<RegistryState>,
 
     /// wasmtime 引擎（共享，clone 廉价）
     engine: Engine,
 
     /// wasmtime 链接器（定义 host 函数）
     linker: Linker<HostState>,
-
-    /// 已编译的 wasm 模块（编译一次，实例化多次）
-    modules: HashMap<String, Component>,
 
     /// 每个池的最大空闲实例数
     max_idle_per_pool: usize,
@@ -57,11 +59,13 @@ impl PluginRegistry {
         let engine = Engine::default();
         let linker = Linker::new(&engine);
         Ok(Self {
-            plugins: HashMap::new(),
-            pools: HashMap::new(),
+            state: Mutex::new(RegistryState {
+                plugins: HashMap::new(),
+                modules: HashMap::new(),
+                pools: HashMap::new(),
+            }),
             engine,
             linker,
-            modules: HashMap::new(),
             max_idle_per_pool: 0,
             ref_counts: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -98,11 +102,13 @@ impl PluginRegistry {
         }
 
         Ok(Self {
-            plugins: plugin_metas,
-            pools: HashMap::new(),
+            state: Mutex::new(RegistryState {
+                plugins: plugin_metas,
+                modules,
+                pools: HashMap::new(),
+            }),
             engine,
             linker,
-            modules,
             max_idle_per_pool,
             ref_counts: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -114,25 +120,26 @@ impl PluginRegistry {
     ///
     /// 只有 `load` 过的插件才能被 `acquire`。
     /// 可多次调用同一 id，幂等。
-    pub fn load(&mut self, id: &str) -> Result<()> {
-        if self.pools.contains_key(id) {
+    pub fn load(&self, id: &str) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        if state.pools.contains_key(id) {
             return Ok(()); // 已加载，幂等
         }
 
-        let module = self
+        let module = state
             .modules
             .get(id)
             .ok_or_else(|| anyhow!("plugin '{}' not found in registry", id))?
-            .clone(); // Module clone 廉价（内部 Arc）
+            .clone();
 
-        let pool = MapperPool::new(
+        let pool = Arc::new(MapperPool::new(
             self.engine.clone(),
             module,
-            self.linker.clone(), // Linker clone — 如果你的版本不支持 clone，需改为重建
+            self.linker.clone(),
             self.max_idle_per_pool,
-        );
+        ));
 
-        self.pools.insert(id.to_string(), pool);
+        state.pools.insert(id.to_string(), pool);
         Ok(())
     }
 
@@ -142,11 +149,11 @@ impl PluginRegistry {
     ///
     /// 注意：调用方应确保没有活跃的 PooledMapper 引用该 pool，
     /// 否则会导致悬垂引用。实践中应先停止所有使用该插件的 session。
-    pub fn unload(&mut self, id: &str) -> Result<()> {
+    pub fn unload(&self, id: &str) -> Result<()> {
         // 检查引用计数
         let ref_counts = self.ref_counts.lock()
             .map_err(|e| anyhow!("failed to lock ref_counts: {}", e))?;
-        
+
         if let Some(&count) = ref_counts.get(id) {
             if count > 0 {
                 return Err(anyhow!(
@@ -157,17 +164,18 @@ impl PluginRegistry {
         }
         drop(ref_counts);
 
-        // 移除 pool 和 module
-        self.pools.remove(id);
-        self.modules.remove(id);
-        self.plugins.remove(id);
-        
+        // 移除 pool、module 和 meta
+        let mut state = self.state.lock().unwrap();
+        state.pools.remove(id);
+        state.modules.remove(id);
+        state.plugins.remove(id);
+
         Ok(())
     }
 
     /// 插件是否已加载（有活跃的实例池）。
     pub fn is_loaded(&self, id: &str) -> bool {
-        self.pools.contains_key(id)
+        self.state.lock().unwrap().pools.contains_key(id)
     }
 
     // ── 实例借出 ──
@@ -179,47 +187,59 @@ impl PluginRegistry {
     /// - drop PooledMapper → 自动归还池中
     ///
     /// 如果插件未加载，返回 Err。
-    /// 如果不需要插件映射，使用 `acquire_or_passthrough` 代替。
-    pub fn acquire(&self, plugin_id: &str) -> Result<PooledMapper<'_>> {
-        self.pools
+    pub fn acquire(&self, plugin_id: &str) -> Result<PooledMapper> {
+        let state = self.state.lock().unwrap();
+        let pool = state
+            .pools
             .get(plugin_id)
             .ok_or_else(|| anyhow!("plugin '{}' not loaded", plugin_id))?
-            .acquire()
+            .clone();
+        drop(state);
+        pool.acquire()
     }
 
     // ── 查询 ──
 
     /// 获取插件的 API 端点 URL。
-    pub fn get_url(&self, plugin_id: &str) -> Result<&str> {
-        self.plugins
+    pub fn get_url(&self, plugin_id: &str) -> Result<String> {
+        let state = self.state.lock().unwrap();
+        state
+            .plugins
             .get(plugin_id)
-            .map(|meta| meta.url.as_str())
+            .map(|meta| meta.url.clone())
             .ok_or_else(|| anyhow!("plugin '{}' not found", plugin_id))
     }
 
     /// 获取插件元数据。
-    pub fn get_meta(&self, plugin_id: &str) -> Option<&PluginMeta> {
-        self.plugins.get(plugin_id)
+    pub fn get_meta(&self, plugin_id: &str) -> Option<PluginMeta> {
+        self.state.lock().unwrap().plugins.get(plugin_id).cloned()
     }
 
-    /// 获取所有插件元数据。
-    pub fn list_plugins(&self) -> &HashMap<String, PluginMeta> {
-        &self.plugins
+    /// 获取所有插件元数据列表。
+    pub fn list_plugins(&self) -> Vec<PluginMeta> {
+        self.state.lock().unwrap().plugins.values().cloned().collect()
     }
 
     /// 按类型筛选插件。
-    pub fn list_by_kind(&self, kind: PluginKind) -> Vec<(&String, &PluginMeta)> {
-        self.plugins
-            .iter()
-            .filter(|(_, meta)| meta.kind == kind)
+    pub fn list_by_kind(&self, kind: PluginKind) -> Vec<PluginMeta> {
+        self.state
+            .lock()
+            .unwrap()
+            .plugins
+            .values()
+            .filter(|meta| meta.kind == kind)
+            .cloned()
             .collect()
     }
 
     /// 获取所有已加载插件的池状态（诊断用）。
-    pub fn pool_stats(&self) -> HashMap<&str, usize> {
-        self.pools
+    pub fn pool_stats(&self) -> HashMap<String, usize> {
+        self.state
+            .lock()
+            .unwrap()
+            .pools
             .iter()
-            .map(|(id, pool)| (id.as_str(), pool.idle_count()))
+            .map(|(id, pool)| (id.clone(), pool.idle_count()))
             .collect()
     }
 
@@ -259,13 +279,14 @@ impl PluginRegistry {
     /// 此方法编译 wasm 并添加到 modules HashMap，但不创建 pool。
     /// 需要后续调用 `load()` 来激活插件。
     pub fn add_module(
-        &mut self,
+        &self,
         id: String,
         meta: PluginMeta,
         wasm_bytes: &[u8],
     ) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
         // 检查 ID 唯一性
-        if self.plugins.contains_key(&id) {
+        if state.plugins.contains_key(&id) {
             return Err(anyhow!("plugin '{}' already exists", id));
         }
 
@@ -274,8 +295,8 @@ impl PluginRegistry {
             .map_err(|e| anyhow!("failed to compile wasm for plugin '{}': {}", id, e))?;
 
         // 插入元数据和模块
-        self.plugins.insert(id.clone(), meta);
-        self.modules.insert(id, module);
+        state.plugins.insert(id.clone(), meta);
+        state.modules.insert(id, module);
 
         Ok(())
     }

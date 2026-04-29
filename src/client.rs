@@ -36,7 +36,7 @@ impl FlowCloudAIClient {
                 for (id, meta) in &pm.plugins {
                     println!("[plugin] found: {} ({:?})", id, meta.kind);
                 }
-                let mut registry = PluginRegistry::build(
+                let registry = PluginRegistry::build(
                     pm.engine.clone(),
                     pm.linker.clone(),
                     pm.plugins.clone(),
@@ -44,7 +44,7 @@ impl FlowCloudAIClient {
                 )?;
 
                 // 扫描到的插件默认自动激活，避免 session 在未显式 load_plugin 时退回直通模式。
-                let plugin_ids: Vec<String> = registry.list_plugins().keys().cloned().collect();
+                let plugin_ids: Vec<String> = registry.list_plugins().into_iter().map(|m| m.id).collect();
                 for id in plugin_ids {
                     registry.load(&id)?;
                 }
@@ -71,26 +71,19 @@ impl FlowCloudAIClient {
 
     // ── 插件管理 ──
 
-    pub fn load_plugin(&mut self, id: &str) -> Result<()> {
-        Arc::get_mut(&mut self.plugin_registry)
-            .ok_or_else(|| {
-                anyhow!(
-                    "cannot load plugin while sessions hold a registry reference; \
-                     call load_plugin before creating any session"
-                )
-            })?
-            .load(id)
+    pub fn load_plugin(&self, id: &str) -> Result<()> {
+        self.plugin_registry.load(id)
     }
 
-    pub fn list_plugins(&self) -> &HashMap<String, PluginMeta> {
+    pub fn list_plugins(&self) -> Vec<PluginMeta> {
         self.plugin_registry.list_plugins()
     }
 
-    pub fn list_by_kind(&self, kind: PluginKind) -> Vec<(&String, &PluginMeta)> {
+    pub fn list_by_kind(&self, kind: PluginKind) -> Vec<PluginMeta> {
         self.plugin_registry.list_by_kind(kind)
     }
 
-    pub fn pool_stats(&self) -> HashMap<&str, usize> {
+    pub fn pool_stats(&self) -> HashMap<String, usize> {
         self.plugin_registry.pool_stats()
     }
 
@@ -98,11 +91,7 @@ impl FlowCloudAIClient {
     ///
     /// 包括 id, name, version, description, author, kind, fcplug_path 等字段。
     pub fn list_all_plugins(&self) -> Vec<PluginMeta> {
-        self.plugin_registry
-            .list_plugins()
-            .values()
-            .cloned()
-            .collect()
+        self.plugin_registry.list_plugins()
     }
 
     /// 获取插件的引用计数（用于诊断）。
@@ -123,7 +112,7 @@ impl FlowCloudAIClient {
     /// - 插件不存在：返回 anyhow::Error
     /// - 插件正在被使用：返回明确的错误提示
     /// - 文件操作失败：转换为 anyhow::Error 并附带上下文
-    pub fn uninstall_plugin(&mut self, plugin_id: &str) -> Result<()> {
+    pub fn uninstall_plugin(&self, plugin_id: &str) -> Result<()> {
         // 1. 检查插件是否存在
         let meta = self
             .plugin_registry
@@ -144,19 +133,10 @@ impl FlowCloudAIClient {
             ));
         }
 
-        // 3. 获取可变引用并卸载
-        let registry = Arc::get_mut(&mut self.plugin_registry).ok_or_else(|| {
-            anyhow!(
-                "cannot uninstall plugin while sessions hold a registry reference; \
-                 call uninstall_plugin before creating any session or after all sessions are dropped"
-            )
-        })?;
+        // 3. 卸载插件（销毁 pool、module 和 meta）
+        self.plugin_registry.unload(plugin_id)?;
 
-        // 4. 卸载插件（销毁 pool 和 module）
-        registry.unload(plugin_id)?;
-
-
-        // 5. 删除磁盘文件
+        // 4. 删除磁盘文件
         std::fs::remove_file(&fcplug_path)
             .map_err(|e| {
                 anyhow!(
@@ -184,7 +164,7 @@ impl FlowCloudAIClient {
     /// - ID 已存在：返回重复错误
     /// - 文件复制失败：转换为 anyhow::Error 并附带上下文
     /// - WASM 编译失败：返回编译错误
-    pub fn install_plugin_from_path(&mut self, source_path: &Path) -> Result<PluginMeta> {
+    pub fn install_plugin_from_path(&self, source_path: &Path) -> Result<PluginMeta> {
         use crate::SUPPORTED_ABI_VERSION;
 
         // 1. 读取 manifest.json 校验
@@ -242,16 +222,9 @@ impl FlowCloudAIClient {
             buf
         };
 
-        // 获取可变引用并添加模块
-        let registry = Arc::get_mut(&mut self.plugin_registry).ok_or_else(|| {
-            anyhow!(
-                "cannot install plugin while sessions hold a registry reference; \
-                 call install_plugin_from_path before creating any session"
-            )
-        })?;
-
-        registry.add_module(info.id.clone(), meta.clone(), &wasm_bytes)?;
-        registry.load(&info.id)?;
+        // 添加模块并激活插件
+        self.plugin_registry.add_module(info.id.clone(), meta.clone(), &wasm_bytes)?;
+        self.plugin_registry.load(&info.id)?;
 
         println!("[plugin] installed: {} ({})", info.id, dest_path.display());
         Ok(meta)

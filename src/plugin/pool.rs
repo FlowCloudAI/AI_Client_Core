@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::plugin::bindings::plugin_bindings::Api;
 use crate::plugin::host::HostState;
@@ -50,13 +50,11 @@ impl MapperPool {
     ///
     /// 池中有空闲实例则复用，否则即时创建。
     /// 返回的 `PooledMapper` 在 drop 时自动归还。
-    pub fn acquire(&self) -> Result<PooledMapper<'_>> {
+    pub fn acquire(self: &Arc<Self>) -> Result<PooledMapper> {
         let mapper = {
-            // 锁作用域极短：只做 Vec::pop
             match self.idle.lock() {
                 Ok(mut guard) => guard.pop(),
                 Err(poisoned) => {
-                    // Mutex 被 poison，获取内部锁并继续使用
                     eprintln!("警告：MapperPool 的 Mutex 被 poison，已恢复");
                     poisoned.into_inner().pop()
                 },
@@ -70,7 +68,7 @@ impl MapperPool {
 
         Ok(PooledMapper {
             mapper: Some(mapper),
-            pool: self,
+            pool: Arc::clone(self),
         })
     }
 
@@ -107,12 +105,12 @@ impl MapperPool {
 /// RAII 守卫：持有从池中借出的 mapper，drop 时自动归还。
 ///
 /// 通过 `DerefMut` 透明访问内部的 `dyn ApiMapper`。
-pub struct PooledMapper<'a> {
+pub struct PooledMapper {
     mapper: Option<Box<dyn ApiMapper + Send>>,
-    pool: &'a MapperPool,
+    pool: Arc<MapperPool>,
 }
 
-impl Drop for PooledMapper<'_> {
+impl Drop for PooledMapper {
     fn drop(&mut self) {
         if let Some(mapper) = self.mapper.take() {
             self.pool.release(mapper);
@@ -120,7 +118,7 @@ impl Drop for PooledMapper<'_> {
     }
 }
 
-impl std::ops::Deref for PooledMapper<'_> {
+impl std::ops::Deref for PooledMapper {
     type Target = dyn ApiMapper + Send;
 
     #[inline]
@@ -129,14 +127,14 @@ impl std::ops::Deref for PooledMapper<'_> {
     }
 }
 
-impl std::ops::DerefMut for PooledMapper<'_> {
+impl std::ops::DerefMut for PooledMapper {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.mapper.as_mut().unwrap().as_mut()
     }
 }
 
-impl ApiMapper for PooledMapper<'_> {
+impl ApiMapper for PooledMapper {
     fn map_request(&mut self, json: &str) -> Result<String> {
         (**self).map_request(json)
     }
