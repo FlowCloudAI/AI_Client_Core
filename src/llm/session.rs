@@ -6,7 +6,7 @@ use crate::llm::stream_decoder::StreamDecoder;
 use crate::llm::tree::ConversationTree;
 use crate::llm::types::{
     ChatRequest, ChatResponse, CtrlMsg, DecoderEventPayload, Message, SessionEvent, ThinkingType,
-    ToolCall, TurnStatus,
+    ToolCall, TurnStatus, Usage,
 };
 use crate::orchestrator::{AssembledTurn, Orchestrate, TaskContext};
 use crate::plugin::pipeline::ApiPipeline;
@@ -561,22 +561,22 @@ impl LLMSession {
             };
             let enabled_tools = Self::enabled_tool_names_from_request(&req);
 
-            let (content, reasoning, tool_calls, finish_reason, turn_status) =
+            let (content, reasoning, tool_calls, finish_reason, turn_status, usage) =
                 self.send_and_process(&req, cancel_rx.clone(), &event_tx).await?;
 
             let asst_node_id = if matches!(turn_status, TurnStatus::Cancelled | TurnStatus::Interrupted) {
                 // 将已生成的部分内容保存为 assistant 节点，使 head 推进到 "assistant"，
                 // 确保 should_wait_for_user() 返回 true，避免 drive 循环立即重试。
                 self.add_message(Message::assistant(
-                    Some(content).filter(|s| !s.is_empty()),
-                    Some(reasoning).filter(|s| !s.is_empty()),
+                    Some(content).filter(|s: &String| !s.is_empty()),
+                    Some(reasoning).filter(|s: &String| !s.is_empty()),
                     None,
                 ))
                 .await
             } else {
                 self.add_message(Message::assistant(
-                    Some(content).filter(|s| !s.is_empty()),
-                    Some(reasoning).filter(|s| !s.is_empty()),
+                    Some(content).filter(|s: &String| !s.is_empty()),
+                    Some(reasoning).filter(|s: &String| !s.is_empty()),
                     tool_calls.clone(),
                 ))
                 .await
@@ -594,6 +594,7 @@ impl LLMSession {
                             .send(SessionEvent::TurnEnd {
                                 status,
                                 node_id: asst_node_id,
+                                usage,
                             })
                             .await?;
                         continue;
@@ -608,6 +609,7 @@ impl LLMSession {
                 .send(SessionEvent::TurnEnd {
                     status: turn_status,
                     node_id: asst_node_id,
+                    usage,
                 })
                 .await?;
 
@@ -707,6 +709,7 @@ impl LLMSession {
         Option<Vec<ToolCall>>,
         Option<String>,
         TurnStatus,
+        Option<Usage>,
     )> {
         if req.stream.unwrap_or(false) {
             self.handle_stream(req, cancel_rx, event_tx).await
@@ -725,6 +728,7 @@ impl LLMSession {
         Option<Vec<ToolCall>>,
         Option<String>,
         TurnStatus,
+        Option<Usage>,
     )> {
         let json = self.prepare_request(req)?;
 
@@ -786,6 +790,7 @@ impl LLMSession {
             tool_calls,
             Some(finish_reason),
             TurnStatus::Ok,
+            Some(res.usage),
         ))
     }
 
@@ -800,6 +805,7 @@ impl LLMSession {
         Option<Vec<ToolCall>>,
         Option<String>,
         TurnStatus,
+        Option<Usage>,
     )> {
         // StreamDecoder 和 ToolCallAccumulator 降为方法局部变量
         let mut decoder = StreamDecoder::default();
@@ -820,6 +826,7 @@ impl LLMSession {
         let mut finish_reason: Option<String> = None;
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut turn_status = TurnStatus::Ok;
+        let mut usage: Option<Usage> = None;
         let cancel_version = *cancel_rx.borrow();
 
         'outer: loop {
@@ -908,8 +915,9 @@ impl LLMSession {
                         break 'outer;
                     }
 
-                    DecoderEventPayload::TurnEnd { status, .. } => {
+                    DecoderEventPayload::TurnEnd { status, usage: u } => {
                         turn_status = status.clone();
+                        usage = u;
                         finish_reason = Some(match &turn_status {
                             TurnStatus::Ok => "stop".to_string(),
                             TurnStatus::Cancelled => "cancelled".to_string(),
@@ -938,6 +946,7 @@ impl LLMSession {
             },
             finish_reason,
             turn_status,
+            usage,
         ))
     }
 }

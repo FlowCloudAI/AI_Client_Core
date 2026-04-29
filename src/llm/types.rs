@@ -183,6 +183,9 @@ pub struct ChatResponseStream {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_fingerprint: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -406,6 +409,8 @@ pub enum SessionEvent {
         status: TurnStatus,
         /// 本轮助手消息节点 ID（供前端做历史导航 / 分支 / 重说）
         node_id: u64,
+        /// API 用量统计（通常在流式最后一个 chunk 或非流式响应中返回）
+        usage: Option<Usage>,
     },
     /// 分支切换完成（checkout 成功）。
     BranchChanged { node_id: u64 },

@@ -85,7 +85,7 @@ impl StreamDecoder {
                     event_info: self.next_info(),
                     payload: DecoderEventPayload::TurnEnd {
                         status: TurnStatus::Ok,
-                        usage: None,
+                        usage: resp.usage.clone(),
                     },
                 }));
             }
