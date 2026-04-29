@@ -3,6 +3,7 @@ use futures_util::future::BoxFuture;
 use serde_json::Value;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,7 +37,7 @@ type Handler = Arc<
 pub struct ToolSpec {
     pub schema: Value,
     handler: Handler,
-    pub enabled: bool,
+    enabled: AtomicBool,
 }
 
 // ─────────────────────── ToolRegistry ────────────────────────
@@ -151,7 +152,7 @@ impl ToolRegistry {
         let mut v: Vec<_> = self
             .tools
             .values()
-            .filter(|x| x.enabled)
+            .filter(|x| x.enabled.load(Ordering::SeqCst))
             .map(|x| x.schema.clone())
             .collect();
         if v.is_empty() {
@@ -166,7 +167,7 @@ impl ToolRegistry {
         let v: Vec<_> = whitelist
             .iter()
             .filter_map(|name| self.tools.get(name))
-            .filter(|spec| spec.enabled)
+            .filter(|spec| spec.enabled.load(Ordering::SeqCst))
             .map(|spec| spec.schema.clone())
             .collect();
         if v.is_empty() { None } else { Some(v) }
@@ -183,10 +184,10 @@ impl ToolRegistry {
     }
 
     /// 启用指定工具。返回是否成功（工具存在则成功）。
-    pub fn enable_tool(&mut self, name: &str) -> bool {
-        match self.tools.get_mut(name) {
+    pub fn enable_tool(&self, name: &str) -> bool {
+        match self.tools.get(name) {
             Some(spec) => {
-                spec.enabled = true;
+                spec.enabled.store(true, Ordering::SeqCst);
                 true
             }
             None => false,
@@ -194,10 +195,10 @@ impl ToolRegistry {
     }
 
     /// 禁用指定工具。返回是否成功（工具存在则成功）。
-    pub fn disable_tool(&mut self, name: &str) -> bool {
-        match self.tools.get_mut(name) {
+    pub fn disable_tool(&self, name: &str) -> bool {
+        match self.tools.get(name) {
             Some(spec) => {
-                spec.enabled = false;
+                spec.enabled.store(false, Ordering::SeqCst);
                 true
             }
             None => false,
@@ -208,7 +209,7 @@ impl ToolRegistry {
     pub fn is_enabled(&self, name: &str) -> bool {
         self.tools
             .get(name)
-            .map(|spec| spec.enabled)
+            .map(|spec| spec.enabled.load(Ordering::SeqCst))
             .unwrap_or(false)
     }
 
@@ -229,7 +230,7 @@ impl ToolRegistry {
 
         let handler = match self.tools.get(func_name) {
             Some(spec) => {
-                if !spec.enabled {
+                if !spec.enabled.load(Ordering::SeqCst) {
                     anyhow::bail!("工具已禁用: {}", func_name);
                 }
                 Arc::clone(&spec.handler)
@@ -273,7 +274,7 @@ impl ToolRegistry {
                     }
                 }),
                 handler,
-                enabled: true,
+                enabled: AtomicBool::new(true),
             },
         );
     }
