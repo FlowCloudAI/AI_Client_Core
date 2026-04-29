@@ -1,11 +1,14 @@
 use std::collections::HashSet;
-use crate::llm::types::{ChatResponseStream, DecoderEvent, DecoderEventPayload, EventInfo, ToolCall, TurnStatus};
+use crate::llm::types::{ChatResponseStream, DecoderEvent, DecoderEventPayload, EventInfo, ToolCall, TurnStatus, Usage};
 
 #[derive(Default, Debug)]
 pub struct StreamDecoder {
     seq: u64,
     turn_id: u64,
     started: HashSet<(usize, usize)>,
+    /// 部分 API（如 Qwen）将 usage 放在独立的 chunk（choices 为空）中，
+    /// 该 chunk 会在 finish_reason chunk 之前到达。这里暂存以便 TurnEnd 使用。
+    pending_usage: Option<Usage>,
 }
 
 impl StreamDecoder {
@@ -13,6 +16,7 @@ impl StreamDecoder {
         self.turn_id = turn_id;
         self.seq = 0;
         self.started.clear();
+        self.pending_usage = None;
     }
 
     fn next_info(&mut self) -> EventInfo {
@@ -43,6 +47,12 @@ impl StreamDecoder {
                 return out;
             }
         };
+
+        // 部分 API 将 usage 放在独立的 chunk 中（choices 为空），
+        // 该 chunk 会在 finish_reason chunk 之前到达，需要暂存。
+        if resp.usage.is_some() {
+            self.pending_usage = resp.usage.clone();
+        }
 
         for (choice_i, choice) in resp.choices.into_iter().enumerate() {
             // content delta / reasoning delta 你照旧发给 Session -> UI
@@ -85,7 +95,7 @@ impl StreamDecoder {
                     event_info: self.next_info(),
                     payload: DecoderEventPayload::TurnEnd {
                         status: TurnStatus::Ok,
-                        usage: resp.usage.clone(),
+                        usage: self.pending_usage.take(),
                     },
                 }));
             }
