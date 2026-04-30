@@ -18,6 +18,7 @@ pub use plugin::loaded::LoadedPlugin;
 pub use plugin::types::PluginKind;
 pub use llm::session::LLMSession;
 pub use llm::handle::SessionHandle;
+pub use llm::tree::ConversationNode;
 pub use llm::types::{SessionEvent, ThinkingType, TurnStatus, Usage};
 pub use client::{FlowCloudAIClient};
 pub use audio::{AudioDecoder, AudioSource};

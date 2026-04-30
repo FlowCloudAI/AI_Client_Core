@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use serde::Serialize;
 use crate::llm::types::Message;
 
 // ═════════════════════════════════════════════════════════════
@@ -10,7 +11,7 @@ use crate::llm::types::Message;
 pub type NodeId = u64;
 
 /// 树中的单个消息节点
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ConversationNode {
     pub id: NodeId,
     pub message: Message,
