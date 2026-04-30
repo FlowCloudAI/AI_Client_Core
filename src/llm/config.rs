@@ -1,4 +1,4 @@
-// llm/config.rs
+// llm/config.rs——会话配置
 
 use anyhow::anyhow;
 use anyhow::Result;

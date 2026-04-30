@@ -6,7 +6,7 @@ use crate::orchestrator::orchestrate::Orchestrate;
 use crate::tool::registry::ToolRegistry;
 
 // ═════════════════════════════════════════════════════════════
-//                    DefaultOrchestrator
+//                    默认编排器（DefaultOrchestrator）
 // ═════════════════════════════════════════════════════════════
 
 /// 内置默认编排器。

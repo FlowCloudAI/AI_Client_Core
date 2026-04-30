@@ -48,7 +48,7 @@ impl HttpPoster {
             return Err(anyhow!("HTTP 错误 {}: {}", status, text));
         }
 
-        // bytes_stream -> AsyncRead
+        // bytes_stream → AsyncRead
         let byte_stream = res
             .bytes_stream()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));

@@ -139,7 +139,7 @@ impl StreamDecoder {
             }));
         }
 
-        // args delta -> ToolCallDelta
+        // args delta → ToolCallDelta（参数增量 → 工具调用增量）
         if !tc.function.arguments.is_empty() {
             out.push(Ok(DecoderEvent {
                 event_info: self.next_info(),

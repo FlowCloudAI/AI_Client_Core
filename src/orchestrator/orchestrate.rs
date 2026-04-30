@@ -2,7 +2,7 @@ use anyhow::Result;
 use crate::orchestrator::context::{AssembledTurn, TaskContext};
 
 // ═════════════════════════════════════════════════════════════
-//                     Orchestrate trait
+//                     编排器接口（Orchestrate trait）
 // ═════════════════════════════════════════════════════════════
 
 /// 编排器接口。

@@ -15,7 +15,7 @@ use crate::storage::{ConversationMeta, ConversationStore, StoredConversation};
 use crate::tool::registry::ToolRegistry;
 use crate::tts::TTSSession;
 use crate::PluginScanner;
-// ─────────────────────── FlowCloudAIClient ──────────────────
+// ─────────────────────── FlowCloudAI 客户端 ─────────────────
 
 pub struct FlowCloudAIClient {
     plugin_registry: Arc<PluginRegistry>,
@@ -289,7 +289,7 @@ impl FlowCloudAIClient {
     /// 创建 LLM 会话（简单模式）。
     ///
     /// - `config_override`: 可选的 `SessionConfig` 覆盖。传 `None` 时使用默认值：
-    ///   - `event_buffer`: 256, `request_timeout`: 60s, `max_tool_rounds`: 10, `max_line_bytes`: 1MB
+    ///   - `event_buffer`: 256，`request_timeout`: 60s，`max_tool_rounds`: 10，`max_line_bytes`: 1MB
     pub fn create_llm_session(
         &self,
         plugin_id: &str,

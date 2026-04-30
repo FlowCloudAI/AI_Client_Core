@@ -9,7 +9,7 @@ use crate::plugin::pool::{MapperPool, PooledMapper};
 use crate::plugin::types::{PluginKind, PluginMeta};
 use wasmtime::component::{Component, Linker};
 
-// ─────────────────────── RegistryState ──────────────────────
+// ─────────────────────── 注册表状态 ────────────────────────
 
 /// PluginRegistry 的可变内部状态，由 Mutex 保护。
 struct RegistryState {
@@ -18,7 +18,7 @@ struct RegistryState {
     pools: HashMap<String, Arc<MapperPool>>,
 }
 
-// ─────────────────────── PluginRegistry ─────────────────────
+// ─────────────────────── 插件注册中心 ──────────────────────
 
 /// 插件注册中心。
 ///
@@ -310,7 +310,7 @@ impl PluginRegistry {
 // ── Send + Sync 安全性说明 ──
 //
 // PluginRegistry 是 Sync：
-// - HashMap<String, PluginMeta>: Send + Sync
+// - HashMap<String, PluginMeta>: Send + Sync（线程安全）
 // - HashMap<String, MapperPool>: MapperPool 内部用 std::sync::Mutex，是 Sync
 // - Engine: 内部 Arc，Send + Sync
 // - Linker: Send + Sync（如果你的 wasmtime 版本支持）

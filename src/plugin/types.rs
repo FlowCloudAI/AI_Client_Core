@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-// ─────────────────────── PluginKind ─────────────────────
+// ─────────────────────── 插件类型 ─────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum PluginKind {
@@ -13,7 +13,7 @@ pub enum PluginKind {
     TTS,
 }
 
-// ─────────────────────── manifest.json ──────────────────
+// ─────────────────────── manifest.json 解析 ─────────────
 
 /// manifest.json 反序列化目标。
 ///
@@ -130,7 +130,7 @@ impl PluginMeta {
     }
 }
 
-// ─────────────────────── LLMInfo ────────────────────────
+// ─────────────────────── LLM 信息 ────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct LLMInfo {
@@ -153,7 +153,7 @@ pub struct LLMInfo {
     pub max_tokens: Option<u64>,
 }
 
-// ─────────────────────── TTSInfo ────────────────────────
+// ─────────────────────── TTS 信息 ────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct TTSInfo {
@@ -206,7 +206,7 @@ pub struct VoiceInfo {
     pub preview_url: Option<String>,
 }
 
-// ─────────────────────── ImageInfo ──────────────────────
+// ─────────────────────── 图像信息 ────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ImageInfo {

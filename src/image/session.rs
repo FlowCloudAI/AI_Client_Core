@@ -6,7 +6,7 @@ use crate::llm::config::SessionConfig;
 use crate::plugin::pipeline::ApiPipeline;
 use crate::image::types::*;
 
-// ─────────────────────── ImageSession ───────────────────
+// ─────────────────────── 图像会话 ──────────────────────
 
 /// 图像生成会话。
 ///

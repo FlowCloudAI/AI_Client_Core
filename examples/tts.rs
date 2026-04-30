@@ -58,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── 方式 4：从字符串自动检测编码 ──
-    let source = AudioSource::detect("68656c6c6f");  // hex
+    let source = AudioSource::detect("68656c6c6f");  // 十六进制
     let bytes = AudioDecoder::resolve(&source).await?;
     println!("resolved {} bytes", bytes.len());
 

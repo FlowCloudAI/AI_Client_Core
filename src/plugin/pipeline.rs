@@ -1,4 +1,4 @@
-// plugin/pipeline.rs
+// plugin/pipeline.rs——API 管道
 use std::sync::Arc;
 use anyhow::Result;
 use serde_json::Value;

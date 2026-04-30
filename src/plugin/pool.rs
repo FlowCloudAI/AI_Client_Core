@@ -9,7 +9,7 @@ use wasmtime::component::{Component, Linker};
 use wasmtime::{Engine, Store};
 use wasmtime_wasi::WasiCtxBuilder;
 
-// ─────────────────────── MapperPool ─────────────────────────
+// ─────────────────────── 映射器池 ─────────────────────────
 
 /// 单个插件的 WasmMapper 实例池。
 ///
@@ -20,7 +20,7 @@ use wasmtime_wasi::WasiCtxBuilder;
 pub struct MapperPool {
     engine: Engine,
     component: Component,           // 改名 module → component
-    linker: Linker<HostState>,      // component::Linker
+    linker: Linker<HostState>,      // component::Linker（组件链接器）
     idle: Mutex<Vec<Box<dyn ApiMapper + Send>>>,
     max_idle: usize,
 }
@@ -100,7 +100,7 @@ impl MapperPool {
     }
 }
 
-// ─────────────────────── PooledMapper ───────────────────────
+// ─────────────────────── 池化映射器 ────────────────────────
 
 /// RAII 守卫：持有从池中借出的 mapper，drop 时自动归还。
 ///

@@ -6,7 +6,7 @@ use crate::llm::config::SessionConfig;
 use crate::plugin::pipeline::ApiPipeline;
 use crate::tts::types::*;
 
-// ─────────────────────── TTSSession ─────────────────────
+// ─────────────────────── TTS 会话 ────────────────────────
 
 /// TTS 语音合成会话。
 ///

@@ -5,7 +5,7 @@ use wasmtime::Store;
 use crate::plugin::bindings::plugin_bindings::Api;
 use crate::plugin::host::HostState;
 
-// ─────────────────────────── Trait ───────────────────────────
+// ─────────────────────────── 映射器接口 ────────────────────
 
 /// 请求/响应映射器。
 ///
@@ -17,7 +17,7 @@ pub trait ApiMapper: Send {
     fn map_stream_line(&mut self, line: &str) -> Result<String>;
 }
 
-// ─────────────────────── PassthroughMapper ───────────────────
+// ─────────────────────── 直通映射器 ─────────────────────────
 
 /// 无插件时的直通实现：原样返回，零开销。
 pub struct PassthroughMapper;
@@ -37,7 +37,7 @@ impl ApiMapper for PassthroughMapper {
     }
 }
 
-// ─────────────────────── WasmMapper ─────────────────────────
+// ─────────────────────── Wasm 映射器 ────────────────────────
 
 /// 基于 wasmtime 的插件映射器。
 ///

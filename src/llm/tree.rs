@@ -268,7 +268,7 @@ mod tests {
         assert_eq!(msgs[3].content.as_deref(), Some("msg4"));
     }
 
-    // ── checkout ──
+    // ── checkout（切换节点）──
 
     #[test]
     fn checkout_to_earlier_node() {
@@ -326,7 +326,7 @@ mod tests {
         assert_eq!(msgs_b[1].content.as_deref(), Some("answer_B"));
     }
 
-    // ── path_to ──
+    // ── path_to（路径查询）──
 
     #[test]
     fn path_to_returns_correct_sequence() {
@@ -349,7 +349,7 @@ mod tests {
         assert_eq!(tree.path_to(Some(n2)), vec![n1, n2]);
     }
 
-    // ── get_node ──
+    // ── get_node（获取节点）──
 
     #[test]
     fn get_node_returns_correct_message() {
@@ -374,7 +374,7 @@ mod tests {
         assert_eq!(tree.get_node(n3).unwrap().parent, Some(n2));
     }
 
-    // ── all_nodes / children_of ──
+    // ── all_nodes / children_of（全节点/子节点）──
 
     #[test]
     fn all_nodes_includes_branches() {

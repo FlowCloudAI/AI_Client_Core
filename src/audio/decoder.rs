@@ -12,7 +12,7 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use tokio::sync::Mutex;
 
-// ─────────────────────── AudioSource ────────────────────────
+// ─────────────────────── 音频来源 ──────────────────────────
 
 /// 音频数据来源。
 #[derive(Debug, Clone)]
@@ -52,7 +52,7 @@ impl AudioSource {
     }
 }
 
-// ─────────────────────── DecodedAudio ───────────────────────
+// ─────────────────────── 解码音频 ──────────────────────────
 
 /// 解码后的 PCM 音频数据。
 #[derive(Debug, Clone)]
@@ -67,7 +67,7 @@ pub struct DecodedAudio {
     pub channels: u16,
 }
 
-// ─────────────────────── AudioDecoder ───────────────────────
+// ─────────────────────── 音频解码器 ─────────────────────────
 
 /// 统一的音频解码器。
 ///
