@@ -497,10 +497,12 @@ impl LLMSession {
     ) -> Result<()> {
         let mut current_ctx = TaskContext::default();
         let mut tool_rounds = 0usize;
+        let mut accumulated_usage: Option<Usage> = None;
 
         loop {
             if self.should_wait_for_user().await {
                 tool_rounds = 0;
+                accumulated_usage = None;
                 event_tx.send(SessionEvent::NeedInput).await?;
 
                 // 并发等待用户输入或控制指令
@@ -564,6 +566,18 @@ impl LLMSession {
             let (content, reasoning, tool_calls, finish_reason, turn_status, usage) =
                 self.send_and_process(&req, cancel_rx.clone(), &event_tx).await?;
 
+            // 累加本轮的 usage（同一用户 turn 内可能有多次 API 调用，如工具执行后的重试）
+            if let Some(ref u) = usage {
+                match accumulated_usage {
+                    Some(ref mut acc) => {
+                        acc.prompt_tokens += u.prompt_tokens;
+                        acc.completion_tokens += u.completion_tokens;
+                        acc.total_tokens += u.total_tokens;
+                    }
+                    None => accumulated_usage = Some(u.clone()),
+                }
+            }
+
             let asst_node_id = if matches!(turn_status, TurnStatus::Cancelled | TurnStatus::Interrupted) {
                 // 将已生成的部分内容保存为 assistant 节点，使 head 推进到 "assistant"，
                 // 确保 should_wait_for_user() 返回 true，避免 drive 循环立即重试。
@@ -594,7 +608,7 @@ impl LLMSession {
                             .send(SessionEvent::TurnEnd {
                                 status,
                                 node_id: asst_node_id,
-                                usage,
+                                usage: accumulated_usage.take(),
                             })
                             .await?;
                         continue;
@@ -609,7 +623,7 @@ impl LLMSession {
                 .send(SessionEvent::TurnEnd {
                     status: turn_status,
                     node_id: asst_node_id,
-                    usage,
+                    usage: accumulated_usage.take(),
                 })
                 .await?;
 
@@ -836,6 +850,7 @@ impl LLMSession {
                         Ok(()) if *cancel_rx.borrow() != cancel_version => {
                             turn_status = TurnStatus::Cancelled;
                             finish_reason = Some("cancelled".to_string());
+                            usage = decoder.take_pending_usage();
                             break 'outer;
                         }
                         Ok(()) => {
@@ -844,6 +859,7 @@ impl LLMSession {
                         Err(_) => {
                             turn_status = TurnStatus::Cancelled;
                             finish_reason = Some("cancelled".to_string());
+                            usage = decoder.take_pending_usage();
                             break 'outer;
                         }
                     }
@@ -901,6 +917,8 @@ impl LLMSession {
                     }
 
                     DecoderEventPayload::ToolCallsRequired => {
+                        // 取出可能已被暂存的 usage（部分 API 在 tool_calls 之前发送 usage chunk）
+                        usage = decoder.take_pending_usage();
                         tool_calls = acc.build_calls(self.turn_id);
                         for call in &tool_calls {
                             event_tx
@@ -933,7 +951,17 @@ impl LLMSession {
         }
 
         if finish_reason.is_none() {
-            return Err(anyhow!("流式响应异常结束：缺少终止标记"));
+            // 部分 API（如 DeepSeek v4 代理）不在流式 chunk 中携带
+            // finish_reason，而是仅以 [DONE] 或 TCP 关闭表示结束。
+            // 此时视为正常结束。
+            finish_reason = Some("stop".to_string());
+            if !matches!(turn_status, TurnStatus::Error(_)) {
+                turn_status = TurnStatus::Ok;
+            }
+            // 尝试取出可能已被暂存在 decoder 中的 usage
+            if usage.is_none() {
+                usage = decoder.take_pending_usage();
+            }
         }
 
         Ok((

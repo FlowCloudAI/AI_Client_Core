@@ -19,6 +19,11 @@ impl StreamDecoder {
         self.pending_usage = None;
     }
 
+    /// 取出已暂存的 usage（用于非 TurnEnd 的退场路径，如 tool_calls / 取消 / 流异常关闭）。
+    pub fn take_pending_usage(&mut self) -> Option<Usage> {
+        self.pending_usage.take()
+    }
+
     fn next_info(&mut self) -> EventInfo {
         self.seq += 1;
         EventInfo {
@@ -36,7 +41,17 @@ impl StreamDecoder {
         if let Some(rest) = s.strip_prefix("data:") {
             s = rest.trim();
         }
-        if s.is_empty() || s == "[DONE]" {
+        if s.is_empty() {
+            return out;
+        }
+        if s == "[DONE]" {
+            out.push(Ok(DecoderEvent {
+                event_info: self.next_info(),
+                payload: DecoderEventPayload::TurnEnd {
+                    status: TurnStatus::Ok,
+                    usage: self.pending_usage.take(),
+                },
+            }));
             return out;
         }
 
