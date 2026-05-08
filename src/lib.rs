@@ -12,7 +12,7 @@ pub mod storage;
 
 pub const SUPPORTED_ABI_VERSION: u32 = 2;
 
-pub use plugin::manager::PluginManager;
+pub use plugin::manager::{PluginLoadError, PluginLoadReport, PluginManager};
 pub use plugin::scanner::PluginScanner;
 pub use plugin::loaded::LoadedPlugin;
 pub use plugin::types::PluginKind;

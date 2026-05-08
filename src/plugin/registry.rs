@@ -1,8 +1,8 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{anyhow, Result};
-use wasmtime::Engine;
+use wasmtime::{Config, Engine};
 
 use crate::plugin::host::HostState;
 use crate::plugin::pool::{MapperPool, PooledMapper};
@@ -54,10 +54,27 @@ pub struct PluginRegistry {
 impl PluginRegistry {
     // ── 构建 ──
 
-    /// 空 registry，无插件。所有 acquire 都会走 passthrough。
+    fn state(&self) -> Result<MutexGuard<'_, RegistryState>> {
+        self.state
+            .lock()
+            .map_err(|e| anyhow!("plugin registry state poisoned: {}", e))
+    }
+
+    fn ref_counts_guard(&self) -> Result<MutexGuard<'_, HashMap<String, usize>>> {
+        self.ref_counts
+            .lock()
+            .map_err(|e| anyhow!("plugin registry ref_counts poisoned: {}", e))
+    }
+
+    /// 空 registry，无插件。仅未指定插件的管道会走 passthrough。
     pub fn empty() -> Result<Self> {
-        let engine = Engine::default();
-        let linker = Linker::new(&engine);
+        let mut config = Config::new();
+        config.wasm_component_model(true);
+        let engine = Engine::new(&config)
+            .map_err(|e| anyhow!("failed to create WebAssembly engine: {}", e))?;
+        let mut linker = Linker::new(&engine);
+        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
+            .map_err(|e| anyhow!("failed to add WASI to linker: {}", e))?;
         Ok(Self {
             state: Mutex::new(RegistryState {
                 plugins: HashMap::new(),
@@ -121,7 +138,7 @@ impl PluginRegistry {
     /// 只有 `load` 过的插件才能被 `acquire`。
     /// 可多次调用同一 id，幂等。
     pub fn load(&self, id: &str) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state()?;
         if state.pools.contains_key(id) {
             return Ok(()); // 已加载，幂等
         }
@@ -151,8 +168,7 @@ impl PluginRegistry {
     /// 否则会导致悬垂引用。实践中应先停止所有使用该插件的 session。
     pub fn unload(&self, id: &str) -> Result<()> {
         // 检查引用计数
-        let ref_counts = self.ref_counts.lock()
-            .map_err(|e| anyhow!("failed to lock ref_counts: {}", e))?;
+        let ref_counts = self.ref_counts_guard()?;
 
         if let Some(&count) = ref_counts.get(id) {
             if count > 0 {
@@ -165,7 +181,7 @@ impl PluginRegistry {
         drop(ref_counts);
 
         // 移除 pool、module 和 meta
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state()?;
         state.pools.remove(id);
         state.modules.remove(id);
         state.plugins.remove(id);
@@ -174,8 +190,15 @@ impl PluginRegistry {
     }
 
     /// 插件是否已加载（有活跃的实例池）。
+    pub fn try_is_loaded(&self, id: &str) -> Result<bool> {
+        Ok(self.state()?.pools.contains_key(id))
+    }
+
+    /// 插件是否已加载（有活跃的实例池）。
+    ///
+    /// 兼容旧 API：锁异常时保守返回 false，严格路径请使用 `try_is_loaded`。
     pub fn is_loaded(&self, id: &str) -> bool {
-        self.state.lock().unwrap().pools.contains_key(id)
+        self.try_is_loaded(id).unwrap_or(false)
     }
 
     // ── 实例借出 ──
@@ -188,7 +211,7 @@ impl PluginRegistry {
     ///
     /// 如果插件未加载，返回 Err。
     pub fn acquire(&self, plugin_id: &str) -> Result<PooledMapper> {
-        let state = self.state.lock().unwrap();
+        let state = self.state()?;
         let pool = state
             .pools
             .get(plugin_id)
@@ -202,7 +225,7 @@ impl PluginRegistry {
 
     /// 获取插件的 API 端点 URL。
     pub fn get_url(&self, plugin_id: &str) -> Result<String> {
-        let state = self.state.lock().unwrap();
+        let state = self.state()?;
         state
             .plugins
             .get(plugin_id)
@@ -211,65 +234,112 @@ impl PluginRegistry {
     }
 
     /// 获取插件元数据。
+    pub fn try_get_meta(&self, plugin_id: &str) -> Result<Option<PluginMeta>> {
+        Ok(self.state()?.plugins.get(plugin_id).cloned())
+    }
+
+    /// 获取插件元数据。
+    ///
+    /// 兼容旧 API：锁异常时返回 None，严格路径请使用 `try_get_meta`。
     pub fn get_meta(&self, plugin_id: &str) -> Option<PluginMeta> {
-        self.state.lock().unwrap().plugins.get(plugin_id).cloned()
+        self.try_get_meta(plugin_id).ok().flatten()
     }
 
     /// 获取所有插件元数据列表。
+    pub fn try_list_plugins(&self) -> Result<Vec<PluginMeta>> {
+        Ok(self.state()?.plugins.values().cloned().collect())
+    }
+
+    /// 获取所有插件元数据列表。
+    ///
+    /// 兼容旧 API：锁异常时返回空列表，严格路径请使用 `try_list_plugins`。
     pub fn list_plugins(&self) -> Vec<PluginMeta> {
-        self.state.lock().unwrap().plugins.values().cloned().collect()
+        self.try_list_plugins().unwrap_or_default()
     }
 
     /// 按类型筛选插件。
-    pub fn list_by_kind(&self, kind: PluginKind) -> Vec<PluginMeta> {
-        self.state
-            .lock()
-            .unwrap()
+    pub fn try_list_by_kind(&self, kind: PluginKind) -> Result<Vec<PluginMeta>> {
+        Ok(self
+            .state()?
             .plugins
             .values()
             .filter(|meta| meta.kind == kind)
             .cloned()
-            .collect()
+            .collect())
+    }
+
+    /// 按类型筛选插件。
+    ///
+    /// 兼容旧 API：锁异常时返回空列表，严格路径请使用 `try_list_by_kind`。
+    pub fn list_by_kind(&self, kind: PluginKind) -> Vec<PluginMeta> {
+        self.try_list_by_kind(kind).unwrap_or_default()
     }
 
     /// 获取所有已加载插件的池状态（诊断用）。
-    pub fn pool_stats(&self) -> HashMap<String, usize> {
-        self.state
-            .lock()
-            .unwrap()
+    pub fn try_pool_stats(&self) -> Result<HashMap<String, usize>> {
+        Ok(self
+            .state()?
             .pools
             .iter()
             .map(|(id, pool)| (id.clone(), pool.idle_count()))
-            .collect()
+            .collect())
+    }
+
+    /// 获取所有已加载插件的池状态（诊断用）。
+    ///
+    /// 兼容旧 API：锁异常时返回空 map，严格路径请使用 `try_pool_stats`。
+    pub fn pool_stats(&self) -> HashMap<String, usize> {
+        self.try_pool_stats().unwrap_or_default()
     }
 
     // ── 引用计数管理 ──
 
     /// 增加插件引用计数（session 创建时调用）。
+    pub fn try_increment_ref(&self, plugin_id: &str) -> Result<()> {
+        let mut counts = self.ref_counts_guard()?;
+        *counts.entry(plugin_id.to_string()).or_insert(0) += 1;
+        Ok(())
+    }
+
+    /// 增加插件引用计数（session 创建时调用）。
+    ///
+    /// 兼容旧 API：锁异常时忽略，严格路径请使用 `try_increment_ref`。
     pub fn increment_ref(&self, plugin_id: &str) {
-        if let Ok(mut counts) = self.ref_counts.lock() {
-            *counts.entry(plugin_id.to_string()).or_insert(0) += 1;
-        }
+        let _ = self.try_increment_ref(plugin_id);
     }
 
     /// 减少插件引用计数（session 销毁时调用）。
-    pub fn decrement_ref(&self, plugin_id: &str) {
-        if let Ok(mut counts) = self.ref_counts.lock() {
-            if let Some(count) = counts.get_mut(plugin_id) {
-                if *count > 0 {
-                    *count -= 1;
-                }
+    pub fn try_decrement_ref(&self, plugin_id: &str) -> Result<()> {
+        let mut counts = self.ref_counts_guard()?;
+        if let Some(count) = counts.get_mut(plugin_id) {
+            if *count > 0 {
+                *count -= 1;
             }
         }
+        Ok(())
+    }
+
+    /// 减少插件引用计数（session 销毁时调用）。
+    ///
+    /// 兼容旧 API：锁异常时忽略，严格路径请使用 `try_decrement_ref`。
+    pub fn decrement_ref(&self, plugin_id: &str) {
+        let _ = self.try_decrement_ref(plugin_id);
     }
 
     /// 获取插件引用计数。
+    pub fn try_get_ref_count(&self, plugin_id: &str) -> Result<usize> {
+        Ok(self
+            .ref_counts_guard()?
+            .get(plugin_id)
+            .copied()
+            .unwrap_or(0))
+    }
+
+    /// 获取插件引用计数。
+    ///
+    /// 兼容旧 API：锁异常时返回 `usize::MAX`，代表未知且应视为 busy。
     pub fn get_ref_count(&self, plugin_id: &str) -> usize {
-        self.ref_counts
-            .lock()
-            .ok()
-            .and_then(|counts| counts.get(plugin_id).copied())
-            .unwrap_or(0)
+        self.try_get_ref_count(plugin_id).unwrap_or(usize::MAX)
     }
 
     // ── 动态模块加载 ──
@@ -284,7 +354,7 @@ impl PluginRegistry {
         meta: PluginMeta,
         wasm_bytes: &[u8],
     ) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state()?;
         // 检查 ID 唯一性
         if state.plugins.contains_key(&id) {
             return Err(anyhow!("plugin '{}' already exists", id));
@@ -304,6 +374,37 @@ impl PluginRegistry {
     /// 获取引用计数的 Arc（供 Session 持有）。
     pub fn ref_counts(&self) -> Arc<Mutex<HashMap<String, usize>>> {
         Arc::clone(&self.ref_counts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    #[test]
+    fn ref_count_poison_returns_error_and_legacy_busy() {
+        let registry = PluginRegistry::empty().unwrap();
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = registry.ref_counts.lock().unwrap();
+            panic!("制造引用计数 poison");
+        }));
+
+        assert!(registry.try_get_ref_count("p").is_err());
+        assert_eq!(registry.get_ref_count("p"), usize::MAX);
+    }
+
+    #[test]
+    fn state_poison_try_api_returns_error_legacy_api_is_safe() {
+        let registry = PluginRegistry::empty().unwrap();
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = registry.state.lock().unwrap();
+            panic!("制造 registry state poison");
+        }));
+
+        assert!(registry.try_list_plugins().is_err());
+        assert!(registry.list_plugins().is_empty());
+        assert!(!registry.is_loaded("p"));
     }
 }
 

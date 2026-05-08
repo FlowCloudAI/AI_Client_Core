@@ -31,31 +31,29 @@ impl FlowCloudAIClient {
     /// - `storage_path`: 可选的对话存储目录。传 `Some(path)` 时启用本地持久化，
     ///   每次 turn_end 状态为 Ok 时自动将对话写盘。
     pub fn new(plugins_dir: PathBuf, storage_path: Option<PathBuf>) -> Result<Self> {
-        let plugin_registry = match PluginManager::new(plugins_dir.clone()) {
-            Ok(pm) => {
-                for (id, meta) in &pm.plugins {
-                    println!("[plugin] found: {} ({:?})", id, meta.kind);
-                }
-                let registry = PluginRegistry::build(
-                    pm.engine.clone(),
-                    pm.linker.clone(),
-                    pm.plugins.clone(),
-                    8,
-                )?;
+        let pm = PluginManager::new(plugins_dir.clone())?;
+        for (id, meta) in &pm.plugins {
+            println!("[plugin] found: {} ({:?})", id, meta.kind);
+        }
 
-                // 扫描到的插件默认自动激活，避免 session 在未显式 load_plugin 时退回直通模式。
-                let plugin_ids: Vec<String> = registry.list_plugins().into_iter().map(|m| m.id).collect();
-                for id in plugin_ids {
-                    registry.load(&id)?;
-                }
+        let registry = PluginRegistry::build(
+            pm.engine.clone(),
+            pm.linker.clone(),
+            pm.plugins.clone(),
+            8,
+        )?;
 
-                registry
-            }
-            Err(e) => {
-                println!("[plugin] no plugins loaded: {}", e);
-                PluginRegistry::empty()?
-            }
-        };
+        // 扫描到的插件默认自动激活，避免 session 在未显式 load_plugin 时无法使用。
+        let plugin_ids: Vec<String> = registry
+            .try_list_plugins()?
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        for id in plugin_ids {
+            registry.load(&id)?;
+        }
+
+        let plugin_registry = registry;
 
         let storage = storage_path
             .map(|p| ConversationStore::new(p).map(Arc::new))
@@ -99,6 +97,11 @@ impl FlowCloudAIClient {
         self.plugin_registry.get_ref_count(plugin_id)
     }
 
+    /// 严格获取插件的引用计数。
+    pub fn try_get_plugin_ref_count(&self, plugin_id: &str) -> Result<usize> {
+        self.plugin_registry.try_get_ref_count(plugin_id)
+    }
+
     /// 卸载插件：从运行时移除并删除 .fcplug 文件。
     ///
     /// # 逻辑步骤
@@ -123,7 +126,7 @@ impl FlowCloudAIClient {
         let fcplug_path = meta.fcplug_path.clone();
 
         // 2. 检查引用计数
-        let ref_count = self.plugin_registry.get_ref_count(plugin_id);
+        let ref_count = self.plugin_registry.try_get_ref_count(plugin_id)?;
         if ref_count > 0 {
             return Err(anyhow!(
                 "cannot uninstall plugin '{}': still in use by {} session(s). \
@@ -284,6 +287,24 @@ impl FlowCloudAIClient {
         installer(reg)
     }
 
+    fn ensure_plugin_kind(&self, plugin_id: &str, expected: PluginKind) -> Result<()> {
+        let meta = self
+            .plugin_registry
+            .try_get_meta(plugin_id)?
+            .ok_or_else(|| anyhow!("plugin '{}' not found", plugin_id))?;
+
+        if meta.kind != expected {
+            return Err(anyhow!(
+                "plugin '{}' kind mismatch: expected {:?}, got {:?}",
+                plugin_id,
+                expected,
+                meta.kind
+            ));
+        }
+
+        Ok(())
+    }
+
     // ── Session 工厂 ──
 
     /// 创建 LLM 会话（简单模式）。
@@ -296,6 +317,7 @@ impl FlowCloudAIClient {
         api_key: &str,
         config_override: Option<SessionConfig>,
     ) -> Result<LLMSession> {
+        self.ensure_plugin_kind(plugin_id, PluginKind::LLM)?;
         let url = self.plugin_registry.get_url(plugin_id)?;
         if !url.starts_with("http") {
             return Err(anyhow!("plugin '{}' has invalid URL: {}", plugin_id, url));
@@ -305,10 +327,10 @@ impl FlowCloudAIClient {
         config.base_url = url.to_string();
         config.api_key = api_key.to_string();
 
-        let pipeline = ApiPipeline::new(
+        let pipeline = ApiPipeline::try_new(
             Arc::clone(&self.plugin_registry),
             Some(plugin_id.to_string()),
-        );
+        )?;
 
         let mut session = LLMSession::new(
             config,
@@ -338,6 +360,7 @@ impl FlowCloudAIClient {
         conversation_id: &str,
         config_override: Option<SessionConfig>,
     ) -> Result<LLMSession> {
+        self.ensure_plugin_kind(plugin_id, PluginKind::LLM)?;
         let store = self
             .storage
             .as_ref()
@@ -356,10 +379,10 @@ impl FlowCloudAIClient {
         config.base_url = url.to_string();
         config.api_key = api_key.to_string();
 
-        let pipeline = ApiPipeline::new(
+        let pipeline = ApiPipeline::try_new(
             Arc::clone(&self.plugin_registry),
             Some(plugin_id.to_string()),
-        );
+        )?;
 
         let mut session = LLMSession::new(
             config,
@@ -387,7 +410,7 @@ impl FlowCloudAIClient {
     /// 每轮对话开始前自动调用 `assemble`。
     ///
     /// 使用内置策略时，可通过 `DefaultOrchestrator::new(registry)` 构建：
-    /// ```rust
+    /// ```ignore
     /// let orch = DefaultOrchestrator::new(client.tool_registry().clone())
     ///     .with_whitelist(my_sense.tool_whitelist());
     /// let session = client.create_orchestrated_session(plugin_id, api_key, Box::new(orch), None)?;
@@ -403,6 +426,7 @@ impl FlowCloudAIClient {
         orchestrator: Box<dyn Orchestrate>,
         config_override: Option<SessionConfig>,
     ) -> Result<LLMSession> {
+        self.ensure_plugin_kind(plugin_id, PluginKind::LLM)?;
         let url = self.plugin_registry.get_url(plugin_id)?;
         if !url.starts_with("http") {
             return Err(anyhow!("plugin '{}' has invalid URL: {}", plugin_id, url));
@@ -412,10 +436,10 @@ impl FlowCloudAIClient {
         config.base_url = url.to_string();
         config.api_key = api_key.to_string();
 
-        let pipeline = ApiPipeline::new(
+        let pipeline = ApiPipeline::try_new(
             Arc::clone(&self.plugin_registry),
             Some(plugin_id.to_string()),
-        );
+        )?;
 
         let mut session = LLMSession::new(
             config,
@@ -435,14 +459,14 @@ impl FlowCloudAIClient {
     /// 创建 LLM 会话（编排模式，同时加载 Sense）。
     ///
     /// 等价于：
-    /// ```rust
+    /// ```ignore
     /// let mut session = client.create_orchestrated_session(plugin_id, api_key, orchestrator, config_override)?;
     /// session.load_sense(sense).await?;
     /// ```
     ///
     /// `Sense` 只进入 `load_sense()`（系统提示 + 工具安装），不进入编排器。
     /// 若需要编排器感知工具白名单，在构建 `DefaultOrchestrator` 时显式传入：
-    /// ```rust
+    /// ```ignore
     /// let orch = DefaultOrchestrator::new(client.tool_registry().clone())
     ///     .with_whitelist(my_sense.tool_whitelist());
     /// client.create_orchestrated_session_with_sense(plugin_id, api_key, my_sense, Box::new(orch), None).await?;
@@ -477,6 +501,7 @@ impl FlowCloudAIClient {
         api_key: &str,
         config_override: Option<SessionConfig>,
     ) -> Result<TTSSession> {
+        self.ensure_plugin_kind(plugin_id, PluginKind::TTS)?;
         let url = self.plugin_registry.get_url(plugin_id)?;
         if !url.starts_with("http") {
             return Err(anyhow!("plugin '{}' has invalid URL: {}", plugin_id, url));
@@ -494,10 +519,10 @@ impl FlowCloudAIClient {
         config.base_url = url.to_string();
         config.api_key = api_key.to_string();
 
-        let pipeline = ApiPipeline::new(
+        let pipeline = ApiPipeline::try_new(
             Arc::clone(&self.plugin_registry),
             Some(plugin_id.to_string()),
-        );
+        )?;
 
         TTSSession::new(config, pipeline)
     }
@@ -544,6 +569,7 @@ impl FlowCloudAIClient {
         api_key: &str,
         config_override: Option<SessionConfig>,
     ) -> Result<ImageSession> {
+        self.ensure_plugin_kind(plugin_id, PluginKind::Image)?;
         let url = self.plugin_registry.get_url(plugin_id)?;
         if !url.starts_with("http") {
             return Err(anyhow!("plugin '{}' has invalid URL: {}", plugin_id, url));
@@ -561,10 +587,10 @@ impl FlowCloudAIClient {
         config.base_url = url.to_string();
         config.api_key = api_key.to_string();
 
-        let pipeline = ApiPipeline::new(
+        let pipeline = ApiPipeline::try_new(
             Arc::clone(&self.plugin_registry),
             Some(plugin_id.to_string()),
-        );
+        )?;
 
         ImageSession::new(config, pipeline)
     }

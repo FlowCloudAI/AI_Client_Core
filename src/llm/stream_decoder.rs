@@ -6,8 +6,8 @@ pub struct StreamDecoder {
     seq: u64,
     turn_id: u64,
     started: HashSet<(usize, usize)>,
-    /// 部分 API（如 Qwen）将 usage 放在独立的 chunk（choices 为空）中，
-    /// 该 chunk 会在 finish_reason chunk 之前到达。这里暂存以便 TurnEnd 使用。
+    /// 部分 API（如 Qwen）将 usage 放在独立的 chunk（choices 为空）中。
+    /// 该 chunk 可能在 finish_reason chunk 之后到达，这里暂存以便 TurnEnd 使用。
     pending_usage: Option<Usage>,
 }
 

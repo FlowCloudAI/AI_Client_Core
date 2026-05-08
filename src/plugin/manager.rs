@@ -12,12 +12,27 @@ use crate::plugin::types::{PluginKind, PluginManifest, PluginMeta};
 pub struct PluginManager {
     plug_path: PathBuf,
     pub plugins: HashMap<String, PluginMeta>,
+    pub load_report: PluginLoadReport,
     pub(crate) engine: Engine,
     pub(crate) linker: Linker<HostState>,
 
     llm_plugin: LoadedPlugin,
     image_plugin: LoadedPlugin,
     tts_plugin: LoadedPlugin,
+}
+
+/// 插件加载报告。
+#[derive(Debug, Clone, Default)]
+pub struct PluginLoadReport {
+    pub loaded: Vec<PluginMeta>,
+    pub skipped: Vec<PluginLoadError>,
+}
+
+/// 单个插件跳过原因。
+#[derive(Debug, Clone)]
+pub struct PluginLoadError {
+    pub path: PathBuf,
+    pub reason: String,
 }
 
 // ── 初始化 ──
@@ -33,11 +48,12 @@ impl PluginManager {
         wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
             .map_err(|e| anyhow!("Failed to add WASI to linker: {}", e))?;
 
-        let plugins = Self::load_plugins(Path::new(&plug_path))?;
+        let (plugins, load_report) = Self::load_plugins_report(Path::new(&plug_path))?;
 
         Ok(PluginManager {
             plug_path,
             plugins,
+            load_report,
             engine,
             linker,
             llm_plugin: LoadedPlugin::new(PluginKind::LLM),
@@ -46,57 +62,70 @@ impl PluginManager {
         })
     }
 
-    fn load_plugins(path: &Path) -> Result<HashMap<String, PluginMeta>> {
+    fn load_plugins_report(path: &Path) -> Result<(HashMap<String, PluginMeta>, PluginLoadReport)> {
         let mut plugins: HashMap<String, PluginMeta> = HashMap::new();
+        let mut report = PluginLoadReport::default();
 
         for fcplug in PluginScanner::scan_plugins(path)
             .context("Failed to scan plugins directory")? {
             match PluginScanner::read_plugin_info(&fcplug) {
                 Ok(manifest) => {
-                    if !Self::validate_plugin(&manifest, &plugins) {
+                    if let Err(reason) = Self::validate_plugin(&manifest, &plugins) {
+                        report.skipped.push(PluginLoadError {
+                            path: fcplug,
+                            reason,
+                        });
                         continue;
                     }
 
                     let id = manifest.meta.id.clone();
                     match PluginScanner::build_plugin_meta(manifest, &fcplug) {
-                        Ok(meta) => { plugins.insert(id, meta); }
-                        Err(e) => { eprintln!("⚠️  Failed to build meta for {:?}: {}", fcplug, e); }
+                        Ok(meta) => {
+                            report.loaded.push(meta.clone());
+                            plugins.insert(id, meta);
+                        }
+                        Err(e) => {
+                            report.skipped.push(PluginLoadError {
+                                path: fcplug,
+                                reason: format!("failed to build meta: {}", e),
+                            });
+                        }
                     }
                 }
                 Err(e) => {
-                    eprintln!("⚠️  Invalid plugin {:?}: {}", fcplug, e);
+                    report.skipped.push(PluginLoadError {
+                        path: fcplug,
+                        reason: format!("invalid plugin: {}", e),
+                    });
                 }
             }
         }
 
-        Ok(plugins)
+        Ok((plugins, report))
     }
 
     fn validate_plugin(
         manifest: &PluginManifest,
         existing: &HashMap<String, PluginMeta>,
-    ) -> bool {
+    ) -> std::result::Result<(), String> {
         let info = &manifest.meta;
 
         if existing.contains_key(&info.id) {
-            eprintln!("⚠️  Duplicate plugin ID: {}", info.id);
-            return false;
+            return Err(format!("duplicate plugin ID: {}", info.id));
         }
 
         if info.abi_version != SUPPORTED_ABI_VERSION {
-            eprintln!(
-                "⚠️  Skip plugin '{}': ABI version mismatch (expected: {}, got: {})",
+            return Err(format!(
+                "ABI version mismatch for '{}': expected {}, got {}",
                 info.id, SUPPORTED_ABI_VERSION, info.abi_version
-            );
-            return false;
+            ));
         }
 
         if info.url.is_empty() {
-            eprintln!("⚠️  Skip plugin '{}': empty URL", info.id);
-            return false;
+            return Err(format!("empty URL for '{}'", info.id));
         }
 
-        true
+        Ok(())
     }
 }
 

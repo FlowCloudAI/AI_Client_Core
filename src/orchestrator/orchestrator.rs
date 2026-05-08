@@ -18,7 +18,7 @@ use crate::tool::registry::ToolRegistry;
 ///
 /// # 工具白名单
 /// 若 `Sense` 声明了白名单，在创建 `DefaultOrchestrator` 时显式传入：
-/// ```rust
+/// ```ignore
 /// DefaultOrchestrator::new(registry)
 ///     .with_whitelist(sense.tool_whitelist())
 /// ```
@@ -50,7 +50,7 @@ impl DefaultOrchestrator {
     /// 传 `Some(vec)` 表示仅启用指定名称的工具。
     ///
     /// 推荐用法：
-    /// ```rust
+    /// ```ignore
     /// DefaultOrchestrator::new(registry).with_whitelist(sense.tool_whitelist())
     /// ```
     pub fn with_whitelist(mut self, whitelist: Option<Vec<String>>) -> Self {
@@ -95,7 +95,7 @@ impl DefaultOrchestrator {
                     .filter(|name| self.registry.has_tool(name))
                     .cloned()
                     .collect();
-                turn.tool_schemas = self.registry.schemas_filtered(&enabled);
+                turn.tool_schemas = Some(self.registry.schemas_filtered_strict(&enabled));
                 turn.enabled_tools = enabled;
             }
             None => {
@@ -139,5 +139,59 @@ impl Orchestrate for DefaultOrchestrator {
         self.select_tools(&mut turn);
         self.apply_overrides(ctx, &mut turn);
         Ok(turn)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::types::ToolFunctionArg;
+    use crate::sense::sense_state_new;
+
+    fn registry_with_tools() -> Arc<ToolRegistry> {
+        let mut registry = ToolRegistry::new();
+        registry.put_state(sense_state_new::<()>());
+        registry.register::<(), _>(
+            "alpha",
+            "测试工具 alpha",
+            None::<Vec<ToolFunctionArg>>,
+            |_state, _args| Ok("alpha".to_string()),
+        );
+        registry.register::<(), _>(
+            "beta",
+            "测试工具 beta",
+            None::<Vec<ToolFunctionArg>>,
+            |_state, _args| Ok("beta".to_string()),
+        );
+        Arc::new(registry)
+    }
+
+    #[test]
+    fn empty_whitelist_disables_all_tools() {
+        let orch = DefaultOrchestrator::new(registry_with_tools()).with_whitelist(Some(vec![]));
+        let turn = orch.assemble(&TaskContext::default()).unwrap();
+
+        assert_eq!(turn.tool_schemas, Some(vec![]));
+        assert!(turn.enabled_tools.is_empty());
+    }
+
+    #[test]
+    fn invalid_whitelist_disables_all_tools() {
+        let orch = DefaultOrchestrator::new(registry_with_tools())
+            .with_whitelist(Some(vec!["missing".to_string()]));
+        let turn = orch.assemble(&TaskContext::default()).unwrap();
+
+        assert_eq!(turn.tool_schemas, Some(vec![]));
+        assert!(turn.enabled_tools.is_empty());
+    }
+
+    #[test]
+    fn partial_whitelist_keeps_valid_tools_only() {
+        let orch = DefaultOrchestrator::new(registry_with_tools())
+            .with_whitelist(Some(vec!["alpha".to_string(), "missing".to_string()]));
+        let turn = orch.assemble(&TaskContext::default()).unwrap();
+
+        assert_eq!(turn.enabled_tools, vec!["alpha".to_string()]);
+        assert_eq!(turn.tool_schemas.unwrap().len(), 1);
     }
 }

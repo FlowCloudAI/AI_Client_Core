@@ -217,7 +217,7 @@ impl StorageCtx {
         messages: Vec<StoredMessage>,
         model: &str,
         head: Option<u64>,
-    ) {
+    ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
 
         // 保留已有标题（rename 修改的是文件，这里重读以拿到最新值）
@@ -255,11 +255,6 @@ impl StorageCtx {
             head,
         };
 
-        if let Err(e) = self.store.save(&conv) {
-            eprintln!(
-                "[storage] failed to save conversation {}: {}",
-                self.conversation_id, e
-            );
-        }
+        self.store.save(&conv)
     }
 }

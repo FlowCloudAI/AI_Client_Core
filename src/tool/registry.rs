@@ -164,13 +164,21 @@ impl ToolRegistry {
 
     /// 只获取指定工具名的 Schema（白名单筛选），且仅返回启用的工具。
     pub fn schemas_filtered(&self, whitelist: &[String]) -> Option<Vec<Value>> {
-        let v: Vec<_> = whitelist
+        let v = self.schemas_filtered_strict(whitelist);
+        if v.is_empty() { None } else { Some(v) }
+    }
+
+    /// 严格白名单筛选。
+    ///
+    /// 与兼容方法不同，空白名单或全无效白名单会返回空 Vec，
+    /// 由调用方包装为 `Some(vec![])` 表示“显式禁用全部工具”。
+    pub fn schemas_filtered_strict(&self, whitelist: &[String]) -> Vec<Value> {
+        whitelist
             .iter()
             .filter_map(|name| self.tools.get(name))
             .filter(|spec| spec.enabled.load(Ordering::SeqCst))
             .map(|spec| spec.schema.clone())
-            .collect();
-        if v.is_empty() { None } else { Some(v) }
+            .collect()
     }
 
     /// 获取所有已注册的工具名。
@@ -301,5 +309,40 @@ impl ToolRegistry {
             }
         }
         (required, properties)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sense::sense_state_new;
+
+    fn registry_with_tool() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.put_state(sense_state_new::<()>());
+        registry.register::<(), _>(
+            "alpha",
+            "测试工具 alpha",
+            None::<Vec<ToolFunctionArg>>,
+            |_state, _args| Ok("alpha".to_string()),
+        );
+        registry
+    }
+
+    #[test]
+    fn strict_filtered_keeps_empty_result() {
+        let registry = registry_with_tool();
+
+        assert!(registry.schemas_filtered_strict(&[]).is_empty());
+        assert!(registry
+            .schemas_filtered_strict(&["missing".to_string()])
+            .is_empty());
+    }
+
+    #[test]
+    fn compat_filtered_still_returns_none_for_empty_result() {
+        let registry = registry_with_tool();
+
+        assert!(registry.schemas_filtered(&[]).is_none());
     }
 }

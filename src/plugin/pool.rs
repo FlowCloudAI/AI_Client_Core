@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use crate::plugin::bindings::plugin_bindings::Api;
 use crate::plugin::host::HostState;
 use crate::plugin::mapper::{ApiMapper, WasmMapper};
-use anyhow::{Result};
+use anyhow::Result;
 use wasmtime::component::ResourceTable;
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Engine, Store};
@@ -55,7 +55,6 @@ impl MapperPool {
             match self.idle.lock() {
                 Ok(mut guard) => guard.pop(),
                 Err(poisoned) => {
-                    eprintln!("警告：MapperPool 的 Mutex 被 poison，已恢复");
                     poisoned.into_inner().pop()
                 },
             }
@@ -74,7 +73,10 @@ impl MapperPool {
 
     /// 当前池中空闲实例数（诊断用）。
     pub fn idle_count(&self) -> usize {
-        self.idle.lock().unwrap().len()
+        match self.idle.lock() {
+            Ok(idle) => idle.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        }
     }
 
     // ── 内部方法 ──
@@ -92,7 +94,10 @@ impl MapperPool {
 
     /// 归还实例到池中（由 PooledMapper::drop 调用）。
     fn release(&self, mapper: Box<dyn ApiMapper + Send>) {
-        let mut idle = self.idle.lock().unwrap();
+        let mut idle = match self.idle.lock() {
+            Ok(idle) => idle,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         if idle.len() < self.max_idle {
             idle.push(mapper);
         }
@@ -123,14 +128,20 @@ impl std::ops::Deref for PooledMapper {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        self.mapper.as_ref().unwrap().as_ref()
+        self.mapper
+            .as_ref()
+            .expect("PooledMapper 在 mapper 被取走后仍被使用")
+            .as_ref()
     }
 }
 
 impl std::ops::DerefMut for PooledMapper {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.mapper.as_mut().unwrap().as_mut()
+        self.mapper
+            .as_mut()
+            .expect("PooledMapper 在 mapper 被取走后仍被使用")
+            .as_mut()
     }
 }
 
@@ -148,8 +159,52 @@ impl ApiMapper for PooledMapper {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
-    // 池的基本行为测试（需要实际 wasm 模块才能跑，这里只验证结构）
-    // #[test]
-    // fn test_acquire_and_release() { ... }
+    struct TestMapper;
+
+    impl ApiMapper for TestMapper {
+        fn map_request(&mut self, json: &str) -> Result<String> {
+            Ok(json.to_string())
+        }
+
+        fn map_response(&mut self, json: &str) -> Result<String> {
+            Ok(json.to_string())
+        }
+
+        fn map_stream_line(&mut self, line: &str) -> Result<String> {
+            Ok(line.to_string())
+        }
+    }
+
+    fn test_pool(max_idle: usize) -> MapperPool {
+        let engine = Engine::default();
+        let component = Component::new(&engine, "(component)").unwrap();
+        let linker = Linker::new(&engine);
+        MapperPool::new(engine, component, linker, max_idle)
+    }
+
+    #[test]
+    fn idle_count_recovers_from_poison() {
+        let pool = test_pool(1);
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = pool.idle.lock().unwrap();
+            panic!("制造 pool poison");
+        }));
+
+        assert_eq!(pool.idle_count(), 0);
+    }
+
+    #[test]
+    fn release_recovers_from_poison() {
+        let pool = test_pool(1);
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = pool.idle.lock().unwrap();
+            panic!("制造 pool poison");
+        }));
+
+        pool.release(Box::new(TestMapper));
+        assert_eq!(pool.idle_count(), 1);
+    }
 }

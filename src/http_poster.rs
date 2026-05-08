@@ -44,7 +44,10 @@ impl HttpPoster {
 
         let status = res.status();
         if !status.is_success() {
-            let text = res.text().await.unwrap_or_default();
+            let text = res
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<读取错误响应体失败: {}>", e));
             return Err(anyhow!("HTTP 错误 {}: {}", status, text));
         }
 

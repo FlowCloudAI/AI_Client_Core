@@ -269,6 +269,49 @@ impl LLMSession {
 // ── 启动 ──
 
 impl LLMSession {
+    /// 启动会话，失败时通过 `Result` 返回。
+    ///
+    /// 推荐新代码使用此方法，避免 runtime 创建失败被隐藏。
+    pub fn try_run(
+        self,
+        input_rx: mpsc::Receiver<String>,
+    ) -> Result<(ReceiverStream<SessionEvent>, SessionHandle)> {
+        let (event_tx, event_rx) = mpsc::channel::<SessionEvent>(self.config.event_buffer);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<CtrlMsg>(8);
+        let (cancel_tx, cancel_rx) = watch::channel::<u64>(0);
+        let (ctx_tx, ctx_rx) = mpsc::channel::<TaskContext>(16);
+
+        let handle = SessionHandle {
+            inner: Arc::clone(&self.conversation),
+            tree: Arc::clone(&self.tree),
+            system_messages: Arc::clone(&self.system_messages),
+            ctrl_tx,
+            cancel_tx,
+            ctx_tx,
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("创建 session runtime 失败")?;
+
+        std::thread::spawn(move || {
+            rt.block_on(async move {
+                if let Err(e) = self
+                    .drive(input_rx, ctrl_rx, Some(ctx_rx), cancel_rx, event_tx.clone())
+                    .await
+                {
+                    let _ = event_tx.send(SessionEvent::Error(format!("{:#}", e))).await;
+                }
+            });
+        });
+
+        Ok((ReceiverStream::new(event_rx), handle))
+    }
+
+    /// 启动会话。
+    ///
+    /// 兼容旧 API：如果启动失败，会返回一个只发送 `SessionEvent::Error` 的事件流。
     pub fn run(
         self,
         input_rx: mpsc::Receiver<String>,
@@ -287,21 +330,27 @@ impl LLMSession {
             ctx_tx,
         };
 
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to create session runtime");
-
-            rt.block_on(async move {
-                if let Err(e) = self
-                    .drive(input_rx, ctrl_rx, Some(ctx_rx), cancel_rx, event_tx.clone())
-                    .await
-                {
-                    let _ = event_tx.send(SessionEvent::Error(format!("{:#}", e))).await;
-                }
-            });
-        });
+        match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("创建 session runtime 失败")
+        {
+            Ok(rt) => {
+                std::thread::spawn(move || {
+                    rt.block_on(async move {
+                        if let Err(e) = self
+                            .drive(input_rx, ctrl_rx, Some(ctx_rx), cancel_rx, event_tx.clone())
+                            .await
+                        {
+                            let _ = event_tx.send(SessionEvent::Error(format!("{:#}", e))).await;
+                        }
+                    });
+                });
+            }
+            Err(e) => {
+                let _ = event_tx.try_send(SessionEvent::Error(format!("{:#}", e)));
+            }
+        }
 
         (ReceiverStream::new(event_rx), handle)
     }
@@ -314,21 +363,22 @@ impl LLMSession {
     /// - 两路上下文均在每轮 assemble 前以 `try_recv` 排空，取最新值
     ///
     /// # 示例
-    /// ```rust
+    /// ```ignore
     /// let (ctx_tx, ctx_rx) = mpsc::channel::<TaskContext>(16);
     /// let (events, handle) = session.run_with_context_channel(input_rx, ctx_rx);
     /// // 外部推送（等价于 handle.set_task_context，但可跨模块持有 tx）
     /// ctx_tx.send(my_ctx).await?;
     /// ```
-    pub fn run_with_context_channel(
+    pub fn try_run_with_context_channel(
         self,
         input_rx: mpsc::Receiver<String>,
         mut ext_ctx_rx: mpsc::Receiver<TaskContext>,
-    ) -> (ReceiverStream<SessionEvent>, SessionHandle) {
+    ) -> Result<(ReceiverStream<SessionEvent>, SessionHandle)> {
         let (event_tx, event_rx) = mpsc::channel::<SessionEvent>(self.config.event_buffer);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<CtrlMsg>(8);
         let (cancel_tx, cancel_rx) = watch::channel::<u64>(0);
         let (ctx_tx, ctx_rx) = mpsc::channel::<TaskContext>(16);
+        let ctx_forward_tx = ctx_tx.clone();
 
         let handle = SessionHandle {
             inner: Arc::clone(&self.conversation),
@@ -339,22 +389,22 @@ impl LLMSession {
             ctx_tx: ctx_tx.clone(),
         };
 
-        // 将外部 ctx_rx 转发到内部 channel，与 handle.set_task_context 合并为同一路输入
-        tokio::spawn(async move {
-            while let Some(ctx) = ext_ctx_rx.recv().await {
-                if ctx_tx.send(ctx).await.is_err() {
-                    break;
-                }
-            }
-        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("创建 session runtime 失败")?;
 
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to create session runtime");
-
             rt.block_on(async move {
+                // 将外部 ctx_rx 转发到内部 channel，与 handle.set_task_context 合并为同一路输入。
+                tokio::spawn(async move {
+                    while let Some(ctx) = ext_ctx_rx.recv().await {
+                        if ctx_forward_tx.send(ctx).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+
                 if let Err(e) = self
                     .drive(input_rx, ctrl_rx, Some(ctx_rx), cancel_rx, event_tx.clone())
                     .await
@@ -364,6 +414,62 @@ impl LLMSession {
             });
         });
 
+        Ok((ReceiverStream::new(event_rx), handle))
+    }
+
+    /// 底层版本：接受调用方自持的 ctx 接收端，适合将上下文流接入已有系统。
+    ///
+    /// 兼容旧 API：如果启动失败，会返回一个只发送 `SessionEvent::Error` 的事件流。
+    pub fn run_with_context_channel(
+        self,
+        input_rx: mpsc::Receiver<String>,
+        mut ext_ctx_rx: mpsc::Receiver<TaskContext>,
+    ) -> (ReceiverStream<SessionEvent>, SessionHandle) {
+        let (event_tx, event_rx) = mpsc::channel::<SessionEvent>(self.config.event_buffer);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<CtrlMsg>(8);
+        let (cancel_tx, cancel_rx) = watch::channel::<u64>(0);
+        let (ctx_tx, ctx_rx) = mpsc::channel::<TaskContext>(16);
+        let ctx_forward_tx = ctx_tx.clone();
+
+        let handle = SessionHandle {
+            inner: Arc::clone(&self.conversation),
+            tree: Arc::clone(&self.tree),
+            system_messages: Arc::clone(&self.system_messages),
+            ctrl_tx,
+            cancel_tx,
+            ctx_tx,
+        };
+
+        match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("创建 session runtime 失败")
+        {
+            Ok(rt) => {
+                std::thread::spawn(move || {
+                    rt.block_on(async move {
+                        tokio::spawn(async move {
+                            while let Some(ctx) = ext_ctx_rx.recv().await {
+                                if ctx_forward_tx.send(ctx).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+
+                        if let Err(e) = self
+                            .drive(input_rx, ctrl_rx, Some(ctx_rx), cancel_rx, event_tx.clone())
+                            .await
+                        {
+                            let _ = event_tx.send(SessionEvent::Error(format!("{:#}", e))).await;
+                        }
+                    });
+                });
+            }
+            Err(e) => {
+                let _ = event_tx.try_send(SessionEvent::Error(format!("{:#}", e)));
+            }
+        }
+
         (ReceiverStream::new(event_rx), handle)
     }
 }
@@ -371,7 +477,7 @@ impl LLMSession {
 // ── 核心状态机 ──
 
 impl LLMSession {
-    fn enabled_tool_names_from_request(req: &ChatRequest) -> HashSet<String> {
+    fn enabled_tool_names_from_request(req: &ChatRequest) -> Option<HashSet<String>> {
         req.tools
             .as_ref()
             .map(|tools| {
@@ -384,7 +490,6 @@ impl LLMSession {
                     })
                     .collect()
             })
-            .unwrap_or_default()
     }
 
     fn is_write_like_tool(name: &str) -> bool {
@@ -468,10 +573,12 @@ impl LLMSession {
     ) -> Result<()> {
         match msg {
             CtrlMsg::SwitchPlugin { plugin_id, api_key } => {
+                self.pipeline
+                    .ensure_plugin_kind(&plugin_id, crate::plugin::types::PluginKind::LLM)?;
                 let url = self.pipeline.get_url(&plugin_id)?.to_string();
                 self.config.base_url = url;
                 self.config.api_key = api_key;
-                self.pipeline.set_plugin(Some(plugin_id));
+                self.pipeline.try_set_plugin(Some(plugin_id))?;
             }
             CtrlMsg::Checkout { node_id } => {
                 self.tree
@@ -628,15 +735,19 @@ impl LLMSession {
                 .await?;
 
             if is_ok {
-                self.auto_save().await;
+                if let Err(e) = self.auto_save().await {
+                    event_tx
+                        .send(SessionEvent::Error(format!("存储失败: {:#}", e)))
+                        .await?;
+                }
             }
         }
     }
 
     /// 将当前对话树写入磁盘（仅当 storage_ctx 已注入时生效）。
-    async fn auto_save(&self) {
+    async fn auto_save(&self) -> Result<()> {
         let Some(ref ctx) = self.storage_ctx else {
-            return;
+            return Ok(());
         };
 
         let tree = self.tree.read().await;
@@ -659,7 +770,7 @@ impl LLMSession {
             .collect();
 
         let model = self.conversation.read().await.model.clone();
-        ctx.flush(messages, &model, head);
+        ctx.flush(messages, &model, head)
     }
 
     async fn should_wait_for_user(&self) -> bool {
@@ -879,7 +990,7 @@ impl LLMSession {
             // acquire → map → release，每行独立借出，不跨 await
             let normalized = self
                 .normalize_stream_line(&line)
-                .unwrap_or_else(|_| line.clone());
+                .context("流式插件映射失败")?;
 
             let events = decoder.decode(&normalized);
 
@@ -935,14 +1046,22 @@ impl LLMSession {
 
                     DecoderEventPayload::TurnEnd { status, usage: u } => {
                         turn_status = status.clone();
-                        usage = u;
+                        if u.is_some() {
+                            usage = u;
+                        }
                         finish_reason = Some(match &turn_status {
                             TurnStatus::Ok => "stop".to_string(),
                             TurnStatus::Cancelled => "cancelled".to_string(),
                             TurnStatus::Interrupted => "interrupted".to_string(),
                             TurnStatus::Error(e) => return Err(anyhow!(e.clone())),
                         });
-                        break 'outer;
+
+                        // Qwen 的 OpenAI 兼容流式响应会先发送 finish_reason=stop，
+                        // 再发送 choices=[] 的 usage-only chunk，最后发送 [DONE]。
+                        // 普通完成且尚未拿到 usage 时继续读取尾部块，避免用量统计丢失。
+                        if Self::should_stop_after_stream_turn_end(&turn_status, &usage) {
+                            break 'outer;
+                        }
                     }
 
                     _ => {}
@@ -977,6 +1096,10 @@ impl LLMSession {
             usage,
         ))
     }
+
+    fn should_stop_after_stream_turn_end(turn_status: &TurnStatus, usage: &Option<Usage>) -> bool {
+        usage.is_some() || !matches!(turn_status, TurnStatus::Ok)
+    }
 }
 
 // ── 工具执行 ──
@@ -985,7 +1108,7 @@ impl LLMSession {
     async fn execute_tool_calls(
         &mut self,
         tool_calls: Vec<ToolCall>,
-        enabled_tools: &HashSet<String>,
+        enabled_tools: &Option<HashSet<String>>,
         read_only: bool,
         event_tx: &mpsc::Sender<SessionEvent>,
     ) -> Result<()> {
@@ -993,7 +1116,10 @@ impl LLMSession {
             let func_name = &call.function.name;
             let args_str = call.function.arguments.trim();
 
-            let (output, is_error) = if !enabled_tools.is_empty() && !enabled_tools.contains(func_name) {
+            let (output, is_error) = if enabled_tools
+                .as_ref()
+                .is_some_and(|tools| !tools.contains(func_name))
+            {
                 (format!("工具执行失败: 本轮不允许调用工具 '{}'", func_name), true)
             } else if read_only && Self::is_write_like_tool(func_name) {
                 (format!("工具执行失败: 只读模式下禁止调用写入类工具 '{}'", func_name), true)
@@ -1054,7 +1180,13 @@ impl LLMSession {
 #[cfg(test)]
 mod tests {
     use super::LLMSession;
-    use crate::llm::types::{Message, ToolCall, ToolFunctionCall};
+    use crate::llm::config::SessionConfig;
+    use crate::llm::types::{Message, ToolCall, ToolFunctionCall, TurnStatus, Usage};
+    use crate::plugin::pipeline::ApiPipeline;
+    use crate::plugin::registry::PluginRegistry;
+    use crate::tool::registry::ToolRegistry;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
 
     #[test]
     fn context_insert_index_before_pending_block_keeps_latest_user_anchor() {
@@ -1135,5 +1267,51 @@ mod tests {
             LLMSession::context_insert_index_before_pending_block(&messages),
             2
         );
+    }
+
+    #[test]
+    fn run_with_context_channel_can_start_without_outer_tokio_runtime() {
+        let registry = Arc::new(PluginRegistry::empty().unwrap());
+        let pipeline = ApiPipeline::try_new(registry, None).unwrap();
+        let session = LLMSession::new(
+            SessionConfig::default(),
+            pipeline,
+            Arc::new(ToolRegistry::new()),
+        )
+        .unwrap();
+        let (input_tx, input_rx) = mpsc::channel(1);
+        let (ctx_tx, ctx_rx) = mpsc::channel(1);
+        drop(input_tx);
+        drop(ctx_tx);
+
+        let (_events, _handle) = session.run_with_context_channel(input_rx, ctx_rx);
+    }
+
+    #[test]
+    fn stream_turn_end_waits_for_qwen_usage_tail() {
+        let usage = Usage {
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            total_tokens: 30,
+        };
+
+        assert!(!LLMSession::should_stop_after_stream_turn_end(
+            &TurnStatus::Ok,
+            &None
+        ));
+
+        println!(
+            "Qwen usage: prompt_tokens={}, completion_tokens={}, total_tokens={}",
+            usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
+        );
+        assert!(LLMSession::should_stop_after_stream_turn_end(
+            &TurnStatus::Ok,
+            &Some(usage)
+        ));
+
+        assert!(LLMSession::should_stop_after_stream_turn_end(
+            &TurnStatus::Cancelled,
+            &None
+        ));
     }
 }

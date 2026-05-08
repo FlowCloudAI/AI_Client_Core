@@ -139,6 +139,8 @@ async fn run_chat_loop(
                 eprintln!("\n[SessionError]\n{}", msg);
                 break;
             }
+
+            SessionEvent::BranchChanged { .. } => {}
         }
     }
 
