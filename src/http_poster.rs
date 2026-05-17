@@ -1,9 +1,9 @@
-use std::time::Duration;
 use anyhow::{Result, anyhow};
 use futures_util::{StreamExt, TryStreamExt};
 use reqwest::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::Value;
+use std::time::{Duration, Instant};
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::io::StreamReader;
 
@@ -33,6 +33,12 @@ impl HttpPoster {
         key: &str,
         body: Value,
     ) -> Result<impl futures_util::Stream<Item = Result<String>>> {
+        let body_bytes = body.to_string().len();
+        log::info!(
+            "[client:http][post_json_start] url={} body_bytes={}",
+            url,
+            body_bytes
+        );
         let req = self
             .client
             .post(url)
@@ -40,7 +46,14 @@ impl HttpPoster {
             .header(ACCEPT, "application/json")
             .header(AUTHORIZATION, format!("Bearer {}", key));
 
+        let started = Instant::now();
         let res = req.json(&body).send().await?;
+        log::info!(
+            "[client:http][post_json_response] url={} elapsed_ms={} status={}",
+            url,
+            started.elapsed().as_millis(),
+            res.status()
+        );
 
         let status = res.status();
         if !status.is_success() {

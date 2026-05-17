@@ -864,6 +864,7 @@ dependencies = [
  "cpal",
  "futures-util",
  "hex",
+ "log",
  "reqwest",
  "serde",
  "serde_json",

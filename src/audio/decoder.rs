@@ -1,7 +1,7 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::StreamConfig;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::io::Cursor;
 use std::sync::Arc;
 use symphonia::core::audio::SampleBuffer;
@@ -83,20 +83,12 @@ impl AudioDecoder {
     /// 将 AudioSource 解析为原始音频字节。
     pub async fn resolve(source: &AudioSource) -> Result<Vec<u8>> {
         match source {
-            AudioSource::Hex(hex) => {
-                hex::decode(hex).context("failed to decode hex audio")
-            }
-            AudioSource::Base64(b64) => {
-                base64::engine::general_purpose::STANDARD
-                    .decode(b64)
-                    .context("failed to decode base64 audio")
-            }
-            AudioSource::Url(url) => {
-                Self::fetch_url(url).await
-            }
-            AudioSource::Raw(bytes) => {
-                Ok(bytes.clone())
-            }
+            AudioSource::Hex(hex) => hex::decode(hex).context("failed to decode hex audio"),
+            AudioSource::Base64(b64) => base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .context("failed to decode base64 audio"),
+            AudioSource::Url(url) => Self::fetch_url(url).await,
+            AudioSource::Raw(bytes) => Ok(bytes.clone()),
         }
     }
 
@@ -171,10 +163,10 @@ impl AudioDecoder {
             let packet = match format_reader.next_packet() {
                 Ok(p) => p,
                 Err(symphonia::core::errors::Error::IoError(ref e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-                    {
-                        break;
-                    }
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    break;
+                }
                 Err(e) => return Err(anyhow!("read packet error: {}", e)),
             };
 
@@ -264,7 +256,7 @@ impl AudioDecoder {
                     }
                 },
                 move |err| {
-                    eprintln!("[AudioDecoder] playback error: {}", err);
+                    log::warn!("[AudioDecoder] playback error: {}", err);
                 },
                 None,
             )
@@ -285,10 +277,7 @@ impl AudioDecoder {
     /// 一站式：从 AudioSource 解码并播放。
     ///
     /// 在 async 上下文中使用，播放部分自动 spawn_blocking。
-    pub async fn play_source(
-        source: &AudioSource,
-        format_hint: Option<&str>,
-    ) -> Result<()> {
+    pub async fn play_source(source: &AudioSource, format_hint: Option<&str>) -> Result<()> {
         let audio = Self::decode_source(source, format_hint).await?;
         tokio::task::spawn_blocking(move || Self::play(&audio))
             .await

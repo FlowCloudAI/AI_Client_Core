@@ -1,7 +1,4 @@
-use anyhow::{anyhow, Result};
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use crate::PluginScanner;
 use crate::image::ImageSession;
 use crate::llm::config::SessionConfig;
 use crate::llm::session::LLMSession;
@@ -14,7 +11,10 @@ use crate::sense::Sense;
 use crate::storage::{ConversationMeta, ConversationStore, StoredConversation};
 use crate::tool::registry::ToolRegistry;
 use crate::tts::TTSSession;
-use crate::PluginScanner;
+use anyhow::{Result, anyhow};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 // ─────────────────────── FlowCloudAI 客户端 ─────────────────
 
 pub struct FlowCloudAIClient {
@@ -33,15 +33,11 @@ impl FlowCloudAIClient {
     pub fn new(plugins_dir: PathBuf, storage_path: Option<PathBuf>) -> Result<Self> {
         let pm = PluginManager::new(plugins_dir.clone())?;
         for (id, meta) in &pm.plugins {
-            println!("[plugin] found: {} ({:?})", id, meta.kind);
+            log::info!("[plugin] found: {} ({:?})", id, meta.kind);
         }
 
-        let registry = PluginRegistry::build(
-            pm.engine.clone(),
-            pm.linker.clone(),
-            pm.plugins.clone(),
-            8,
-        )?;
+        let registry =
+            PluginRegistry::build(pm.engine.clone(), pm.linker.clone(), pm.plugins.clone(), 8)?;
 
         // 扫描到的插件默认自动激活，避免 session 在未显式 load_plugin 时无法使用。
         let plugin_ids: Vec<String> = registry
@@ -140,16 +136,19 @@ impl FlowCloudAIClient {
         self.plugin_registry.unload(plugin_id)?;
 
         // 4. 删除磁盘文件
-        std::fs::remove_file(&fcplug_path)
-            .map_err(|e| {
-                anyhow!(
-                    "failed to remove plugin file '{}': {}",
-                    fcplug_path.display(),
-                    e
-                )
-            })?;
+        std::fs::remove_file(&fcplug_path).map_err(|e| {
+            anyhow!(
+                "failed to remove plugin file '{}': {}",
+                fcplug_path.display(),
+                e
+            )
+        })?;
 
-        println!("[plugin] uninstalled: {} ({})", plugin_id, fcplug_path.display());
+        log::info!(
+            "[plugin] uninstalled: {} ({})",
+            plugin_id,
+            fcplug_path.display()
+        );
         Ok(())
     }
 
@@ -171,8 +170,13 @@ impl FlowCloudAIClient {
         use crate::SUPPORTED_ABI_VERSION;
 
         // 1. 读取 manifest.json 校验
-        let manifest = PluginScanner::read_plugin_info(source_path)
-            .map_err(|e| anyhow!("failed to read plugin manifest from {:?}: {}", source_path, e))?;
+        let manifest = PluginScanner::read_plugin_info(source_path).map_err(|e| {
+            anyhow!(
+                "failed to read plugin manifest from {:?}: {}",
+                source_path,
+                e
+            )
+        })?;
 
         let info = &manifest.meta;
 
@@ -197,15 +201,14 @@ impl FlowCloudAIClient {
         // 如果文件已在目标位置（直接下载到 plugins_dir 的场景），跳过复制
         let same_file = source_path.canonicalize().ok() == dest_path.canonicalize().ok();
         if !same_file {
-            std::fs::copy(source_path, &dest_path)
-                .map_err(|e| {
-                    anyhow!(
-                        "failed to copy plugin from {:?} to {:?}: {}",
-                        source_path,
-                        dest_path,
-                        e
-                    )
-                })?;
+            std::fs::copy(source_path, &dest_path).map_err(|e| {
+                anyhow!(
+                    "failed to copy plugin from {:?} to {:?}: {}",
+                    source_path,
+                    dest_path,
+                    e
+                )
+            })?;
         }
 
         // 3. 构建 PluginMeta
@@ -218,7 +221,8 @@ impl FlowCloudAIClient {
                 .map_err(|e| anyhow!("cannot open plugin '{}': {}", info.id, e))?;
             let mut archive = zip::ZipArchive::new(file)
                 .map_err(|e| anyhow!("cannot read zip for plugin '{}': {}", info.id, e))?;
-            let mut entry = archive.by_name("plugin.wasm")
+            let mut entry = archive
+                .by_name("plugin.wasm")
                 .map_err(|_| anyhow!("plugin.wasm not found in '{}'", info.id))?;
             let mut buf = Vec::new();
             std::io::Read::read_to_end(&mut entry, &mut buf)?;
@@ -226,10 +230,11 @@ impl FlowCloudAIClient {
         };
 
         // 添加模块并激活插件
-        self.plugin_registry.add_module(info.id.clone(), meta.clone(), &wasm_bytes)?;
+        self.plugin_registry
+            .add_module(info.id.clone(), meta.clone(), &wasm_bytes)?;
         self.plugin_registry.load(&info.id)?;
 
-        println!("[plugin] installed: {} ({})", info.id, dest_path.display());
+        log::info!("[plugin] installed: {} ({})", info.id, dest_path.display());
         Ok(meta)
     }
 
@@ -240,13 +245,12 @@ impl FlowCloudAIClient {
     /// 必须在 `create_llm_session` 之前调用。
     /// 多个 Sense 可以叠加安装（工具名不冲突即可）。
     pub fn install_sense(&mut self, sense: &dyn Sense) -> Result<()> {
-        let reg = Arc::get_mut(&mut self.tool_registry)
-            .ok_or_else(|| {
-                anyhow!(
-                    "cannot install sense while sessions hold a tool registry reference; \
+        let reg = Arc::get_mut(&mut self.tool_registry).ok_or_else(|| {
+            anyhow!(
+                "cannot install sense while sessions hold a tool registry reference; \
                      call install_sense before creating any session"
-                )
-            })?;
+            )
+        })?;
         sense.install_tools(reg)
     }
 
@@ -277,13 +281,12 @@ impl FlowCloudAIClient {
     where
         F: FnOnce(&mut ToolRegistry) -> Result<()>,
     {
-        let reg = Arc::get_mut(&mut self.tool_registry)
-            .ok_or_else(|| {
-                anyhow!(
-                    "cannot install tools while sessions hold a tool registry reference; \
+        let reg = Arc::get_mut(&mut self.tool_registry).ok_or_else(|| {
+            anyhow!(
+                "cannot install tools while sessions hold a tool registry reference; \
                      call install_tools before creating any session"
-                )
-            })?;
+            )
+        })?;
         installer(reg)
     }
 
@@ -332,11 +335,7 @@ impl FlowCloudAIClient {
             Some(plugin_id.to_string()),
         )?;
 
-        let mut session = LLMSession::new(
-            config,
-            pipeline,
-            Arc::clone(&self.tool_registry),
-        )?;
+        let mut session = LLMSession::new(config, pipeline, Arc::clone(&self.tool_registry))?;
 
         if let Some(ref store) = self.storage {
             session.set_storage_ctx(plugin_id.to_string(), Arc::clone(store));
@@ -384,11 +383,7 @@ impl FlowCloudAIClient {
             Some(plugin_id.to_string()),
         )?;
 
-        let mut session = LLMSession::new(
-            config,
-            pipeline,
-            Arc::clone(&self.tool_registry),
-        )?;
+        let mut session = LLMSession::new(config, pipeline, Arc::clone(&self.tool_registry))?;
 
         // 回放历史消息
         session.preload_history(conv.messages, conv.head);
@@ -441,11 +436,7 @@ impl FlowCloudAIClient {
             Some(plugin_id.to_string()),
         )?;
 
-        let mut session = LLMSession::new(
-            config,
-            pipeline,
-            Arc::clone(&self.tool_registry),
-        )?;
+        let mut session = LLMSession::new(config, pipeline, Arc::clone(&self.tool_registry))?;
 
         session.set_orchestrator(orchestrator);
 
@@ -481,7 +472,8 @@ impl FlowCloudAIClient {
         orchestrator: Box<dyn Orchestrate>,
         config_override: Option<SessionConfig>,
     ) -> Result<LLMSession> {
-        let mut session = self.create_orchestrated_session(plugin_id, api_key, orchestrator, config_override)?;
+        let mut session =
+            self.create_orchestrated_session(plugin_id, api_key, orchestrator, config_override)?;
         session.load_sense(sense).await?;
         Ok(session)
     }
@@ -510,8 +502,8 @@ impl FlowCloudAIClient {
         let mut config = config_override.unwrap_or_else(|| SessionConfig {
             base_url: url.to_string(),
             api_key: api_key.to_string(),
-            event_buffer: 0,          // TTS 不用事件流
-            request_timeout: 120,     // TTS 合成可能较慢
+            event_buffer: 0,      // TTS 不用事件流
+            request_timeout: 120, // TTS 合成可能较慢
             max_tool_rounds: 0,
             max_line_bytes: 0,
         });
@@ -579,7 +571,7 @@ impl FlowCloudAIClient {
             base_url: url.to_string(),
             api_key: api_key.to_string(),
             event_buffer: 0,
-            request_timeout: 180,  // 图像生成较慢
+            request_timeout: 180, // 图像生成较慢
             max_tool_rounds: 0,
             max_line_bytes: 0,
         });

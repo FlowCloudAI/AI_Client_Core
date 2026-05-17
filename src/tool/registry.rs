@@ -3,8 +3,8 @@ use futures_util::future::BoxFuture;
 use serde_json::Value;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 // ─────────────────────── 辅助函数 ───────────────────────────
@@ -28,8 +28,8 @@ pub fn arg_str<'a>(args: &'a Value, key: &str) -> anyhow::Result<&'a str> {
 /// 因为 state 已经在 `Arc<Mutex<T>>` 后面，handler 只需要 &self 就能拿到 state。
 type Handler = Arc<
     dyn for<'a> Fn(&'a ToolRegistry, &'a Value) -> BoxFuture<'a, anyhow::Result<String>>
-    + Send
-    + Sync,
+        + Send
+        + Sync,
 >;
 
 // ─────────────────────── 工具规格 ──────────────────────────
@@ -119,9 +119,9 @@ impl ToolRegistry {
     ) where
         T: Any + Send + 'static,
         F: for<'a> Fn(&'a mut T, &'a Value) -> BoxFuture<'a, anyhow::Result<String>>
-        + Send
-        + Sync
-        + 'static,
+            + Send
+            + Sync
+            + 'static,
     {
         let handler = Arc::new(handler);
 
@@ -262,7 +262,7 @@ impl ToolRegistry {
         required: Vec<String>,
         handler: Handler,
     ) {
-        println!("[debug] inserting tool: {}", name);
+        log::debug!("[tool] inserting tool: {}", name);
 
         let pros = properties.unwrap_or(serde_json::json!({}));
 
@@ -334,9 +334,11 @@ mod tests {
         let registry = registry_with_tool();
 
         assert!(registry.schemas_filtered_strict(&[]).is_empty());
-        assert!(registry
-            .schemas_filtered_strict(&["missing".to_string()])
-            .is_empty());
+        assert!(
+            registry
+                .schemas_filtered_strict(&["missing".to_string()])
+                .is_empty()
+        );
     }
 
     #[test]

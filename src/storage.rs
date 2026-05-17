@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -128,10 +128,14 @@ impl ConversationStore {
             if let Ok(content) = std::fs::read_to_string(&path) {
                 match serde_json::from_str::<StoredConversation>(&content) {
                     Ok(conv) => metas.push(conv.meta),
-                    Err(err) => eprintln!("[storage] 解析对话文件失败: path={} error={}", path.display(), err),
+                    Err(err) => log::warn!(
+                        "[storage] 解析对话文件失败: path={} error={}",
+                        path.display(),
+                        err
+                    ),
                 }
             } else {
-                eprintln!("[storage] 读取对话文件失败: path={}", path.display());
+                log::warn!("[storage] 读取对话文件失败: path={}", path.display());
             }
         }
         metas.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -145,7 +149,11 @@ impl ConversationStore {
         match serde_json::from_str(&content) {
             Ok(conv) => Some(conv),
             Err(err) => {
-                eprintln!("[storage] 解析对话文件失败: path={} error={}", path.display(), err);
+                log::warn!(
+                    "[storage] 解析对话文件失败: path={} error={}",
+                    path.display(),
+                    err
+                );
                 None
             }
         }

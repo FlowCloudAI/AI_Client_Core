@@ -1,5 +1,7 @@
+use crate::llm::types::{
+    ChatResponseStream, DecoderEvent, DecoderEventPayload, EventInfo, ToolCall, TurnStatus, Usage,
+};
 use std::collections::HashSet;
-use crate::llm::types::{ChatResponseStream, DecoderEvent, DecoderEventPayload, EventInfo, ToolCall, TurnStatus, Usage};
 
 #[derive(Default, Debug)]
 pub struct StreamDecoder {
@@ -58,7 +60,9 @@ impl StreamDecoder {
         let resp: ChatResponseStream = match serde_json::from_str(s) {
             Ok(v) => v,
             Err(e) => {
-                out.push(Err(anyhow::anyhow!("[decoder] 解析 JSON 失败: {e};\nline={s}")));
+                out.push(Err(anyhow::anyhow!(
+                    "[decoder] 解析 JSON 失败: {e};\nline={s}"
+                )));
                 return out;
             }
         };
@@ -90,7 +94,7 @@ impl StreamDecoder {
 
             if let Some(tool_calls) = choice.delta.tool_calls {
                 for tc in tool_calls {
-                    //println!("{}", line);
+                    // log::debug!("{}", line);
                     self.emit_tool_call_events(choice_i, tc, &mut out);
                 }
             }
@@ -145,7 +149,11 @@ impl StreamDecoder {
                 event_info: self.next_info(),
                 payload: DecoderEventPayload::ToolCallDelta {
                     index,
-                    tool_name: if tc.function.name.is_empty() { None } else { Some(tc.function.name) },
+                    tool_name: if tc.function.name.is_empty() {
+                        None
+                    } else {
+                        Some(tc.function.name)
+                    },
                     args: tc.function.arguments,
                 },
             }));

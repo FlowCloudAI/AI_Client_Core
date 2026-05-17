@@ -1,9 +1,9 @@
+use crate::plugin::types::{PluginManifest, PluginMeta};
+use anyhow::Result;
 use std::fs;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use zip::ZipArchive;
-use anyhow::Result;
-use crate::plugin::types::{PluginManifest, PluginMeta};
 
 pub struct PluginScanner;
 
@@ -19,7 +19,6 @@ impl PluginScanner {
         Ok(info)
     }
 
-
     pub fn build_plugin_meta(manifest: PluginManifest, fcplug: &Path) -> Result<PluginMeta> {
         PluginMeta::from_manifest(manifest, fcplug.to_path_buf())
             .map_err(|e| anyhow::anyhow!("failed to parse plugin spec: {}", e))
@@ -33,17 +32,17 @@ impl PluginScanner {
                     let path = entry.path();
 
                     if path.extension().and_then(|s| s.to_str()) == Some("fcplug") {
-                        println!("Found plugin: {}", path.display());
+                        log::info!("[plugin] found file: {}", path.display());
                         result.push(path);
                     }
                 }
-            },
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                println!("Plugin directory not found, creating: {}", dir.display());
+                log::info!("[plugin] directory not found, creating: {}", dir.display());
                 fs::create_dir(dir)?;
             }
             Err(e) => {
-                println!("Error reading plugin directory: {}", e);
+                log::warn!("[plugin] failed to read directory: {}", e);
                 return Err(e.into());
             }
         }

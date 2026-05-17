@@ -1,6 +1,6 @@
-use std::collections::HashMap;
-use serde::Serialize;
 use crate::llm::types::Message;
+use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 
 // ═════════════════════════════════════════════════════════════
 //                      对话消息树
@@ -76,13 +76,16 @@ impl ConversationTree {
         let assigned_id = id.unwrap_or(self.next_id);
         self.next_id = self.next_id.max(assigned_id.saturating_add(1));
 
-        self.nodes.insert(assigned_id, ConversationNode {
-            id: assigned_id,
-            message,
-            parent: self.head,
-            turn_id,
-            timestamp: timestamp.unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
-        });
+        self.nodes.insert(
+            assigned_id,
+            ConversationNode {
+                id: assigned_id,
+                message,
+                parent: self.head,
+                turn_id,
+                timestamp: timestamp.unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+            },
+        );
 
         self.head = Some(assigned_id);
         assigned_id
@@ -122,14 +125,60 @@ impl ConversationTree {
         timestamp: String,
     ) -> NodeId {
         self.next_id = self.next_id.max(id.saturating_add(1));
-        self.nodes.insert(id, ConversationNode {
+        self.nodes.insert(
             id,
-            message,
-            parent,
-            turn_id,
-            timestamp,
-        });
+            ConversationNode {
+                id,
+                message,
+                parent,
+                turn_id,
+                timestamp,
+            },
+        );
         id
+    }
+
+    /// 修复 parent 链中的环。
+    ///
+    /// 旧版本恢复逻辑曾可能把根节点错误接到后续节点上，形成环。
+    /// 这里选择环中最小 node_id 作为根节点断开 parent；node_id 按创建顺序递增，
+    /// 因此通常能保留最接近原始线性历史的结构。
+    pub fn repair_parent_cycles(&mut self) -> usize {
+        let node_ids = self.nodes.keys().copied().collect::<Vec<_>>();
+        let mut repaired = 0usize;
+
+        for start in node_ids {
+            let mut path = Vec::<NodeId>::new();
+            let mut visited = HashMap::<NodeId, usize>::new();
+            let mut cur = Some(start);
+
+            while let Some(id) = cur {
+                if let Some(cycle_start) = visited.get(&id).copied() {
+                    let cycle_nodes = &path[cycle_start..];
+                    if let Some(break_node_id) = cycle_nodes.iter().min().copied() {
+                        if let Some(node) = self.nodes.get_mut(&break_node_id) {
+                            if let Some(old_parent) = node.parent.take() {
+                                repaired += 1;
+                                log::warn!(
+                                    "[client:tree][parent_cycle_repaired] start={} break_node={} old_parent={} cycle_len={}",
+                                    start,
+                                    break_node_id,
+                                    old_parent,
+                                    cycle_nodes.len()
+                                );
+                            }
+                        }
+                    }
+                    break;
+                }
+
+                visited.insert(id, path.len());
+                path.push(id);
+                cur = self.nodes.get(&id).and_then(|node| node.parent);
+            }
+        }
+
+        repaired
     }
 
     // ── 读操作 ──────────────────────────────────────────────
@@ -161,7 +210,17 @@ impl ConversationTree {
     pub fn path_to(&self, node_id: Option<NodeId>) -> Vec<NodeId> {
         let mut path = Vec::new();
         let mut cur = node_id;
+        let mut visited = HashSet::new();
         while let Some(id) = cur {
+            if !visited.insert(id) {
+                log::warn!(
+                    "[client:tree][path_cycle_detected] head={:?} repeated_node={} partial_path_len={}",
+                    node_id,
+                    id,
+                    path.len()
+                );
+                break;
+            }
             path.push(id);
             cur = self.nodes.get(&id).and_then(|n| n.parent);
         }
@@ -202,7 +261,9 @@ impl ConversationTree {
 
     /// 返回树中所有节点的引用（含所有分支，不限于当前路径）。
     pub fn all_nodes(&self) -> Vec<&ConversationNode> {
-        self.nodes.values().collect()
+        let mut nodes = self.nodes.values().collect::<Vec<_>>();
+        nodes.sort_by_key(|node| node.id);
+        nodes
     }
 
     /// 返回指定节点的直接子节点 ID 列表。
@@ -223,8 +284,12 @@ impl ConversationTree {
 mod tests {
     use super::*;
 
-    fn u(s: &str) -> Message { Message::user(s) }
-    fn a(s: &str) -> Message { Message::assistant(Some(s), None::<&str>, None) }
+    fn u(s: &str) -> Message {
+        Message::user(s)
+    }
+    fn a(s: &str) -> Message {
+        Message::assistant(Some(s), None::<&str>, None)
+    }
 
     // ── 基础操作 ──
 
@@ -347,6 +412,70 @@ mod tests {
 
         // n2 的路径只到 n2
         assert_eq!(tree.path_to(Some(n2)), vec![n1, n2]);
+    }
+
+    #[test]
+    fn path_to_self_parent_node_does_not_loop() {
+        let mut tree = ConversationTree::new();
+        tree.insert_node(1, Some(1), u("自环"), 1, "2026-05-14T00:00:00Z".to_string());
+        tree.set_head(1).unwrap();
+
+        assert_eq!(tree.path_to_head(), vec![1]);
+        assert_eq!(tree.linearize().len(), 1);
+    }
+
+    #[test]
+    fn path_to_parent_cycle_does_not_loop() {
+        let mut tree = ConversationTree::new();
+        tree.insert_node(
+            1,
+            Some(2),
+            u("节点1"),
+            1,
+            "2026-05-14T00:00:00Z".to_string(),
+        );
+        tree.insert_node(
+            2,
+            Some(1),
+            a("节点2"),
+            1,
+            "2026-05-14T00:00:01Z".to_string(),
+        );
+        tree.set_head(2).unwrap();
+
+        assert_eq!(tree.path_to_head(), vec![1, 2]);
+        assert_eq!(tree.linearize().len(), 2);
+    }
+
+    #[test]
+    fn repair_parent_cycles_breaks_cycle_at_smallest_node_id() {
+        let mut tree = ConversationTree::new();
+        tree.insert_node(
+            1,
+            Some(3),
+            u("节点1"),
+            1,
+            "2026-05-14T00:00:00Z".to_string(),
+        );
+        tree.insert_node(
+            2,
+            Some(1),
+            a("节点2"),
+            1,
+            "2026-05-14T00:00:01Z".to_string(),
+        );
+        tree.insert_node(
+            3,
+            Some(2),
+            u("节点3"),
+            2,
+            "2026-05-14T00:00:02Z".to_string(),
+        );
+        tree.set_head(3).unwrap();
+
+        assert_eq!(tree.repair_parent_cycles(), 1);
+        assert_eq!(tree.get_node(1).unwrap().parent, None);
+        assert_eq!(tree.path_to_head(), vec![1, 2, 3]);
     }
 
     // ── get_node（获取节点）──

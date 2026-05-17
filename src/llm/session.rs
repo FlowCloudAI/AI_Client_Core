@@ -12,14 +12,14 @@ use crate::orchestrator::{AssembledTurn, Orchestrate, TaskContext};
 use crate::plugin::pipeline::ApiPipeline;
 use crate::storage::{StorageCtx, StoredMessage};
 use crate::tool::registry::ToolRegistry;
-use anyhow::{anyhow, Context, Result};
-use futures_util::future::{self, Either};
+use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
+use futures_util::future::{self, Either};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{mpsc, watch, RwLock};
+use std::time::{Duration, Instant};
+use tokio::sync::{RwLock, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 
 // ═════════════════════════════════════════════════════════════
@@ -88,7 +88,11 @@ impl LLMSession {
     }
 
     /// 注入存储上下文（由 FlowCloudAIClient 在 create_llm_session 中调用）。
-    pub fn set_storage_ctx(&mut self, plugin_id: String, store: std::sync::Arc<crate::storage::ConversationStore>) {
+    pub fn set_storage_ctx(
+        &mut self,
+        plugin_id: String,
+        store: std::sync::Arc<crate::storage::ConversationStore>,
+    ) {
         self.storage_ctx = Some(StorageCtx::new(plugin_id, store));
     }
 
@@ -134,6 +138,7 @@ impl LLMSession {
             let mut prev_id: Option<u64> = None;
             let mut last_id: Option<u64> = None;
             for stored in messages {
+                let stored_id = stored.node_id;
                 let msg = crate::llm::types::Message {
                     role: stored.role,
                     content: stored.content,
@@ -141,8 +146,12 @@ impl LLMSession {
                     tool_call_id: stored.tool_call_id,
                     tool_calls: stored.tool_calls,
                 };
-                let parent = stored.parent.or(prev_id);
-                let id = stored.node_id.unwrap_or(tree.next_id());
+                let parent = if stored_id.is_some() {
+                    stored.parent
+                } else {
+                    prev_id
+                };
+                let id = stored_id.unwrap_or(tree.next_id());
                 tree.insert_node(
                     id,
                     parent,
@@ -152,6 +161,13 @@ impl LLMSession {
                 );
                 prev_id = Some(id);
                 last_id = Some(id);
+            }
+            let repaired_cycles = tree.repair_parent_cycles();
+            if repaired_cycles > 0 {
+                log::warn!(
+                    "[client:session][preload_history_repaired] repaired_parent_cycles={}",
+                    repaired_cycles
+                );
             }
             // 设置 head：优先使用显式 head，其次退化为最后一条消息
             let effective_head = head.or(last_id);
@@ -478,26 +494,39 @@ impl LLMSession {
 
 impl LLMSession {
     fn enabled_tool_names_from_request(req: &ChatRequest) -> Option<HashSet<String>> {
-        req.tools
-            .as_ref()
-            .map(|tools| {
-                tools.iter()
-                    .filter_map(|tool| {
-                        tool.get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                    })
-                    .collect()
-            })
+        req.tools.as_ref().map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| {
+                    tool.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
     }
 
     fn is_write_like_tool(name: &str) -> bool {
         let lower = name.to_ascii_lowercase();
         [
-            "create", "update", "delete", "remove", "edit", "rename", "write",
-            "save", "apply", "confirm", "install", "uninstall", "enable", "disable",
-            "set_", "set-", "merge",
+            "create",
+            "update",
+            "delete",
+            "remove",
+            "edit",
+            "rename",
+            "write",
+            "save",
+            "apply",
+            "confirm",
+            "install",
+            "uninstall",
+            "enable",
+            "disable",
+            "set_",
+            "set-",
+            "merge",
         ]
         .iter()
         .any(|token| lower.contains(token))
@@ -621,7 +650,16 @@ impl LLMSession {
 
                     match future::select(input_fut, ctrl_fut).await {
                         Either::Left((Some(input), _)) => {
+                            log::info!(
+                                "[client:drive][input_received] next_turn_id={} input_chars={}",
+                                self.turn_id + 1,
+                                input.chars().count()
+                            );
                             self.add_message(Message::user(input)).await;
+                            log::info!(
+                                "[client:drive][user_message_added] next_turn_id={}",
+                                self.turn_id + 1
+                            );
                             break 'wait;
                         }
                         Either::Left((None, _)) => return Ok(()),
@@ -639,8 +677,21 @@ impl LLMSession {
 
             // 每轮开始前尝试更新 context（非阻塞）
             if let Some(ref mut rx) = ctx_rx {
+                let mut drained_context_count = 0usize;
                 while let Ok(ctx) = rx.try_recv() {
                     current_ctx = ctx;
+                    drained_context_count += 1;
+                }
+                if drained_context_count > 0 {
+                    log::info!(
+                        "[client:drive][context_drained] next_turn_id={} count={} project_id={:?} task_type={} attributes={} flags={}",
+                        self.turn_id + 1,
+                        drained_context_count,
+                        current_ctx.project_id.as_deref(),
+                        current_ctx.task_type,
+                        current_ctx.attributes.len(),
+                        current_ctx.flags.len()
+                    );
                 }
             }
 
@@ -655,7 +706,44 @@ impl LLMSession {
                 })
                 .await?;
 
+            log::info!(
+                "[client:drive][snapshot_start] turn_id={} node_id={}",
+                self.turn_id,
+                turn_head_id
+            );
+            let stage_started = Instant::now();
             let req = self.snapshot().await;
+            let snapshot_elapsed_ms = stage_started.elapsed().as_millis();
+            let snapshot_tool_count = req.tools.as_ref().map_or(0, Vec::len);
+            let snapshot_content_chars: usize = req
+                .messages
+                .iter()
+                .filter_map(|message| message.content.as_ref())
+                .map(|content| content.chars().count())
+                .sum();
+            let snapshot_last_role = req
+                .messages
+                .last()
+                .map(|message| message.role.as_str())
+                .unwrap_or("<none>");
+            log::info!(
+                "[client:drive][snapshot_done] turn_id={} elapsed_ms={} messages={} last_role={} content_chars={} tool_count={} stream={:?} thinking_set={}",
+                self.turn_id,
+                snapshot_elapsed_ms,
+                req.messages.len(),
+                snapshot_last_role,
+                snapshot_content_chars,
+                snapshot_tool_count,
+                req.stream,
+                req.thinking.is_some()
+            );
+
+            log::info!(
+                "[client:drive][assemble_start] turn_id={} has_orchestrator={}",
+                self.turn_id,
+                self.orchestrator.is_some()
+            );
+            let stage_started = Instant::now();
 
             // Orchestrator 装配（如果有）
             // Session 永远只读 AssembledTurn::read_only，不感知 TaskContext 业务字段。
@@ -669,9 +757,40 @@ impl LLMSession {
                 (req, AssembledTurn::default().read_only)
             };
             let enabled_tools = Self::enabled_tool_names_from_request(&req);
+            log::info!(
+                "[client:drive][assemble_done] turn_id={} elapsed_ms={} read_only={} messages={} tool_count={}",
+                self.turn_id,
+                stage_started.elapsed().as_millis(),
+                read_only,
+                req.messages.len(),
+                req.tools.as_ref().map_or(0, Vec::len)
+            );
 
-            let (content, reasoning, tool_calls, finish_reason, turn_status, usage) =
-                self.send_and_process(&req, cancel_rx.clone(), &event_tx).await?;
+            log::info!(
+                "[client:drive][send_and_process_start] turn_id={} stream={:?} base_url={}",
+                self.turn_id,
+                req.stream,
+                self.config.base_url
+            );
+            let stage_started = Instant::now();
+            let (content, reasoning, tool_calls, finish_reason, turn_status, usage) = self
+                .send_and_process(&req, cancel_rx.clone(), &event_tx)
+                .await?;
+            log::info!(
+                "[client:drive][send_and_process_done] turn_id={} elapsed_ms={} content_chars={} reasoning_chars={} tool_calls={} finish_reason={:?} status={}",
+                self.turn_id,
+                stage_started.elapsed().as_millis(),
+                content.chars().count(),
+                reasoning.chars().count(),
+                tool_calls.as_ref().map_or(0, Vec::len),
+                finish_reason,
+                match &turn_status {
+                    TurnStatus::Ok => "ok",
+                    TurnStatus::Cancelled => "cancelled",
+                    TurnStatus::Interrupted => "interrupted",
+                    TurnStatus::Error(_) => "error",
+                }
+            );
 
             // 累加本轮的 usage（同一用户 turn 内可能有多次 API 调用，如工具执行后的重试）
             if let Some(ref u) = usage {
@@ -685,23 +804,24 @@ impl LLMSession {
                 }
             }
 
-            let asst_node_id = if matches!(turn_status, TurnStatus::Cancelled | TurnStatus::Interrupted) {
-                // 将已生成的部分内容保存为 assistant 节点，使 head 推进到 "assistant"，
-                // 确保 should_wait_for_user() 返回 true，避免 drive 循环立即重试。
-                self.add_message(Message::assistant(
-                    Some(content).filter(|s: &String| !s.is_empty()),
-                    Some(reasoning).filter(|s: &String| !s.is_empty()),
-                    None,
-                ))
-                .await
-            } else {
-                self.add_message(Message::assistant(
-                    Some(content).filter(|s: &String| !s.is_empty()),
-                    Some(reasoning).filter(|s: &String| !s.is_empty()),
-                    tool_calls.clone(),
-                ))
-                .await
-            };
+            let asst_node_id =
+                if matches!(turn_status, TurnStatus::Cancelled | TurnStatus::Interrupted) {
+                    // 将已生成的部分内容保存为 assistant 节点，使 head 推进到 "assistant"，
+                    // 确保 should_wait_for_user() 返回 true，避免 drive 循环立即重试。
+                    self.add_message(Message::assistant(
+                        Some(content).filter(|s: &String| !s.is_empty()),
+                        Some(reasoning).filter(|s: &String| !s.is_empty()),
+                        None,
+                    ))
+                    .await
+                } else {
+                    self.add_message(Message::assistant(
+                        Some(content).filter(|s: &String| !s.is_empty()),
+                        Some(reasoning).filter(|s: &String| !s.is_empty()),
+                        tool_calls.clone(),
+                    ))
+                    .await
+                };
 
             if finish_reason.as_deref() == Some("tool_calls") {
                 if let Some(calls) = tool_calls {
@@ -720,7 +840,8 @@ impl LLMSession {
                             .await?;
                         continue;
                     }
-                    self.execute_tool_calls(calls, &enabled_tools, read_only, &event_tx).await?;
+                    self.execute_tool_calls(calls, &enabled_tools, read_only, &event_tx)
+                        .await?;
                     continue;
                 }
             }
@@ -801,13 +922,11 @@ impl LLMSession {
 // ── 插件映射（核心变化点） ──
 
 impl LLMSession {
-
     /// 请求转换：acquire mapper → map → release（自动）。
     fn prepare_request(&self, req: &ChatRequest) -> Result<Value> {
         let json = serde_json::to_value(req)?;
         self.pipeline.prepare_request_json(&json)
     }
-
 
     /// 响应转换。
     fn normalize_response(&self, raw: &str) -> Result<String> {
@@ -855,20 +974,53 @@ impl LLMSession {
         TurnStatus,
         Option<Usage>,
     )> {
+        log::info!(
+            "[client:llm][non_stream_prepare_start] turn_id={} messages={} tool_count={}",
+            self.turn_id,
+            req.messages.len(),
+            req.tools.as_ref().map_or(0, Vec::len)
+        );
+        let stage_started = Instant::now();
         let json = self.prepare_request(req)?;
+        log::info!(
+            "[client:llm][non_stream_prepare_done] turn_id={} elapsed_ms={} body_bytes={}",
+            self.turn_id,
+            stage_started.elapsed().as_millis(),
+            json.to_string().len()
+        );
 
         let raw_line = {
+            log::info!(
+                "[client:llm][non_stream_http_send_start] turn_id={} base_url={}",
+                self.turn_id,
+                self.config.base_url
+            );
+            let stage_started = Instant::now();
             let stream = self
                 .client
                 .post_json(&self.config.base_url, &self.config.api_key, json)
                 .await
                 .context("创建请求失败")?;
+            log::info!(
+                "[client:llm][non_stream_http_send_done] turn_id={} elapsed_ms={}",
+                self.turn_id,
+                stage_started.elapsed().as_millis()
+            );
             tokio::pin!(stream);
+            log::info!(
+                "[client:llm][non_stream_first_line_wait] turn_id={}",
+                self.turn_id
+            );
             stream
                 .next()
                 .await
                 .ok_or_else(|| anyhow!("response empty"))??
         };
+        log::info!(
+            "[client:llm][non_stream_first_line_done] turn_id={} bytes={}",
+            self.turn_id,
+            raw_line.len()
+        );
 
         let normalized = self.normalize_response(&raw_line)?;
 
@@ -937,13 +1089,37 @@ impl LLMSession {
         decoder.begin_turn(self.turn_id);
         let mut acc = ToolCallAccumulator::default();
 
+        log::info!(
+            "[client:llm][stream_prepare_start] turn_id={} messages={} tool_count={}",
+            self.turn_id,
+            req.messages.len(),
+            req.tools.as_ref().map_or(0, Vec::len)
+        );
+        let stage_started = Instant::now();
         let json = self.prepare_request(req)?;
+        log::info!(
+            "[client:llm][stream_prepare_done] turn_id={} elapsed_ms={} body_bytes={}",
+            self.turn_id,
+            stage_started.elapsed().as_millis(),
+            json.to_string().len()
+        );
 
+        log::info!(
+            "[client:llm][stream_http_send_start] turn_id={} base_url={}",
+            self.turn_id,
+            self.config.base_url
+        );
+        let stage_started = Instant::now();
         let stream = self
             .client
             .post_json(&self.config.base_url, &self.config.api_key, json)
             .await
             .context("创建流式请求失败")?;
+        log::info!(
+            "[client:llm][stream_http_send_done] turn_id={} elapsed_ms={}",
+            self.turn_id,
+            stage_started.elapsed().as_millis()
+        );
         tokio::pin!(stream);
 
         let mut full_content = String::new();
@@ -953,6 +1129,7 @@ impl LLMSession {
         let mut turn_status = TurnStatus::Ok;
         let mut usage: Option<Usage> = None;
         let cancel_version = *cancel_rx.borrow();
+        let mut line_count = 0usize;
 
         'outer: loop {
             let raw_line = tokio::select! {
@@ -983,6 +1160,15 @@ impl LLMSession {
                 }
             };
             let line = raw_line?;
+            line_count += 1;
+            if line_count == 1 || line_count % 50 == 0 {
+                log::info!(
+                    "[client:llm][stream_line_received] turn_id={} line_count={} bytes={}",
+                    self.turn_id,
+                    line_count,
+                    line.len()
+                );
+            }
             if line.is_empty() {
                 continue;
             }
@@ -1120,9 +1306,15 @@ impl LLMSession {
                 .as_ref()
                 .is_some_and(|tools| !tools.contains(func_name))
             {
-                (format!("工具执行失败: 本轮不允许调用工具 '{}'", func_name), true)
+                (
+                    format!("工具执行失败: 本轮不允许调用工具 '{}'", func_name),
+                    true,
+                )
             } else if read_only && Self::is_write_like_tool(func_name) {
-                (format!("工具执行失败: 只读模式下禁止调用写入类工具 '{}'", func_name), true)
+                (
+                    format!("工具执行失败: 只读模式下禁止调用写入类工具 '{}'", func_name),
+                    true,
+                )
             } else {
                 let args_v: Value = if args_str.is_empty() {
                     Value::Object(Default::default())
@@ -1184,9 +1376,41 @@ mod tests {
     use crate::llm::types::{Message, ToolCall, ToolFunctionCall, TurnStatus, Usage};
     use crate::plugin::pipeline::ApiPipeline;
     use crate::plugin::registry::PluginRegistry;
+    use crate::storage::StoredMessage;
     use crate::tool::registry::ToolRegistry;
     use std::sync::Arc;
     use tokio::sync::mpsc;
+
+    fn new_test_session() -> LLMSession {
+        let registry = Arc::new(PluginRegistry::empty().unwrap());
+        let pipeline = ApiPipeline::try_new(registry, None).unwrap();
+        LLMSession::new(
+            SessionConfig::default(),
+            pipeline,
+            Arc::new(ToolRegistry::new()),
+        )
+        .unwrap()
+    }
+
+    fn stored_message(
+        node_id: Option<u64>,
+        parent: Option<u64>,
+        role: &str,
+        content: &str,
+    ) -> StoredMessage {
+        StoredMessage {
+            message_id: node_id.map(|id| format!("msg_{}", id)),
+            node_id,
+            turn_id: Some(0),
+            parent,
+            role: role.to_string(),
+            content: Some(content.to_string()),
+            reasoning: None,
+            timestamp: "2026-05-14T00:00:00Z".to_string(),
+            tool_call_id: None,
+            tool_calls: None,
+        }
+    }
 
     #[test]
     fn context_insert_index_before_pending_block_keeps_latest_user_anchor() {
@@ -1271,20 +1495,47 @@ mod tests {
 
     #[test]
     fn run_with_context_channel_can_start_without_outer_tokio_runtime() {
-        let registry = Arc::new(PluginRegistry::empty().unwrap());
-        let pipeline = ApiPipeline::try_new(registry, None).unwrap();
-        let session = LLMSession::new(
-            SessionConfig::default(),
-            pipeline,
-            Arc::new(ToolRegistry::new()),
-        )
-        .unwrap();
+        let session = new_test_session();
         let (input_tx, input_rx) = mpsc::channel(1);
         let (ctx_tx, ctx_rx) = mpsc::channel(1);
         drop(input_tx);
         drop(ctx_tx);
 
         let (_events, _handle) = session.run_with_context_channel(input_rx, ctx_rx);
+    }
+
+    #[test]
+    fn preload_history_preserves_v3_root_when_file_order_is_unordered() {
+        let mut session = new_test_session();
+        session.preload_history(
+            vec![
+                stored_message(Some(2), Some(1), "assistant", "回复"),
+                stored_message(Some(1), None, "user", "问题"),
+            ],
+            Some(2),
+        );
+
+        let tree = session.tree.blocking_read();
+        assert_eq!(tree.get_node(1).unwrap().parent, None);
+        assert_eq!(tree.get_node(2).unwrap().parent, Some(1));
+        assert_eq!(tree.path_to_head(), vec![1, 2]);
+    }
+
+    #[test]
+    fn preload_history_repairs_persisted_parent_cycle() {
+        let mut session = new_test_session();
+        session.preload_history(
+            vec![
+                stored_message(Some(1), Some(3), "user", "节点1"),
+                stored_message(Some(2), Some(1), "assistant", "节点2"),
+                stored_message(Some(3), Some(2), "user", "节点3"),
+            ],
+            Some(3),
+        );
+
+        let tree = session.tree.blocking_read();
+        assert_eq!(tree.get_node(1).unwrap().parent, None);
+        assert_eq!(tree.path_to_head(), vec![1, 2, 3]);
     }
 
     #[test]
@@ -1300,9 +1551,11 @@ mod tests {
             &None
         ));
 
-        println!(
+        log::debug!(
             "Qwen usage: prompt_tokens={}, completion_tokens={}, total_tokens={}",
-            usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.total_tokens
         );
         assert!(LLMSession::should_stop_after_stream_turn_end(
             &TurnStatus::Ok,

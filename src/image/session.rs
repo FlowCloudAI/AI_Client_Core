@@ -1,10 +1,10 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
 
 use crate::http_poster::HttpPoster;
+use crate::image::types::*;
 use crate::llm::config::SessionConfig;
 use crate::plugin::pipeline::ApiPipeline;
-use crate::image::types::*;
 
 // ─────────────────────── 图像会话 ──────────────────────
 
@@ -34,15 +34,17 @@ impl ImageSession {
     pub async fn generate(&self, req: &ImageRequest) -> Result<ImageResult> {
         let json = serde_json::to_value(req)?;
         let mapped_json = self.pipeline.prepare_request_json(&json)?;
-        
-        println!("[generate] mapped_json:{}", mapped_json);
+        log::debug!(
+            "[image] mapped request bytes={}",
+            mapped_json.to_string().len()
+        );
 
         let raw_body = self.post_and_collect(mapped_json).await?;
 
         let normalized = self.pipeline.map_response(&raw_body)?;
 
-        let resp: ImageResponse = serde_json::from_str(&normalized)
-            .context("failed to parse image response")?;
+        let resp: ImageResponse =
+            serde_json::from_str(&normalized).context("failed to parse image response")?;
 
         // 检查错误
         if let Some(ref err) = resp.error {
@@ -55,11 +57,7 @@ impl ImageSession {
     }
 
     /// 便捷方法：文生图
-    pub async fn text_to_image(
-        &self,
-        model: &str,
-        prompt: &str,
-    ) -> Result<ImageResult> {
+    pub async fn text_to_image(&self, model: &str, prompt: &str) -> Result<ImageResult> {
         let req = ImageRequest::text_to_image(model, prompt);
         self.generate(&req).await
     }
@@ -96,8 +94,12 @@ impl ImageSession {
         {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[post_and_collect] post_json failed: {}", e);
-                return Err(anyhow!("Image request failed [url={}]: {}", self.config.base_url, e));
+                log::warn!("[image] post_json failed: {}", e);
+                return Err(anyhow!(
+                    "Image request failed [url={}]: {}",
+                    self.config.base_url,
+                    e
+                ));
             }
         };
 
@@ -108,7 +110,7 @@ impl ImageSession {
             match chunk {
                 Ok(c) => body.push_str(&c),
                 Err(e) => {
-                    eprintln!("[post_and_collect] stream chunk error: {}", e);
+                    log::warn!("[image] stream chunk error: {}", e);
                     return Err(anyhow!("Image request stream failed: {}", e));
                 }
             }
@@ -118,13 +120,14 @@ impl ImageSession {
             return Err(anyhow!("Image response empty"));
         }
 
-        println!("[post_and_collect] raw response body (first 1024 chars): {}", &body[..body.len().min(1024)]);
+        log::debug!("[image] raw response bytes={}", body.len());
 
         Ok(body)
     }
 
     fn extract_result(&self, resp: ImageResponse) -> Result<ImageResult> {
-        let data_list = resp.data
+        let data_list = resp
+            .data
             .ok_or_else(|| anyhow!("Image response missing data"))?;
 
         if data_list.is_empty() {

@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
 
 use crate::http_poster::HttpPoster;
@@ -42,18 +42,21 @@ impl TTSSession {
         // 发送请求，读取完整响应（非流式）
         let raw_body = self.post_and_collect(mapped_json).await?;
 
-        println!("RAW TTS response: {}", raw_body);
-
         // 插件映射响应
         let normalized = self.pipeline.map_response(&raw_body)?;
 
-        println!("MAP TTS response: {}", normalized);
-
         // 解析响应
-        let resp: TTSResponse = serde_json::from_str(&normalized)
-            .context("failed to parse TTS response")?;
+        let resp: TTSResponse =
+            serde_json::from_str(&normalized).context("failed to parse TTS response")?;
 
-        println!("NORM TTS response: {:?}", resp);
+        log::debug!(
+            "[tts] response normalized: raw_bytes={}, normalized_bytes={}, has_data={}, trace_id={:?}, status_code={:?}",
+            raw_body.len(),
+            normalized.len(),
+            resp.data.is_some(),
+            resp.trace_id,
+            resp.base_resp.as_ref().map(|base| base.status_code)
+        );
 
         // 检查状态
         if let Some(ref base) = resp.base_resp {
@@ -99,7 +102,8 @@ impl TTSSession {
 
     /// 从响应中提取音频数据。
     fn extract_result(&self, resp: TTSResponse) -> Result<TTSResult> {
-        let data = resp.data
+        let data = resp
+            .data
             .ok_or_else(|| anyhow!("TTS response missing audio data"))?;
 
         let extra = resp.extra_info.as_ref();
