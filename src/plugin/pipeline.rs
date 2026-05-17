@@ -1,11 +1,11 @@
 // plugin/pipeline.rs——API 管道
-use std::sync::Arc;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde_json::Value;
+use std::sync::Arc;
 
 use crate::plugin::mapper::{ApiMapper, PassthroughMapper};
 use crate::plugin::registry::PluginRegistry;
-use crate::plugin::types::PluginKind;
+use crate::plugin::types::{PluginKind, ThinkingEffort};
 
 /// 可复用的 mapper 管道。
 /// LLM / Image / TTS session 各自组合持有一个。
@@ -123,6 +123,22 @@ impl ApiPipeline {
         Ok(())
     }
 
+    /// 校验当前 LLM 请求是否符合插件声明的模型能力。
+    pub fn validate_llm_request(
+        &self,
+        model: &str,
+        thinking_effort: Option<ThinkingEffort>,
+    ) -> Result<()> {
+        let Some(plugin_id) = &self.plugin_id else {
+            return Ok(());
+        };
+        let meta = self
+            .registry
+            .try_get_meta(plugin_id)?
+            .ok_or_else(|| anyhow!("plugin '{}' not found", plugin_id))?;
+        meta.validate_llm_request(model, thinking_effort)
+    }
+
     fn acquire_mapper(&self) -> Result<Box<dyn ApiMapper + Send + '_>> {
         match &self.plugin_id {
             None => Ok(Box::new(PassthroughMapper)),
@@ -130,7 +146,9 @@ impl ApiPipeline {
                 let pooled = self.registry.acquire(id)?;
                 Ok(Box::new(pooled))
             }
-            Some(_) if self.mode == PipelineMode::AllowPassthrough => Ok(Box::new(PassthroughMapper)),
+            Some(_) if self.mode == PipelineMode::AllowPassthrough => {
+                Ok(Box::new(PassthroughMapper))
+            }
             Some(id) => Err(anyhow!("plugin '{}' is selected but not loaded", id)),
         }
     }

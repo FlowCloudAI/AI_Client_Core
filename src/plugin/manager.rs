@@ -1,13 +1,12 @@
-use anyhow::{anyhow, Context, Result};
+use crate::plugin::host::HostState;
+use crate::plugin::types::{PluginKind, PluginManifest, PluginMeta};
+use crate::{LoadedPlugin, PluginScanner};
+use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use wasmtime::component::Linker;
 use wasmtime::{Config, Engine};
-use crate::{LoadedPlugin, PluginScanner, SUPPORTED_ABI_VERSION};
-use crate::plugin::host::HostState;
-use crate::plugin::types::{PluginKind, PluginManifest, PluginMeta};
-
 
 pub struct PluginManager {
     plug_path: PathBuf,
@@ -66,8 +65,9 @@ impl PluginManager {
         let mut plugins: HashMap<String, PluginMeta> = HashMap::new();
         let mut report = PluginLoadReport::default();
 
-        for fcplug in PluginScanner::scan_plugins(path)
-            .context("Failed to scan plugins directory")? {
+        for fcplug in
+            PluginScanner::scan_plugins(path).context("Failed to scan plugins directory")?
+        {
             match PluginScanner::read_plugin_info(&fcplug) {
                 Ok(manifest) => {
                     if let Err(reason) = Self::validate_plugin(&manifest, &plugins) {
@@ -114,17 +114,6 @@ impl PluginManager {
             return Err(format!("duplicate plugin ID: {}", info.id));
         }
 
-        if info.abi_version != SUPPORTED_ABI_VERSION {
-            return Err(format!(
-                "ABI version mismatch for '{}': expected {}, got {}",
-                info.id, SUPPORTED_ABI_VERSION, info.abi_version
-            ));
-        }
-
-        if info.url.is_empty() {
-            return Err(format!("empty URL for '{}'", info.id));
-        }
-
         Ok(())
     }
 }
@@ -153,15 +142,6 @@ impl PluginManager {
             return Err(anyhow!("Plugin already exists: {}", info.id));
         }
 
-        if info.abi_version != SUPPORTED_ABI_VERSION {
-            return Err(anyhow!(
-                "Plugin '{}' ABI version mismatch: expected {}, got {}",
-                info.id,
-                SUPPORTED_ABI_VERSION,
-                info.abi_version
-            ));
-        }
-
         let filename = Path::new(plugin_path)
             .file_name()
             .ok_or_else(|| anyhow!("Invalid plugin filename: {}", plugin_path))?;
@@ -183,7 +163,8 @@ impl PluginManager {
 
 impl PluginManager {
     pub fn load_llm_plugin(&mut self, id: &str) -> Result<()> {
-        self.llm_plugin.load(&self.plugins, &self.linker, &self.engine, id)
+        self.llm_plugin
+            .load(&self.plugins, &self.linker, &self.engine, id)
             .context(format!("Failed to load LLM plugin '{}'", id))
     }
 

@@ -10,6 +10,7 @@ use crate::llm::types::{
 };
 use crate::orchestrator::{AssembledTurn, Orchestrate, TaskContext};
 use crate::plugin::pipeline::ApiPipeline;
+use crate::plugin::types::ThinkingEffort;
 use crate::storage::{StorageCtx, StoredMessage};
 use crate::tool::registry::ToolRegistry;
 use anyhow::{Context, Result, anyhow};
@@ -230,6 +231,16 @@ impl LLMSession {
         } else {
             ThinkingType::disabled()
         });
+        self
+    }
+
+    pub async fn set_thinking_effort(&mut self, effort: ThinkingEffort) -> &mut Self {
+        self.conversation.write().await.thinking_effort = Some(effort);
+        self
+    }
+
+    pub async fn clear_thinking_effort(&mut self) -> &mut Self {
+        self.conversation.write().await.thinking_effort = None;
         self
     }
 
@@ -924,6 +935,8 @@ impl LLMSession {
 impl LLMSession {
     /// 请求转换：acquire mapper → map → release（自动）。
     fn prepare_request(&self, req: &ChatRequest) -> Result<Value> {
+        self.pipeline
+            .validate_llm_request(&req.model, req.thinking_effort)?;
         let json = serde_json::to_value(req)?;
         self.pipeline.prepare_request_json(&json)
     }

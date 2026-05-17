@@ -1,11 +1,12 @@
-use std::sync::Arc;
-use tokio::sync::{RwLock, mpsc};
-use tokio::sync::watch;
-use serde_json::Value;
+use crate::ThinkingType;
 use crate::llm::tree::{ConversationNode, ConversationTree};
 use crate::llm::types::{ChatRequest, CtrlMsg, Message};
 use crate::orchestrator::TaskContext;
-use crate::ThinkingType;
+use crate::plugin::types::ThinkingEffort;
+use serde_json::Value;
+use std::sync::Arc;
+use tokio::sync::watch;
+use tokio::sync::{RwLock, mpsc};
 
 // ═════════════════════════════════════════════════════════════
 //                     会话外部句柄
@@ -64,6 +65,16 @@ impl SessionHandle {
         } else {
             ThinkingType::disabled()
         });
+    }
+
+    /// 设置本次请求的思考强度。
+    pub async fn set_thinking_effort(&self, effort: ThinkingEffort) {
+        self.inner.write().await.thinking_effort = Some(effort);
+    }
+
+    /// 清除思考强度，让插件按模型默认策略处理。
+    pub async fn clear_thinking_effort(&self) {
+        self.inner.write().await.thinking_effort = None;
     }
 
     /// 设置频率惩罚（-2.0 ~ 2.0）
@@ -148,7 +159,13 @@ impl SessionHandle {
 
     /// 获取树中所有节点（含所有分支，不限于当前路径）。
     pub async fn get_all_nodes(&self) -> Vec<ConversationNode> {
-        self.tree.read().await.all_nodes().into_iter().cloned().collect()
+        self.tree
+            .read()
+            .await
+            .all_nodes()
+            .into_iter()
+            .cloned()
+            .collect()
     }
 
     /// 获取指定节点详情。

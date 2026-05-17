@@ -93,7 +93,7 @@ src/
 `examples/` 目录包含大量可运行的示例：
 - `main.rs`、`plugin_management.rs`、`llm.rs`、`llm_ai_dialogue.rs`、`image.rs`、`tts.rs`
 - `orchestrate.rs` — 编排器用法演示
-- `apis/mod.rs` — 共享 API key 模块
+- `support/apis.rs` — 示例 API key 占位模块，默认从编译期环境变量读取
 - `senses/` 下有几个 Sense 实现示例（`llm_a.rs`、`llm_b.rs`、`militech_acs.rs`）
 
 ---
@@ -177,11 +177,11 @@ interface mapper {
 
 ### 7.2 插件包格式
 `.fcplug` 本质是一个 ZIP 文件，内部必须包含：
-- `manifest.json` — 元数据（id、kind、version、abi-version、url 等）
-- `plugin.wasm` — 编译好的 WASM 组件（target: `wasm32-wasip1`，ABI 版本 2）
+- `manifest.json` — 元数据（id、kind、version、agreement-version、url 等）
+- `plugin.wasm` — 编译好的 WASM 组件（target: `wasm32-wasip2`，Agreement v1）
 - `icon.png` — 可选图标
 
-当前 ABI 版本：`SUPPORTED_ABI_VERSION = 2`（定义在 `src/lib.rs`）。
+当前协议版本：`SUPPORTED_AGREEMENT_VERSION = 1`（定义在 `src/lib.rs`）。
 
 ### 7.3 生命周期与引用计数
 - `PluginRegistry` 维护每个插件的引用计数（`ref_counts: Arc<Mutex<HashMap<String, usize>>>`）。
@@ -193,7 +193,7 @@ interface mapper {
 
 ## 八、安全与风险注意事项
 
-1. **WASM 沙箱**：插件在 wasmtime 组件模型中运行，与宿主进程内存隔离。但不要假设插件代码完全可信，ABI 版本检查和 manifest 校验已作为第一道防线。
+1. **WASM 沙箱**：插件在 wasmtime 组件模型中运行，与宿主进程内存隔离。但不要假设插件代码完全可信，Agreement 版本检查和 manifest 校验已作为第一道防线。
 2. **API Key 管理**：`SessionConfig` 中 `api_key` 以纯 `String` 形式存储在内存中。目前未做加密或安全擦除，上层应用如需高安全等级应自行处理。
 3. **工具执行超时**：`ToolRegistry::conduct` 支持传入 `Duration` 做超时控制，默认 LLMSession 中设置为 60 秒。新增工具时请确保其幂等性，避免重复调用产生副作用。
 4. **文件系统安全**：`ConversationStore` 直接在指定目录读写 `{id}.json`。ID 由内部生成（毫秒级时间戳），但如果暴露给外部输入，需防范路径遍历（当前实现已使用 `PathBuf::join` 拼接，不直接信任外部 ID 作为文件名）。
@@ -210,14 +210,14 @@ interface mapper {
 | `FlowCloudAIClient` | `src/client.rs` |
 | `LLMSession` | `src/llm/session.rs` |
 | `SessionHandle` | `src/llm/handle.rs` |
-| `SessionEvent`、`TurnStatus`、`ThinkingType` | `src/llm/types.rs` |
+| `SessionEvent`、`TurnStatus`、`ThinkingType`、`ThinkingEffort` | `src/llm/types.rs` / `src/plugin/types.rs` |
 | `ToolRegistry` | `src/tool/registry.rs` |
 | `ImageSession` | `src/image/session.rs` |
 | `TTSSession` | `src/tts/session.rs` |
 | `AudioDecoder`、`AudioSource` | `src/audio/decoder.rs` |
 | `ConversationStore`、`ConversationMeta`、`StoredConversation`、`StoredMessage` | `src/storage.rs` |
 | `PluginKind`、`PluginManager`、`PluginScanner`、`LoadedPlugin` | `src/plugin/` 下各模块 |
-| `SUPPORTED_ABI_VERSION` | `src/lib.rs`（常量 `2`） |
+| `SUPPORTED_AGREEMENT_VERSION` | `src/lib.rs`（常量 `1`） |
 
 ---
 

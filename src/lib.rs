@@ -10,12 +10,12 @@ pub mod sense;
 pub mod audio;
 pub mod storage;
 
-pub const SUPPORTED_ABI_VERSION: u32 = 2;
+pub const SUPPORTED_AGREEMENT_VERSION: u32 = 1;
 
 pub use plugin::manager::{PluginLoadError, PluginLoadReport, PluginManager};
 pub use plugin::scanner::PluginScanner;
 pub use plugin::loaded::LoadedPlugin;
-pub use plugin::types::PluginKind;
+pub use plugin::types::{PluginKind, ThinkingEffort};
 pub use llm::session::LLMSession;
 pub use llm::handle::SessionHandle;
 pub use llm::tree::ConversationNode;

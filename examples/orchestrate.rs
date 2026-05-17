@@ -4,6 +4,7 @@
 //
 // 运行：cargo run --example orchestrate
 
+#[path = "support/apis.rs"]
 mod apis;
 mod senses;
 

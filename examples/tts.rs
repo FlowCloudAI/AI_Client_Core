@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use flowcloudai_client::audio::{AudioDecoder, AudioSource};
 use flowcloudai_client::tts::{TTSRequest, AudioFormat};
 use flowcloudai_client::FlowCloudAIClient;
+#[path = "support/apis.rs"]
 mod apis;
 
 #[tokio::main]

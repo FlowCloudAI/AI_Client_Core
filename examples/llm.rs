@@ -1,3 +1,4 @@
+#[path = "support/apis.rs"]
 mod apis;
 mod senses;
 

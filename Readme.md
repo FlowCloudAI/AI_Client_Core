@@ -325,18 +325,31 @@ plugin.fcplug
   "meta": {
     "id": "openai",
     "name": "OpenAI Plugin",
-    "kind": "kind/llm",
-    "abi-version": 2,
+    "agreement-version": 1,
+    "kind": "llm",
     "version": "1.0.0",
     "author": "FlowCloud",
+    "description": "OpenAI Chat-like JSON mapper",
     "url": "https://api.openai.com/v1/chat/completions"
   },
-  "llm": {
-    "models": ["gpt-4", "gpt-3.5-turbo"],
-    "default_model": "gpt-4",
-    "supports_thinking": true,
-    "supports_tools": true
-  }
+  "default-model": "gpt-4",
+  "default-supports": {
+    "thinking": true,
+    "tools": true,
+    "stream": true
+  },
+  "default-thinking-efforts": ["low", "medium", "high"],
+  "models": [
+    {
+      "id": "gpt-4",
+      "name": "GPT-4",
+      "max-output-tokens": 8192
+    },
+    {
+      "id": "gpt-3.5-turbo",
+      "name": "GPT-3.5 Turbo"
+    }
+  ]
 }
 ```
 

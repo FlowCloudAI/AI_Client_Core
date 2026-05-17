@@ -155,20 +155,18 @@ impl FlowCloudAIClient {
     /// 从外部路径安装插件。
     ///
     /// # 逻辑步骤
-    /// 1. 读取 manifest.json 校验 ABI 版本和 ID 唯一性
+    /// 1. 读取 manifest.json 校验 Agreement v1 协议和 ID 唯一性
     /// 2. 将文件复制到内部插件目录（plugins_dir）
     /// 3. 更新 PluginRegistry（编译 WASM 模块）
     /// 4. 返回新插件的 PluginMeta
     ///
     /// # 错误处理
     /// - manifest.json 解析失败：返回 anyhow::Error
-    /// - ABI 版本不匹配：返回明确错误
+    /// - 协议版本不匹配：返回明确错误
     /// - ID 已存在：返回重复错误
     /// - 文件复制失败：转换为 anyhow::Error 并附带上下文
     /// - WASM 编译失败：返回编译错误
     pub fn install_plugin_from_path(&self, source_path: &Path) -> Result<PluginMeta> {
-        use crate::SUPPORTED_ABI_VERSION;
-
         // 1. 读取 manifest.json 校验
         let manifest = PluginScanner::read_plugin_info(source_path).map_err(|e| {
             anyhow!(
@@ -179,16 +177,6 @@ impl FlowCloudAIClient {
         })?;
 
         let info = &manifest.meta;
-
-        // 校验 ABI 版本
-        if info.abi_version != SUPPORTED_ABI_VERSION {
-            return Err(anyhow!(
-                "plugin '{}' ABI version mismatch: expected {}, got {}",
-                info.id,
-                SUPPORTED_ABI_VERSION,
-                info.abi_version
-            ));
-        }
 
         // 校验 ID 唯一性
         if self.plugin_registry.get_meta(&info.id).is_some() {

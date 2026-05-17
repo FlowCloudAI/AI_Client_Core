@@ -3,6 +3,7 @@ use anyhow::Context;
 use flowcloudai_client::FlowCloudAIClient;
 use flowcloudai_client::image::ImageRequest;
 
+#[path = "support/apis.rs"]
 mod apis;
 
 #[tokio::main]

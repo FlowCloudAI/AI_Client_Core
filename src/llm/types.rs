@@ -1,3 +1,4 @@
+use crate::plugin::types::ThinkingEffort;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -95,6 +96,9 @@ pub struct ChatRequest {
     pub thinking: Option<ThinkingType>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_effort: Option<ThinkingEffort>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub frequency_penalty: Option<f64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -143,6 +147,7 @@ impl Default for ChatRequest {
             messages: vec![],
             model: "".to_string(),
             thinking: None,
+            thinking_effort: None,
             frequency_penalty: None,
             max_tokens: None,
             presence_penalty: None,
@@ -288,9 +293,15 @@ impl ToolFunctionArg {
     pub fn schema(&self) -> Value {
         let mut v = serde_json::json!({"type": self.r#type});
 
-        if let Some(vv) = &self.default { v["default"] = vv.clone(); }
-        if let Some(vv) = &self.max { v["maximum"] = vv.clone(); }
-        if let Some(vv) = &self.min { v["minimum"] = vv.clone(); }
+        if let Some(vv) = &self.default {
+            v["default"] = vv.clone();
+        }
+        if let Some(vv) = &self.max {
+            v["maximum"] = vv.clone();
+        }
+        if let Some(vv) = &self.min {
+            v["minimum"] = vv.clone();
+        }
         v
     }
 }
@@ -413,6 +424,8 @@ pub enum SessionEvent {
         usage: Option<Usage>,
     },
     /// 分支切换完成（checkout 成功）。
-    BranchChanged { node_id: u64 },
+    BranchChanged {
+        node_id: u64,
+    },
     Error(String),
 }
