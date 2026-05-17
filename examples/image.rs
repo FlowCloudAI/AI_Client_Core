@@ -3,6 +3,10 @@ use anyhow::Context;
 use flowcloudai_client::FlowCloudAIClient;
 use flowcloudai_client::image::ImageRequest;
 
+#[cfg(feature = "local-apis")]
+#[path = "apis/mod.rs"]
+mod apis;
+#[cfg(not(feature = "local-apis"))]
 #[path = "support/apis.rs"]
 mod apis;
 

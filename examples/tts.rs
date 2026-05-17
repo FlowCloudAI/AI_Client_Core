@@ -2,6 +2,10 @@ use std::path::PathBuf;
 use flowcloudai_client::audio::{AudioDecoder, AudioSource};
 use flowcloudai_client::tts::{TTSRequest, AudioFormat};
 use flowcloudai_client::FlowCloudAIClient;
+#[cfg(feature = "local-apis")]
+#[path = "apis/mod.rs"]
+mod apis;
+#[cfg(not(feature = "local-apis"))]
 #[path = "support/apis.rs"]
 mod apis;
 

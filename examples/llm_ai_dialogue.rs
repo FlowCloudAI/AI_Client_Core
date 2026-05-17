@@ -1,3 +1,7 @@
+#[cfg(feature = "local-apis")]
+#[path = "apis/mod.rs"]
+mod apis;
+#[cfg(not(feature = "local-apis"))]
 #[path = "support/apis.rs"]
 mod apis;
 mod senses;
