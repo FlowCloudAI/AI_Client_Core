@@ -2,6 +2,8 @@ use crate::PluginScanner;
 use crate::image::ImageSession;
 use crate::llm::config::SessionConfig;
 use crate::llm::session::LLMSession;
+use crate::llm::tree::ConversationNodeSeed;
+use crate::llm::types::Message;
 use crate::orchestrator::Orchestrate;
 use crate::plugin::manager::PluginManager;
 use crate::plugin::pipeline::ApiPipeline;
@@ -374,7 +376,24 @@ impl FlowCloudAIClient {
         let mut session = LLMSession::new(config, pipeline, Arc::clone(&self.tool_registry))?;
 
         // 回放历史消息
-        session.preload_history(conv.messages, conv.head);
+        let history = conv
+            .messages
+            .into_iter()
+            .map(|stored| ConversationNodeSeed {
+                node_id: stored.node_id,
+                parent: stored.parent,
+                turn_id: stored.turn_id,
+                timestamp: Some(stored.timestamp),
+                message: Message {
+                    role: stored.role,
+                    content: stored.content,
+                    reasoning_content: stored.reasoning,
+                    tool_call_id: stored.tool_call_id,
+                    tool_calls: stored.tool_calls,
+                },
+            })
+            .collect();
+        session.preload_history(history, conv.head);
 
         // 绑定存储上下文（复用原对话 ID，续聊写盘不创建新文件）
         session.resume_storage_ctx(

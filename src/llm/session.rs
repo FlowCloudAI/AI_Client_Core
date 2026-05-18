@@ -3,7 +3,7 @@ use crate::llm::accumulator::ToolCallAccumulator;
 use crate::llm::config::SessionConfig;
 use crate::llm::handle::SessionHandle;
 use crate::llm::stream_decoder::StreamDecoder;
-use crate::llm::tree::ConversationTree;
+use crate::llm::tree::{ConversationNodeSeed, ConversationTree};
 use crate::llm::types::{
     ChatRequest, ChatResponse, CtrlMsg, DecoderEventPayload, Message, SessionEvent, ThinkingType,
     ToolCall, TurnStatus, Usage,
@@ -127,38 +127,28 @@ impl LLMSession {
     ///
     /// `head` 为 v3 持久化格式中的当前活跃节点；旧格式（v2）无此字段传 `None`，
     /// 此时退化为以最后一条消息为 head。
-    pub fn preload_history(
-        &mut self,
-        messages: Vec<crate::storage::StoredMessage>,
-        head: Option<u64>,
-    ) {
+    pub fn preload_history(&mut self, messages: Vec<ConversationNodeSeed>, head: Option<u64>) {
         // 在 run() 调用前，只有 self 持有 Arc<RwLock<ConversationTree>>，
         // 因此 Arc::get_mut 保证成功，避免引入 async。
         if let Some(tree_lock) = Arc::get_mut(&mut self.tree) {
             let tree = tree_lock.get_mut();
             let mut prev_id: Option<u64> = None;
             let mut last_id: Option<u64> = None;
-            for stored in messages {
-                let stored_id = stored.node_id;
-                let msg = crate::llm::types::Message {
-                    role: stored.role,
-                    content: stored.content,
-                    reasoning_content: stored.reasoning,
-                    tool_call_id: stored.tool_call_id,
-                    tool_calls: stored.tool_calls,
-                };
-                let parent = if stored_id.is_some() {
-                    stored.parent
+            for seed in messages {
+                let seed_id = seed.node_id;
+                let parent = if seed_id.is_some() {
+                    seed.parent
                 } else {
                     prev_id
                 };
-                let id = stored_id.unwrap_or(tree.next_id());
+                let id = seed_id.unwrap_or(tree.next_id());
                 tree.insert_node(
                     id,
                     parent,
-                    msg,
-                    stored.turn_id.unwrap_or(0),
-                    stored.timestamp,
+                    seed.message,
+                    seed.turn_id.unwrap_or(0),
+                    seed.timestamp
+                        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
                 );
                 prev_id = Some(id);
                 last_id = Some(id);
@@ -1386,10 +1376,10 @@ impl LLMSession {
 mod tests {
     use super::LLMSession;
     use crate::llm::config::SessionConfig;
+    use crate::llm::tree::ConversationNodeSeed;
     use crate::llm::types::{Message, ToolCall, ToolFunctionCall, TurnStatus, Usage};
     use crate::plugin::pipeline::ApiPipeline;
     use crate::plugin::registry::PluginRegistry;
-    use crate::storage::StoredMessage;
     use crate::tool::registry::ToolRegistry;
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -1410,18 +1400,19 @@ mod tests {
         parent: Option<u64>,
         role: &str,
         content: &str,
-    ) -> StoredMessage {
-        StoredMessage {
-            message_id: node_id.map(|id| format!("msg_{}", id)),
+    ) -> ConversationNodeSeed {
+        ConversationNodeSeed {
             node_id,
-            turn_id: Some(0),
             parent,
-            role: role.to_string(),
-            content: Some(content.to_string()),
-            reasoning: None,
-            timestamp: "2026-05-14T00:00:00Z".to_string(),
-            tool_call_id: None,
-            tool_calls: None,
+            turn_id: Some(0),
+            timestamp: Some("2026-05-14T00:00:00Z".to_string()),
+            message: Message {
+                role: role.to_string(),
+                content: Some(content.to_string()),
+                reasoning_content: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
         }
     }
 

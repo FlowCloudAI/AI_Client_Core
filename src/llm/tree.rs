@@ -23,6 +23,18 @@ pub struct ConversationNode {
     pub timestamp: String,
 }
 
+/// 用于预载历史消息的通用节点数据。
+///
+/// 该结构不绑定任何持久化格式，调用方可从文件、数据库或内存状态转换得到。
+#[derive(Debug, Clone)]
+pub struct ConversationNodeSeed {
+    pub node_id: Option<NodeId>,
+    pub parent: Option<NodeId>,
+    pub turn_id: Option<u64>,
+    pub timestamp: Option<String>,
+    pub message: Message,
+}
+
 /// 对话消息树
 ///
 /// 以链表形式组织消息历史，支持任意节点的 checkout（分支/回退）。
