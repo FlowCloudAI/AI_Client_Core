@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
     let senses_b = senses::llm_b::LLMBSense::new();
 
     // ── 初始化客户端与插件 ──
-    let mut client = FlowCloudAIClient::new(PathBuf::from("./plugins"), None)?;
+    let mut client = FlowCloudAIClient::new(PathBuf::from("./plugins"))?;
     
     client.install_sense(&senses_a)?;
     client.install_sense(&senses_b)?;

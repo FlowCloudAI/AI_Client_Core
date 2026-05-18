@@ -12,7 +12,7 @@ mod apis;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let client = FlowCloudAIClient::new(PathBuf::from("./plugins"), None)?;
+    let client = FlowCloudAIClient::new(PathBuf::from("./plugins"))?;
     client.load_plugin("qwen-image")?;
 
     let img = client.create_image_session("qwen-image", apis::QWEN_LLM.key, None)?;

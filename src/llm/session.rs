@@ -11,7 +11,6 @@ use crate::llm::types::{
 use crate::orchestrator::{AssembledTurn, Orchestrate, TaskContext};
 use crate::plugin::pipeline::ApiPipeline;
 use crate::plugin::types::ThinkingEffort;
-use crate::storage::{StorageCtx, StoredMessage};
 use crate::tool::registry::ToolRegistry;
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
@@ -61,8 +60,6 @@ pub struct LLMSession {
 
     orchestrator: Option<Box<dyn Orchestrate>>,
 
-    /// 可选的持久化上下文（storage_path 不为 None 时由 client 注入）
-    storage_ctx: Option<StorageCtx>,
 }
 
 // ── 构建 & 配置 ──
@@ -84,49 +81,15 @@ impl LLMSession {
             pipeline,
             turn_id: 0,
             orchestrator: None,
-            storage_ctx: None,
         })
-    }
-
-    /// 注入存储上下文（由 FlowCloudAIClient 在 create_llm_session 中调用）。
-    pub fn set_storage_ctx(
-        &mut self,
-        plugin_id: String,
-        store: std::sync::Arc<crate::storage::ConversationStore>,
-    ) {
-        self.storage_ctx = Some(StorageCtx::new(plugin_id, store));
-    }
-
-    /// 获取当前会话对应的持久化对话 ID。
-    pub fn conversation_id(&self) -> Option<&str> {
-        self.storage_ctx
-            .as_ref()
-            .map(|ctx| ctx.conversation_id.as_str())
-    }
-
-    /// 注入存储上下文，复用已有对话 ID（续聊时调用，保证写盘覆盖而非新建文件）。
-    pub fn resume_storage_ctx(
-        &mut self,
-        conversation_id: String,
-        plugin_id: String,
-        created_at: String,
-        store: std::sync::Arc<crate::storage::ConversationStore>,
-    ) {
-        self.storage_ctx = Some(StorageCtx::from_existing(
-            conversation_id,
-            plugin_id,
-            store,
-            created_at,
-        ));
     }
 
     /// 将已有历史消息回放到内部 ConversationTree（必须在 run() 之前调用）。
     ///
-    /// 由 `FlowCloudAIClient::resume_llm_session` 在创建 session 后、启动前注入，
-    /// 使 tree 与磁盘上的对话历史保持一致。
+    /// 调用方可从数据库、文件或内存状态构造 `ConversationNodeSeed`，
+    /// 再在创建 session 后、启动前注入，使 tree 与上层历史状态保持一致。
     ///
-    /// `head` 为 v3 持久化格式中的当前活跃节点；旧格式（v2）无此字段传 `None`，
-    /// 此时退化为以最后一条消息为 head。
+    /// `head` 为当前活跃节点；无显式 head 时传 `None`，此时退化为以最后一条消息为 head。
     pub fn preload_history(&mut self, messages: Vec<ConversationNodeSeed>, head: Option<u64>) {
         // 在 run() 调用前，只有 self 持有 Arc<RwLock<ConversationTree>>，
         // 因此 Arc::get_mut 保证成功，避免引入 async。
@@ -847,7 +810,6 @@ impl LLMSession {
                 }
             }
 
-            let is_ok = matches!(turn_status, TurnStatus::Ok);
             event_tx
                 .send(SessionEvent::TurnEnd {
                     status: turn_status,
@@ -855,44 +817,7 @@ impl LLMSession {
                     usage: accumulated_usage.take(),
                 })
                 .await?;
-
-            if is_ok {
-                if let Err(e) = self.auto_save().await {
-                    event_tx
-                        .send(SessionEvent::Error(format!("存储失败: {:#}", e)))
-                        .await?;
-                }
-            }
         }
-    }
-
-    /// 将当前对话树写入磁盘（仅当 storage_ctx 已注入时生效）。
-    async fn auto_save(&self) -> Result<()> {
-        let Some(ref ctx) = self.storage_ctx else {
-            return Ok(());
-        };
-
-        let tree = self.tree.read().await;
-        let head = tree.head();
-        let messages: Vec<StoredMessage> = tree
-            .all_nodes()
-            .into_iter()
-            .map(|node| StoredMessage {
-                message_id: Some(format!("msg_{}", node.id)),
-                node_id: Some(node.id),
-                turn_id: Some(node.turn_id),
-                parent: node.parent,
-                role: node.message.role.clone(),
-                content: node.message.content.clone(),
-                reasoning: node.message.reasoning_content.clone(),
-                timestamp: node.timestamp.clone(),
-                tool_call_id: node.message.tool_call_id.clone(),
-                tool_calls: node.message.tool_calls.clone(),
-            })
-            .collect();
-
-        let model = self.conversation.read().await.model.clone();
-        ctx.flush(messages, &model, head)
     }
 
     async fn should_wait_for_user(&self) -> bool {

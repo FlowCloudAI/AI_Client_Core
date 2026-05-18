@@ -76,7 +76,7 @@ impl Orchestrate for ModeOrchestrator {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = FlowCloudAIClient::new(PathBuf::from("./plugins"), None)?;
+    let client = FlowCloudAIClient::new(PathBuf::from("./plugins"))?;
     client.load_plugin("deepseek-llm")?;
 
     // ── 方式 A：DefaultOrchestrator（Sense 白名单 + task_type 策略）──────────

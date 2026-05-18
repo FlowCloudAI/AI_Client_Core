@@ -2,15 +2,12 @@ use crate::PluginScanner;
 use crate::image::ImageSession;
 use crate::llm::config::SessionConfig;
 use crate::llm::session::LLMSession;
-use crate::llm::tree::ConversationNodeSeed;
-use crate::llm::types::Message;
 use crate::orchestrator::Orchestrate;
 use crate::plugin::manager::PluginManager;
 use crate::plugin::pipeline::ApiPipeline;
 use crate::plugin::registry::PluginRegistry;
 use crate::plugin::types::{PluginKind, PluginMeta};
 use crate::sense::Sense;
-use crate::storage::{ConversationMeta, ConversationStore, StoredConversation};
 use crate::tool::registry::ToolRegistry;
 use crate::tts::TTSSession;
 use anyhow::{Result, anyhow};
@@ -23,16 +20,13 @@ pub struct FlowCloudAIClient {
     plugin_registry: Arc<PluginRegistry>,
     tool_registry: Arc<ToolRegistry>,
     plugins_dir: PathBuf,
-    storage: Option<Arc<ConversationStore>>,
 }
 
 impl FlowCloudAIClient {
     /// 初始化客户端。
     ///
     /// - `plugins_dir`: 插件目录，扫描 `.fcplug` 文件。
-    /// - `storage_path`: 可选的对话存储目录。传 `Some(path)` 时启用本地持久化，
-    ///   每次 turn_end 状态为 Ok 时自动将对话写盘。
-    pub fn new(plugins_dir: PathBuf, storage_path: Option<PathBuf>) -> Result<Self> {
+    pub fn new(plugins_dir: PathBuf) -> Result<Self> {
         let pm = PluginManager::new(plugins_dir.clone())?;
         for (id, meta) in &pm.plugins {
             log::info!("[plugin] found: {} ({:?})", id, meta.kind);
@@ -53,15 +47,10 @@ impl FlowCloudAIClient {
 
         let plugin_registry = registry;
 
-        let storage = storage_path
-            .map(|p| ConversationStore::new(p).map(Arc::new))
-            .transpose()?;
-
         Ok(Self {
             plugin_registry: Arc::new(plugin_registry),
             tool_registry: Arc::new(ToolRegistry::new()),
             plugins_dir,
-            storage,
         })
     }
 
@@ -325,85 +314,7 @@ impl FlowCloudAIClient {
             Some(plugin_id.to_string()),
         )?;
 
-        let mut session = LLMSession::new(config, pipeline, Arc::clone(&self.tool_registry))?;
-
-        if let Some(ref store) = self.storage {
-            session.set_storage_ctx(plugin_id.to_string(), Arc::clone(store));
-        }
-
-        Ok(session)
-    }
-
-    /// 从已有对话 ID 恢复 LLM 会话（续聊模式）。
-    ///
-    /// 与 `create_llm_session` 相比，额外做了两件事：
-    /// 1. 从 `ConversationStore` 加载历史消息并回放到 `ConversationTree`；
-    /// 2. 将 `StorageCtx` 的 `conversation_id` 设为原对话 ID，确保续聊时
-    ///    写盘覆盖原文件，而非创建新文件（避免重复对话条目）。
-    ///
-    /// - `config_override`: 可选的 `SessionConfig` 覆盖。传 `None` 时使用默认值。
-    pub fn resume_llm_session(
-        &self,
-        plugin_id: &str,
-        api_key: &str,
-        conversation_id: &str,
-        config_override: Option<SessionConfig>,
-    ) -> Result<LLMSession> {
-        self.ensure_plugin_kind(plugin_id, PluginKind::LLM)?;
-        let store = self
-            .storage
-            .as_ref()
-            .ok_or_else(|| anyhow!("storage not configured"))?;
-
-        let conv = store
-            .get(conversation_id)
-            .ok_or_else(|| anyhow!("conversation '{}' not found", conversation_id))?;
-
-        let url = self.plugin_registry.get_url(plugin_id)?;
-        if !url.starts_with("http") {
-            return Err(anyhow!("plugin '{}' has invalid URL: {}", plugin_id, url));
-        }
-
-        let mut config = config_override.unwrap_or_default();
-        config.base_url = url.to_string();
-        config.api_key = api_key.to_string();
-
-        let pipeline = ApiPipeline::try_new(
-            Arc::clone(&self.plugin_registry),
-            Some(plugin_id.to_string()),
-        )?;
-
-        let mut session = LLMSession::new(config, pipeline, Arc::clone(&self.tool_registry))?;
-
-        // 回放历史消息
-        let history = conv
-            .messages
-            .into_iter()
-            .map(|stored| ConversationNodeSeed {
-                node_id: stored.node_id,
-                parent: stored.parent,
-                turn_id: stored.turn_id,
-                timestamp: Some(stored.timestamp),
-                message: Message {
-                    role: stored.role,
-                    content: stored.content,
-                    reasoning_content: stored.reasoning,
-                    tool_call_id: stored.tool_call_id,
-                    tool_calls: stored.tool_calls,
-                },
-            })
-            .collect();
-        session.preload_history(history, conv.head);
-
-        // 绑定存储上下文（复用原对话 ID，续聊写盘不创建新文件）
-        session.resume_storage_ctx(
-            conversation_id.to_string(),
-            plugin_id.to_string(),
-            conv.meta.created_at,
-            Arc::clone(store),
-        );
-
-        Ok(session)
+        LLMSession::new(config, pipeline, Arc::clone(&self.tool_registry))
     }
 
     /// 创建 LLM 会话（编排模式）。
@@ -446,10 +357,6 @@ impl FlowCloudAIClient {
         let mut session = LLMSession::new(config, pipeline, Arc::clone(&self.tool_registry))?;
 
         session.set_orchestrator(orchestrator);
-
-        if let Some(ref store) = self.storage {
-            session.set_storage_ctx(plugin_id.to_string(), Arc::clone(store));
-        }
 
         Ok(session)
     }
@@ -524,38 +431,6 @@ impl FlowCloudAIClient {
         )?;
 
         TTSSession::new(config, pipeline)
-    }
-
-    // ── 对话历史管理 ──
-
-    /// 列出所有已保存对话的元信息（不含消息体），按 updated_at 降序。
-    ///
-    /// 未配置 `storage_path` 时返回空列表。
-    pub fn ai_list_conversations(&self) -> Vec<ConversationMeta> {
-        self.storage.as_ref().map_or_else(Vec::new, |s| s.list())
-    }
-
-    /// 获取指定对话的完整内容（含消息列表）。
-    ///
-    /// 未找到或未配置存储时返回 `None`。
-    pub fn ai_get_conversation(&self, id: &str) -> Option<StoredConversation> {
-        self.storage.as_ref()?.get(id)
-    }
-
-    /// 删除指定对话文件。
-    pub fn ai_delete_conversation(&self, id: &str) -> Result<()> {
-        self.storage
-            .as_ref()
-            .ok_or_else(|| anyhow!("storage not configured"))?
-            .delete(id)
-    }
-
-    /// 重命名对话（修改标题），同时更新 updated_at。
-    pub fn ai_rename_conversation(&self, id: &str, title: String) -> Result<()> {
-        self.storage
-            .as_ref()
-            .ok_or_else(|| anyhow!("storage not configured"))?
-            .rename(id, title)
     }
 
     /// 创建图像生成会话。
