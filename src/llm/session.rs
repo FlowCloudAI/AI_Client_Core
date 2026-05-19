@@ -1460,12 +1460,21 @@ mod tests {
     use super::LLMSession;
     use crate::llm::config::SessionConfig;
     use crate::llm::tree::ConversationNodeSeed;
-    use crate::llm::types::{Message, ToolCall, ToolFunctionCall, TurnStatus, Usage};
+    use crate::llm::types::{
+        Message, SessionEvent, ToolCall, ToolFunctionArg, ToolFunctionCall, TurnStatus, Usage,
+    };
     use crate::plugin::pipeline::ApiPipeline;
     use crate::plugin::registry::PluginRegistry;
     use crate::tool::registry::ToolRegistry;
+    use futures_util::StreamExt;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
 
     fn new_test_session() -> LLMSession {
         let registry = Arc::new(PluginRegistry::empty().unwrap());
@@ -1497,6 +1506,362 @@ mod tests {
                 tool_calls: None,
             },
         }
+    }
+
+    async fn new_http_test_session(
+        base_url: String,
+        stream: bool,
+        tool_registry: Arc<ToolRegistry>,
+    ) -> LLMSession {
+        let registry = Arc::new(PluginRegistry::empty().unwrap());
+        let pipeline = ApiPipeline::try_new(registry, None).unwrap();
+        let mut config = SessionConfig::default();
+        config.base_url = base_url;
+        config.api_key = "test-key".to_string();
+        config.event_buffer = 64;
+        config.max_tool_rounds = 4;
+
+        let mut session = LLMSession::new(config, pipeline, tool_registry).unwrap();
+        session.set_model("mock-model").await;
+        session.set_stream(stream).await;
+        session
+    }
+
+    enum MockReply {
+        DelayHeaders(Duration),
+        StreamPartialThenHold { content: String, hold: Duration },
+        StreamDone { content: String },
+        StreamToolCall { name: String },
+    }
+
+    async fn spawn_mock_server(replies: Vec<MockReply>) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let replies = Arc::new(std::sync::Mutex::new(VecDeque::from(replies)));
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let replies_for_task = Arc::clone(&replies);
+        let count_for_task = Arc::clone(&request_count);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let reply = replies_for_task.lock().unwrap().pop_front();
+                let Some(reply) = reply else {
+                    break;
+                };
+                count_for_task.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    handle_mock_connection(socket, reply).await;
+                });
+            }
+        });
+
+        (format!("http://{}", addr), request_count)
+    }
+
+    async fn handle_mock_connection(mut socket: TcpStream, reply: MockReply) {
+        let _ = read_request_headers(&mut socket).await;
+        match reply {
+            MockReply::DelayHeaders(delay) => {
+                tokio::time::sleep(delay).await;
+            }
+            MockReply::StreamPartialThenHold { content, hold } => {
+                let _ = write_stream_headers(&mut socket).await;
+                let _ = write_sse_line(&mut socket, stream_content_chunk(&content, None)).await;
+                let _ = socket.flush().await;
+                tokio::time::sleep(hold).await;
+            }
+            MockReply::StreamDone { content } => {
+                let _ = write_stream_headers(&mut socket).await;
+                let _ = write_sse_line(&mut socket, stream_content_chunk(&content, None)).await;
+                let _ = write_sse_line(&mut socket, "[DONE]".to_string()).await;
+                let _ = socket.flush().await;
+            }
+            MockReply::StreamToolCall { name } => {
+                let _ = write_stream_headers(&mut socket).await;
+                let _ = write_sse_line(&mut socket, stream_tool_call_chunk(&name)).await;
+                let _ = write_sse_line(&mut socket, stream_tool_finish_chunk()).await;
+                let _ = socket.flush().await;
+            }
+        }
+    }
+
+    async fn read_request_headers(socket: &mut TcpStream) -> std::io::Result<()> {
+        let mut buf = [0u8; 1024];
+        let mut data = Vec::new();
+        loop {
+            let n = socket.read(&mut buf).await?;
+            if n == 0 {
+                return Ok(());
+            }
+            data.extend_from_slice(&buf[..n]);
+            if data.windows(4).any(|w| w == b"\r\n\r\n") {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn write_stream_headers(socket: &mut TcpStream) -> std::io::Result<()> {
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            )
+            .await
+    }
+
+    async fn write_sse_line(socket: &mut TcpStream, data: String) -> std::io::Result<()> {
+        socket
+            .write_all(format!("data: {}\n\n", data).as_bytes())
+            .await
+    }
+
+    fn stream_content_chunk(content: &str, finish_reason: Option<&str>) -> String {
+        serde_json::json!({
+            "id": "chunk-1",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "mock-model",
+            "choices": [{
+                "index": 0,
+                "delta": { "content": content },
+                "finish_reason": finish_reason
+            }],
+            "usage": null
+        })
+        .to_string()
+    }
+
+    fn stream_tool_call_chunk(name: &str) -> String {
+        serde_json::json!({
+            "id": "chunk-tool",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "mock-model",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": "{}"
+                        }
+                    }]
+                },
+                "finish_reason": null
+            }],
+            "usage": null
+        })
+        .to_string()
+    }
+
+    fn stream_tool_finish_chunk() -> String {
+        serde_json::json!({
+            "id": "chunk-tool-finish",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "mock-model",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "tool_calls"
+            }],
+            "usage": null
+        })
+        .to_string()
+    }
+
+    async fn wait_for_request_count(count: &Arc<AtomicUsize>, expected: usize) {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(2) {
+            if count.load(Ordering::SeqCst) >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "等待请求数量超时: expected={}, actual={}",
+            expected,
+            count.load(Ordering::SeqCst)
+        );
+    }
+
+    async fn wait_for_turn_begin(events: &mut ReceiverStream<SessionEvent>) {
+        loop {
+            match events.next().await {
+                Some(SessionEvent::TurnBegin { .. }) => return,
+                Some(SessionEvent::Error(e)) => panic!("收到错误事件: {}", e),
+                Some(_) => {}
+                None => panic!("事件流提前结束"),
+            }
+        }
+    }
+
+    async fn wait_for_content_delta(events: &mut ReceiverStream<SessionEvent>) -> String {
+        loop {
+            match events.next().await {
+                Some(SessionEvent::ContentDelta(delta)) => return delta,
+                Some(SessionEvent::Error(e)) => panic!("收到错误事件: {}", e),
+                Some(_) => {}
+                None => panic!("事件流提前结束"),
+            }
+        }
+    }
+
+    async fn wait_for_turn_end(events: &mut ReceiverStream<SessionEvent>) -> (TurnStatus, u64) {
+        loop {
+            match events.next().await {
+                Some(SessionEvent::TurnEnd {
+                    status, node_id, ..
+                }) => return (status, node_id),
+                Some(SessionEvent::Error(e)) => panic!("收到错误事件: {}", e),
+                Some(_) => {}
+                None => panic!("事件流提前结束"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_cancel_before_response_returns_cancelled() {
+        let (url, request_count) =
+            spawn_mock_server(vec![MockReply::DelayHeaders(Duration::from_secs(5))]).await;
+        let session = new_http_test_session(url, true, Arc::new(ToolRegistry::new())).await;
+        let (input_tx, input_rx) = mpsc::channel(1);
+        let (mut events, handle) = session.try_run(input_rx).unwrap();
+
+        input_tx.send("你好".to_string()).await.unwrap();
+        wait_for_turn_begin(&mut events).await;
+        wait_for_request_count(&request_count, 1).await;
+        handle.cancel();
+        drop(input_tx);
+
+        let (status, _) = wait_for_turn_end(&mut events).await;
+        assert!(matches!(status, TurnStatus::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn stream_cancel_after_partial_preserves_partial_and_recovers() {
+        let (url, request_count) = spawn_mock_server(vec![
+            MockReply::StreamPartialThenHold {
+                content: "半句".to_string(),
+                hold: Duration::from_secs(5),
+            },
+            MockReply::StreamDone {
+                content: "完成".to_string(),
+            },
+        ])
+        .await;
+        let session = new_http_test_session(url, true, Arc::new(ToolRegistry::new())).await;
+        let (input_tx, input_rx) = mpsc::channel(2);
+        let (mut events, handle) = session.try_run(input_rx).unwrap();
+
+        input_tx.send("第一轮".to_string()).await.unwrap();
+        wait_for_turn_begin(&mut events).await;
+        wait_for_request_count(&request_count, 1).await;
+        assert_eq!(wait_for_content_delta(&mut events).await, "半句");
+        handle.cancel();
+
+        let (status, _) = wait_for_turn_end(&mut events).await;
+        assert!(matches!(status, TurnStatus::Cancelled));
+        let snapshot = handle.get_conversation().await;
+        assert!(
+            snapshot
+                .messages
+                .iter()
+                .any(|m| m.role == "assistant" && m.content.as_deref() == Some("半句"))
+        );
+
+        input_tx.send("第二轮".to_string()).await.unwrap();
+        wait_for_turn_begin(&mut events).await;
+        wait_for_request_count(&request_count, 2).await;
+        assert_eq!(wait_for_content_delta(&mut events).await, "完成");
+        let (status, _) = wait_for_turn_end(&mut events).await;
+        assert!(matches!(status, TurnStatus::Ok));
+        drop(input_tx);
+    }
+
+    #[tokio::test]
+    async fn non_stream_cancel_while_waiting_response_returns_cancelled() {
+        let (url, request_count) =
+            spawn_mock_server(vec![MockReply::DelayHeaders(Duration::from_secs(5))]).await;
+        let session = new_http_test_session(url, false, Arc::new(ToolRegistry::new())).await;
+        let (input_tx, input_rx) = mpsc::channel(1);
+        let (mut events, handle) = session.try_run(input_rx).unwrap();
+
+        input_tx.send("非流式".to_string()).await.unwrap();
+        wait_for_turn_begin(&mut events).await;
+        wait_for_request_count(&request_count, 1).await;
+        handle.cancel();
+        drop(input_tx);
+
+        let (status, _) = wait_for_turn_end(&mut events).await;
+        assert!(matches!(status, TurnStatus::Cancelled));
+    }
+
+    #[derive(Clone)]
+    struct SlowToolState {
+        started: Arc<AtomicBool>,
+        finished: Arc<AtomicBool>,
+    }
+
+    #[tokio::test]
+    async fn tool_execution_cancel_stops_followup_turn() {
+        let (url, request_count) = spawn_mock_server(vec![
+            MockReply::StreamToolCall {
+                name: "slow_tool".to_string(),
+            },
+            MockReply::StreamDone {
+                content: "不应请求第二轮".to_string(),
+            },
+        ])
+        .await;
+        let started = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let mut registry = ToolRegistry::new();
+        registry.put_state::<crate::sense::SenseState<SlowToolState>>(Arc::new(
+            tokio::sync::Mutex::new(SlowToolState {
+                started: Arc::clone(&started),
+                finished: Arc::clone(&finished),
+            }),
+        ));
+        registry.register_async::<SlowToolState, _>(
+            "slow_tool",
+            "慢速测试工具",
+            None::<Vec<ToolFunctionArg>>,
+            |state, _args| {
+                Box::pin(async move {
+                    state.started.store(true, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    state.finished.store(true, Ordering::SeqCst);
+                    Ok("完成".to_string())
+                })
+            },
+        );
+
+        let session = new_http_test_session(url, true, Arc::new(registry)).await;
+        let (input_tx, input_rx) = mpsc::channel(1);
+        let (mut events, handle) = session.try_run(input_rx).unwrap();
+
+        input_tx.send("调用工具".to_string()).await.unwrap();
+        wait_for_turn_begin(&mut events).await;
+        wait_for_request_count(&request_count, 1).await;
+        let started_at = Instant::now();
+        while !started.load(Ordering::SeqCst) && started_at.elapsed() < Duration::from_secs(2) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(started.load(Ordering::SeqCst));
+
+        handle.cancel();
+        drop(input_tx);
+        let (status, _) = wait_for_turn_end(&mut events).await;
+        assert!(matches!(status, TurnStatus::Cancelled));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert!(!finished.load(Ordering::SeqCst));
     }
 
     #[test]
