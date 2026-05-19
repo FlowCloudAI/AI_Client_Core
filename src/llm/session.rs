@@ -22,6 +22,68 @@ use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 
+type TurnOutput = (
+    String,
+    String,
+    Option<Vec<ToolCall>>,
+    Option<String>,
+    TurnStatus,
+    Option<Usage>,
+);
+
+/// 单轮取消上下文。
+///
+/// 每轮开始时记录 watch 当前版本，之后只要版本变化就视为取消当前轮。
+#[derive(Clone)]
+struct TurnCancel {
+    rx: watch::Receiver<u64>,
+    baseline: u64,
+}
+
+impl TurnCancel {
+    fn new(rx: &watch::Receiver<u64>) -> Self {
+        Self {
+            rx: rx.clone(),
+            baseline: *rx.borrow(),
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        *self.rx.borrow() != self.baseline
+    }
+
+    async fn cancelled(&mut self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            if self.rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+fn cancelled_turn_output(
+    content: String,
+    reasoning: String,
+    tool_calls: Vec<ToolCall>,
+    usage: Option<Usage>,
+) -> TurnOutput {
+    (
+        content,
+        reasoning,
+        if tool_calls.is_empty() {
+            None
+        } else {
+            Some(tool_calls)
+        },
+        Some("cancelled".to_string()),
+        TurnStatus::Cancelled,
+        usage,
+    )
+}
+
 // ═════════════════════════════════════════════════════════════
 //                    核心会话管理器
 // ═════════════════════════════════════════════════════════════
@@ -598,9 +660,12 @@ impl LLMSession {
         let mut current_ctx = TaskContext::default();
         let mut tool_rounds = 0usize;
         let mut accumulated_usage: Option<Usage> = None;
+        let mut force_wait_for_user = false;
 
         loop {
-            if self.should_wait_for_user().await {
+            if force_wait_for_user || self.should_wait_for_user().await {
+                let forced_wait = force_wait_for_user;
+                force_wait_for_user = false;
                 tool_rounds = 0;
                 accumulated_usage = None;
                 event_tx.send(SessionEvent::NeedInput).await?;
@@ -630,7 +695,12 @@ impl LLMSession {
                         Either::Right((Some(ctrl), _)) => {
                             self.apply_ctrl(ctrl, &event_tx).await?;
                             // Checkout 可能使 head 移动到 user 节点，届时无需继续等待
-                            if !self.should_wait_for_user().await {
+                            let should_continue_turn = if forced_wait {
+                                self.head_is_user().await
+                            } else {
+                                !self.should_wait_for_user().await
+                            };
+                            if should_continue_turn {
                                 break 'wait;
                             }
                         }
@@ -663,6 +733,7 @@ impl LLMSession {
             let turn_head_id = self.tree.read().await.head().unwrap_or(0);
 
             self.turn_id += 1;
+            let mut turn_cancel = TurnCancel::new(&cancel_rx);
             event_tx
                 .send(SessionEvent::TurnBegin {
                     turn_id: self.turn_id,
@@ -738,7 +809,7 @@ impl LLMSession {
             );
             let stage_started = Instant::now();
             let (content, reasoning, tool_calls, finish_reason, turn_status, usage) = self
-                .send_and_process(&req, cancel_rx.clone(), &event_tx)
+                .send_and_process(&req, &mut turn_cancel, &event_tx)
                 .await?;
             log::info!(
                 "[client:drive][send_and_process_done] turn_id={} elapsed_ms={} content_chars={} reasoning_chars={} tool_calls={} finish_reason={:?} status={}",
@@ -804,8 +875,26 @@ impl LLMSession {
                             .await?;
                         continue;
                     }
-                    self.execute_tool_calls(calls, &enabled_tools, read_only, &event_tx)
-                        .await?;
+                    if self
+                        .execute_tool_calls(
+                            calls,
+                            &enabled_tools,
+                            read_only,
+                            &mut turn_cancel,
+                            &event_tx,
+                        )
+                        .await?
+                    {
+                        force_wait_for_user = true;
+                        event_tx
+                            .send(SessionEvent::TurnEnd {
+                                status: TurnStatus::Cancelled,
+                                node_id: asst_node_id,
+                                usage: accumulated_usage.take(),
+                            })
+                            .await?;
+                        continue;
+                    }
                     continue;
                 }
             }
@@ -826,6 +915,14 @@ impl LLMSession {
             .await
             .head_role()
             .map_or(true, |r| r == "assistant")
+    }
+
+    async fn head_is_user(&self) -> bool {
+        self.tree
+            .read()
+            .await
+            .head_role()
+            .is_some_and(|r| r == "user")
     }
 
     async fn snapshot(&self) -> ChatRequest {
@@ -873,35 +970,31 @@ impl LLMSession {
     async fn send_and_process(
         &mut self,
         req: &ChatRequest,
-        cancel_rx: watch::Receiver<u64>,
+        cancel: &mut TurnCancel,
         event_tx: &mpsc::Sender<SessionEvent>,
-    ) -> Result<(
-        String,
-        String,
-        Option<Vec<ToolCall>>,
-        Option<String>,
-        TurnStatus,
-        Option<Usage>,
-    )> {
+    ) -> Result<TurnOutput> {
+        if cancel.is_cancelled() {
+            return Ok(cancelled_turn_output(
+                String::new(),
+                String::new(),
+                Vec::new(),
+                None,
+            ));
+        }
+
         if req.stream.unwrap_or(false) {
-            self.handle_stream(req, cancel_rx, event_tx).await
+            self.handle_stream(req, cancel, event_tx).await
         } else {
-            self.handle_non_stream(req, event_tx).await
+            self.handle_non_stream(req, cancel, event_tx).await
         }
     }
 
     async fn handle_non_stream(
         &mut self,
         req: &ChatRequest,
+        cancel: &mut TurnCancel,
         event_tx: &mpsc::Sender<SessionEvent>,
-    ) -> Result<(
-        String,
-        String,
-        Option<Vec<ToolCall>>,
-        Option<String>,
-        TurnStatus,
-        Option<Usage>,
-    )> {
+    ) -> Result<TurnOutput> {
         log::info!(
             "[client:llm][non_stream_prepare_start] turn_id={} messages={} tool_count={}",
             self.turn_id,
@@ -909,7 +1002,23 @@ impl LLMSession {
             req.tools.as_ref().map_or(0, Vec::len)
         );
         let stage_started = Instant::now();
+        if cancel.is_cancelled() {
+            return Ok(cancelled_turn_output(
+                String::new(),
+                String::new(),
+                Vec::new(),
+                None,
+            ));
+        }
         let json = self.prepare_request(req)?;
+        if cancel.is_cancelled() {
+            return Ok(cancelled_turn_output(
+                String::new(),
+                String::new(),
+                Vec::new(),
+                None,
+            ));
+        }
         log::info!(
             "[client:llm][non_stream_prepare_done] turn_id={} elapsed_ms={} body_bytes={}",
             self.turn_id,
@@ -924,11 +1033,20 @@ impl LLMSession {
                 self.config.base_url
             );
             let stage_started = Instant::now();
-            let stream = self
+            let post_fut = self
                 .client
-                .post_json(&self.config.base_url, &self.config.api_key, json)
-                .await
-                .context("创建请求失败")?;
+                .post_json(&self.config.base_url, &self.config.api_key, json);
+            let stream = tokio::select! {
+                result = post_fut => result.context("创建请求失败")?,
+                _ = cancel.cancelled() => {
+                    return Ok(cancelled_turn_output(
+                        String::new(),
+                        String::new(),
+                        Vec::new(),
+                        None,
+                    ));
+                }
+            };
             log::info!(
                 "[client:llm][non_stream_http_send_done] turn_id={} elapsed_ms={}",
                 self.turn_id,
@@ -939,10 +1057,19 @@ impl LLMSession {
                 "[client:llm][non_stream_first_line_wait] turn_id={}",
                 self.turn_id
             );
-            stream
-                .next()
-                .await
-                .ok_or_else(|| anyhow!("response empty"))??
+            tokio::select! {
+                raw_line = stream.next() => {
+                    raw_line.ok_or_else(|| anyhow!("response empty"))??
+                }
+                _ = cancel.cancelled() => {
+                    return Ok(cancelled_turn_output(
+                        String::new(),
+                        String::new(),
+                        Vec::new(),
+                        None,
+                    ));
+                }
+            }
         };
         log::info!(
             "[client:llm][non_stream_first_line_done] turn_id={} bytes={}",
@@ -950,6 +1077,14 @@ impl LLMSession {
             raw_line.len()
         );
 
+        if cancel.is_cancelled() {
+            return Ok(cancelled_turn_output(
+                String::new(),
+                String::new(),
+                Vec::new(),
+                None,
+            ));
+        }
         let normalized = self.normalize_response(&raw_line)?;
 
         let res: ChatResponse = serde_json::from_str(&normalized)?;
@@ -1002,16 +1137,9 @@ impl LLMSession {
     async fn handle_stream(
         &mut self,
         req: &ChatRequest,
-        mut cancel_rx: watch::Receiver<u64>,
+        cancel: &mut TurnCancel,
         event_tx: &mpsc::Sender<SessionEvent>,
-    ) -> Result<(
-        String,
-        String,
-        Option<Vec<ToolCall>>,
-        Option<String>,
-        TurnStatus,
-        Option<Usage>,
-    )> {
+    ) -> Result<TurnOutput> {
         // StreamDecoder 和 ToolCallAccumulator 降为方法局部变量
         let mut decoder = StreamDecoder::default();
         decoder.begin_turn(self.turn_id);
@@ -1024,7 +1152,23 @@ impl LLMSession {
             req.tools.as_ref().map_or(0, Vec::len)
         );
         let stage_started = Instant::now();
+        if cancel.is_cancelled() {
+            return Ok(cancelled_turn_output(
+                String::new(),
+                String::new(),
+                Vec::new(),
+                None,
+            ));
+        }
         let json = self.prepare_request(req)?;
+        if cancel.is_cancelled() {
+            return Ok(cancelled_turn_output(
+                String::new(),
+                String::new(),
+                Vec::new(),
+                None,
+            ));
+        }
         log::info!(
             "[client:llm][stream_prepare_done] turn_id={} elapsed_ms={} body_bytes={}",
             self.turn_id,
@@ -1038,11 +1182,20 @@ impl LLMSession {
             self.config.base_url
         );
         let stage_started = Instant::now();
-        let stream = self
+        let post_fut = self
             .client
-            .post_json(&self.config.base_url, &self.config.api_key, json)
-            .await
-            .context("创建流式请求失败")?;
+            .post_json(&self.config.base_url, &self.config.api_key, json);
+        let stream = tokio::select! {
+            result = post_fut => result.context("创建流式请求失败")?,
+            _ = cancel.cancelled() => {
+                return Ok(cancelled_turn_output(
+                    String::new(),
+                    String::new(),
+                    Vec::new(),
+                    None,
+                ));
+            }
+        };
         log::info!(
             "[client:llm][stream_http_send_done] turn_id={} elapsed_ms={}",
             self.turn_id,
@@ -1056,29 +1209,15 @@ impl LLMSession {
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut turn_status = TurnStatus::Ok;
         let mut usage: Option<Usage> = None;
-        let cancel_version = *cancel_rx.borrow();
         let mut line_count = 0usize;
 
         'outer: loop {
             let raw_line = tokio::select! {
-                changed = cancel_rx.changed() => {
-                    match changed {
-                        Ok(()) if *cancel_rx.borrow() != cancel_version => {
-                            turn_status = TurnStatus::Cancelled;
-                            finish_reason = Some("cancelled".to_string());
-                            usage = decoder.take_pending_usage();
-                            break 'outer;
-                        }
-                        Ok(()) => {
-                            continue;
-                        }
-                        Err(_) => {
-                            turn_status = TurnStatus::Cancelled;
-                            finish_reason = Some("cancelled".to_string());
-                            usage = decoder.take_pending_usage();
-                            break 'outer;
-                        }
-                    }
+                _ = cancel.cancelled() => {
+                    turn_status = TurnStatus::Cancelled;
+                    finish_reason = Some("cancelled".to_string());
+                    usage = decoder.take_pending_usage();
+                    break 'outer;
                 }
                 raw_line = stream.next() => {
                     match raw_line {
@@ -1088,6 +1227,12 @@ impl LLMSession {
                 }
             };
             let line = raw_line?;
+            if cancel.is_cancelled() {
+                turn_status = TurnStatus::Cancelled;
+                finish_reason = Some("cancelled".to_string());
+                usage = decoder.take_pending_usage();
+                break 'outer;
+            }
             line_count += 1;
             if line_count == 1 || line_count % 50 == 0 {
                 log::info!(
@@ -1224,9 +1369,14 @@ impl LLMSession {
         tool_calls: Vec<ToolCall>,
         enabled_tools: &Option<HashSet<String>>,
         read_only: bool,
+        cancel: &mut TurnCancel,
         event_tx: &mpsc::Sender<SessionEvent>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         for call in tool_calls {
+            if cancel.is_cancelled() {
+                return Ok(true);
+            }
+
             let func_name = &call.function.name;
             let args_str = call.function.arguments.trim();
 
@@ -1260,16 +1410,21 @@ impl LLMSession {
                                 .await?;
                             let tool_call_id = Self::synth_tool_call_id(self.turn_id, call.index);
                             let _ = self.add_message(Message::tool(output, tool_call_id)).await;
+                            if cancel.is_cancelled() {
+                                return Ok(true);
+                            }
                             continue;
                         }
                     }
                 };
 
-                match self
-                    .tool_registry
-                    .conduct(func_name, Some(&args_v), Duration::from_secs(600))
-                    .await
-                {
+                let conduct_fut =
+                    self.tool_registry
+                        .conduct(func_name, Some(&args_v), Duration::from_secs(600));
+                match tokio::select! {
+                    result = conduct_fut => result,
+                    _ = cancel.cancelled() => return Ok(true),
+                } {
                     Ok(o) => (o, false),
                     Err(e) => (format!("工具执行失败: {}", e), true),
                 }
@@ -1286,9 +1441,12 @@ impl LLMSession {
                 .await?;
 
             let _ = self.add_message(Message::tool(output, tool_call_id)).await;
+            if cancel.is_cancelled() {
+                return Ok(true);
+            }
         }
 
-        Ok(())
+        Ok(false)
     }
 
     #[inline]
