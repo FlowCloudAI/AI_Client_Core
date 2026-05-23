@@ -87,8 +87,11 @@ fn main() -> Result<()> {
 
 ```text
 core_ai_client/
+├── docs/              # 协议、调试和设计文档
 ├── examples/          # LLM、图像、TTS、插件管理和编排示例
+├── plugins/           # 本地调试用 .fcplug 插件包
 ├── src/               # 库源码
+├── wit/               # 插件 WIT 接口副本
 ├── Cargo.toml         # crate 配置、features 和 release profile
 ├── Cargo.lock         # 锁定依赖版本
 ├── AGENTS.md          # AI 编码助手维护指南
