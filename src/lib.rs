@@ -22,6 +22,6 @@ pub use orchestrator::{AssembledTurn, DefaultOrchestrator, Orchestrate, TaskCont
 pub use plugin::loaded::LoadedPlugin;
 pub use plugin::manager::{PluginLoadError, PluginLoadReport, PluginManager};
 pub use plugin::scanner::PluginScanner;
-pub use plugin::types::{PluginKind, ThinkingEffort};
+pub use plugin::types::{ModelInfo, PluginKind, ThinkingEffort};
 pub use tool::ToolRegistry;
 pub use tts::TTSSession;

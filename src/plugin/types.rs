@@ -161,6 +161,20 @@ impl PluginMeta {
         &self.model_ids
     }
 
+    /// 返回插件声明的完整模型元数据。
+    pub fn model_infos(&self) -> &[ModelInfo] {
+        match &self.spec {
+            PluginSpec::LLM(i) => &i.models,
+            PluginSpec::TTS(i) => &i.models,
+            PluginSpec::Image(i) => &i.models,
+        }
+    }
+
+    /// 按模型 ID 查询完整模型元数据。
+    pub fn model_info(&self, model_id: &str) -> Option<&ModelInfo> {
+        self.model_infos().iter().find(|model| model.id == model_id)
+    }
+
     pub fn default_model(&self) -> Option<&str> {
         match &self.spec {
             PluginSpec::LLM(i) => i.default_model.as_deref(),
@@ -670,6 +684,12 @@ mod tests {
         assert_eq!(meta.kind, PluginKind::LLM);
         assert_eq!(meta.models(), &["model-a".to_string()]);
         assert_eq!(meta.default_model(), Some("model-a"));
+        assert_eq!(meta.model_infos()[0].id, "model-a");
+        assert_eq!(
+            meta.model_info("model-a").map(|model| model.id.as_str()),
+            Some("model-a")
+        );
+        assert!(meta.model_info("missing").is_none());
     }
 
     #[test]
