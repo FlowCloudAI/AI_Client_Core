@@ -1,3 +1,4 @@
+use crate::error::{ClientError, ErrorCode};
 use crate::llm::types::ToolFunctionArg;
 use futures_util::future::BoxFuture;
 use serde_json::Value;
@@ -13,13 +14,25 @@ pub fn arg_i32(args: &Value, key: &str) -> anyhow::Result<i32> {
     args.get(key)
         .and_then(|v| v.as_i64())
         .map(|v| v as i32)
-        .ok_or_else(|| anyhow::anyhow!("缺少或非法参数: {}", key))
+        .ok_or_else(|| {
+            ClientError::new(
+                ErrorCode::LlmToolCallInvalid,
+                format!("缺少或非法参数: {}", key),
+            )
+            .with_kv("field", key.to_string())
+            .into()
+        })
 }
 
 pub fn arg_str<'a>(args: &'a Value, key: &str) -> anyhow::Result<&'a str> {
-    args.get(key)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("缺少或非法参数: {}", key))
+    args.get(key).and_then(|v| v.as_str()).ok_or_else(|| {
+        ClientError::new(
+            ErrorCode::LlmToolCallInvalid,
+            format!("缺少或非法参数: {}", key),
+        )
+        .with_kv("field", key.to_string())
+        .into()
+    })
 }
 
 // ─────────────────────── Handler 类型 ───────────────────────
@@ -71,7 +84,14 @@ impl ToolRegistry {
         self.state
             .get(&TypeId::of::<T>())
             .and_then(|b| b.downcast_ref::<T>())
-            .ok_or_else(|| anyhow::anyhow!("缺少状态: {}", std::any::type_name::<T>()))
+            .ok_or_else(|| {
+                ClientError::new(
+                    ErrorCode::CoreClientInternalError,
+                    format!("缺少状态: {}", std::any::type_name::<T>()),
+                )
+                .with_kv("type", std::any::type_name::<T>().to_string())
+                .into()
+            })
     }
 
     // ── 工具注册（同步 handler） ──
@@ -239,16 +259,34 @@ impl ToolRegistry {
         let handler = match self.tools.get(func_name) {
             Some(spec) => {
                 if !spec.enabled.load(Ordering::SeqCst) {
-                    anyhow::bail!("工具已禁用: {}", func_name);
+                    return Err(ClientError::new(
+                        ErrorCode::ToolDisabled,
+                        format!("工具已禁用: {}", func_name),
+                    )
+                    .with_kv("tool_id", func_name.to_string())
+                    .into());
                 }
                 Arc::clone(&spec.handler)
             }
-            None => anyhow::bail!("未知工具: {}", func_name),
+            None => {
+                return Err(ClientError::new(
+                    ErrorCode::ToolNotFound,
+                    format!("未知工具: {}", func_name),
+                )
+                .with_kv("tool_id", func_name.to_string())
+                .into());
+            }
         };
 
         match tokio::time::timeout(timeout, handler(self, args)).await {
             Ok(res) => res,
-            Err(_) => anyhow::bail!("工具执行超时: {}", func_name),
+            Err(_) => Err(ClientError::new(
+                ErrorCode::LlmToolCallTimeout,
+                format!("工具执行超时: {}", func_name),
+            )
+            .with_kv("tool_id", func_name.to_string())
+            .with_kv("timeout_ms", timeout.as_millis() as u64)
+            .into()),
         }
     }
 
