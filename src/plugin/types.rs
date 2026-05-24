@@ -1,10 +1,11 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
+use crate::error::{ClientError, ErrorCode};
 use crate::SUPPORTED_AGREEMENT_VERSION;
 
 // ─────────────────────── 插件类型 ─────────────────────────
@@ -49,19 +50,27 @@ pub struct PluginInfoMeta {
 
 impl PluginManifest {
     pub fn parse(json: &str) -> Result<Self> {
-        let raw: serde_json::Value = serde_json::from_str(json)?;
+        let raw: serde_json::Value = serde_json::from_str(json).map_err(|e| {
+            ClientError::new(ErrorCode::PluginManifestInvalid, "manifest JSON 解析失败")
+                .with_kv("source", e.to_string())
+        })?;
         if raw.get("meta").and_then(|m| m.get("abi-version")).is_some()
             && raw
                 .get("meta")
                 .and_then(|m| m.get("agreement-version"))
                 .is_none()
         {
-            return Err(anyhow!(
-                "manifest uses old abi-version; migrate it with `cargo fcplug update`"
-            ));
+            return Err(ClientError::new(
+                ErrorCode::PluginVersionMismatch,
+                "manifest 使用旧的 abi-version，请运行 `cargo fcplug update` 迁移",
+            )
+            .into());
         }
 
-        let manifest: Self = serde_json::from_value(raw)?;
+        let manifest: Self = serde_json::from_value(raw).map_err(|e| {
+            ClientError::new(ErrorCode::PluginManifestInvalid, "manifest 结构不合法")
+                .with_kv("source", e.to_string())
+        })?;
         manifest.validate_meta()?;
         Ok(manifest)
     }
@@ -73,12 +82,17 @@ impl PluginManifest {
         validate_required("meta.name", &self.meta.name)?;
         validate_required("meta.description", &self.meta.description)?;
         if self.meta.agreement_version != SUPPORTED_AGREEMENT_VERSION {
-            return Err(anyhow!(
-                "agreement-version mismatch for '{}': expected {}, got {}",
-                self.meta.id,
-                SUPPORTED_AGREEMENT_VERSION,
-                self.meta.agreement_version
-            ));
+            return Err(ClientError::new(
+                ErrorCode::PluginVersionMismatch,
+                format!(
+                    "插件 '{}' 协议版本不匹配：期望 {}，实际 {}",
+                    self.meta.id, SUPPORTED_AGREEMENT_VERSION, self.meta.agreement_version
+                ),
+            )
+            .with_kv("plugin_id", self.meta.id.clone())
+            .with_kv("expected", SUPPORTED_AGREEMENT_VERSION)
+            .with_kv("actual", self.meta.agreement_version)
+            .into());
         }
         validate_url_policy(&self.meta.url)?;
         Ok(())
@@ -113,10 +127,21 @@ pub enum PluginSpec {
 impl PluginMeta {
     pub fn from_manifest(manifest: PluginManifest, fcplug_path: PathBuf) -> Result<Self> {
         let kind = manifest.meta.kind.clone();
+        let map_ext_err = |e: serde_json::Error| {
+            ClientError::new(ErrorCode::PluginManifestInvalid, "manifest 扩展段解析失败")
+                .with_kv("plugin_id", manifest.meta.id.clone())
+                .with_kv("source", e.to_string())
+        };
         let spec = match kind {
-            PluginKind::LLM => PluginSpec::LLM(serde_json::from_value(manifest.ext.clone())?),
-            PluginKind::TTS => PluginSpec::TTS(serde_json::from_value(manifest.ext.clone())?),
-            PluginKind::Image => PluginSpec::Image(serde_json::from_value(manifest.ext.clone())?),
+            PluginKind::LLM => PluginSpec::LLM(
+                serde_json::from_value(manifest.ext.clone()).map_err(map_ext_err)?,
+            ),
+            PluginKind::TTS => PluginSpec::TTS(
+                serde_json::from_value(manifest.ext.clone()).map_err(map_ext_err)?,
+            ),
+            PluginKind::Image => PluginSpec::Image(
+                serde_json::from_value(manifest.ext.clone()).map_err(map_ext_err)?,
+            ),
         };
 
         spec.validate()?;
@@ -190,7 +215,13 @@ impl PluginMeta {
         thinking_effort: Option<ThinkingEffort>,
     ) -> Result<()> {
         let Some(info) = self.as_llm() else {
-            return Err(anyhow!("plugin '{}' is not an LLM plugin", self.id));
+            return Err(ClientError::new(
+                ErrorCode::PluginKindMismatch,
+                format!("插件 '{}' 不是 LLM 插件", self.id),
+            )
+            .with_kv("plugin_id", self.id.clone())
+            .with_kv("expected_kind", "llm")
+            .into());
         };
         info.validate_request(model, thinking_effort)
     }
@@ -358,10 +389,15 @@ impl LLMInfo {
             let supports = model.supports.apply_to(&self.default_supports);
             let efforts = self.final_thinking_efforts_for_model(model);
             if !supports.thinking && !efforts.is_empty() {
-                return Err(anyhow!(
-                    "model '{}' has thinking-efforts but supports.thinking is false",
-                    model.id
-                ));
+                return Err(ClientError::new(
+                    ErrorCode::PluginManifestInvalid,
+                    format!(
+                        "模型 '{}' 声明了 thinking-efforts 但 supports.thinking 为 false",
+                        model.id
+                    ),
+                )
+                .with_kv("model_id", model.id.clone())
+                .into());
             }
         }
 
@@ -377,16 +413,24 @@ impl LLMInfo {
             .models
             .iter()
             .find(|m| m.id == model_id)
-            .ok_or_else(|| anyhow!("model '{}' is not declared by this plugin", model_id))?;
+            .ok_or_else(|| {
+                ClientError::new(
+                    ErrorCode::ValidationFormatError,
+                    format!("插件未声明模型 '{}'", model_id),
+                )
+                .with_kv("model_id", model_id.to_string())
+            })?;
 
         if let Some(effort) = thinking_effort {
             let efforts = self.final_thinking_efforts_for_model(model);
             if !efforts.contains(&effort) {
-                return Err(anyhow!(
-                    "thinking_effort {:?} is not supported by model '{}'",
-                    effort,
-                    model_id
-                ));
+                return Err(ClientError::new(
+                    ErrorCode::ValidationFormatError,
+                    format!("模型 '{}' 不支持 thinking_effort {:?}", model_id, effort),
+                )
+                .with_kv("model_id", model_id.to_string())
+                .with_kv("thinking_effort", format!("{:?}", effort))
+                .into());
             }
         }
 
@@ -446,7 +490,11 @@ impl TTSInfo {
         validate_models(&self.models)?;
         validate_default_model(self.default_model.as_deref(), &self.models)?;
         if self.voices.is_empty() {
-            return Err(anyhow!("voices cannot be empty for TTS plugins"));
+            return Err(ClientError::new(
+                ErrorCode::PluginManifestInvalid,
+                "TTS 插件的 voices 不能为空",
+            )
+            .into());
         }
 
         let mut seen = BTreeSet::new();
@@ -454,13 +502,23 @@ impl TTSInfo {
             validate_required("voices[].id", &voice.id)?;
             validate_required("voices[].name", &voice.name)?;
             if !seen.insert(voice.id.as_str()) {
-                return Err(anyhow!("duplicate voice id: {}", voice.id));
+                return Err(ClientError::new(
+                    ErrorCode::PluginManifestInvalid,
+                    format!("voice id 重复: {}", voice.id),
+                )
+                .with_kv("voice_id", voice.id.clone())
+                .into());
             }
         }
 
         if let Some(default_voice) = &self.default_voice {
             if !self.voices.iter().any(|voice| voice.id == *default_voice) {
-                return Err(anyhow!("default-voice must match a voice id"));
+                return Err(ClientError::new(
+                    ErrorCode::PluginManifestInvalid,
+                    "default-voice 必须匹配某个已声明的 voice id",
+                )
+                .with_kv("default_voice", default_voice.clone())
+                .into());
             }
         }
 
@@ -524,7 +582,11 @@ impl ImageInfo {
         validate_default_model(self.default_model.as_deref(), &self.models)?;
         validate_positive("max-prompt-length", self.max_prompt_length)?;
         if self.max_batch_size == Some(0) {
-            return Err(anyhow!("max-batch-size must be greater than 0"));
+            return Err(ClientError::new(
+                ErrorCode::PluginManifestInvalid,
+                "max-batch-size 必须大于 0",
+            )
+            .into());
         }
         Ok(())
     }
@@ -536,9 +598,15 @@ fn default_true() -> bool {
     true
 }
 
+fn manifest_invalid(message: impl Into<String>) -> ClientError {
+    ClientError::new(ErrorCode::PluginManifestInvalid, message)
+}
+
 fn validate_required(label: &str, value: &str) -> Result<()> {
     if value.trim().is_empty() {
-        return Err(anyhow!("{} cannot be empty", label));
+        return Err(manifest_invalid(format!("{} 不能为空", label))
+            .with_kv("field", label.to_string())
+            .into());
     }
     Ok(())
 }
@@ -546,35 +614,35 @@ fn validate_required(label: &str, value: &str) -> Result<()> {
 fn validate_plugin_id(id: &str) -> Result<()> {
     validate_required("meta.id", id)?;
     if id.len() > 64 {
-        return Err(anyhow!("meta.id is too long, max 64 chars"));
+        return Err(manifest_invalid("meta.id 过长，最长 64 字符").into());
     }
     if !id.starts_with(|c: char| c.is_ascii_lowercase()) {
-        return Err(anyhow!("meta.id must start with a lowercase ASCII letter"));
+        return Err(manifest_invalid("meta.id 必须以小写 ASCII 字母开头").into());
     }
     if !id
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
-        return Err(anyhow!(
-            "meta.id only allows lowercase ASCII letters, digits and hyphens"
-        ));
+        return Err(manifest_invalid("meta.id 仅允许小写 ASCII 字母、数字和短横线").into());
     }
     if id.ends_with('-') || id.contains("--") {
-        return Err(anyhow!(
-            "meta.id cannot end with hyphen or contain consecutive hyphens"
-        ));
+        return Err(manifest_invalid("meta.id 不能以短横线结尾或包含连续短横线").into());
     }
     Ok(())
 }
 
 fn validate_url_policy(raw: &str) -> Result<()> {
-    let parsed = Url::parse(raw).map_err(|e| anyhow!("invalid URL '{}': {}", raw, e))?;
+    let parsed = Url::parse(raw).map_err(|e| {
+        manifest_invalid(format!("无效 URL '{}': {}", raw, e))
+            .with_kv("url", raw.to_string())
+            .with_kv("source", e.to_string())
+    })?;
     match parsed.scheme() {
         "https" => Ok(()),
         "http" => {
             let host = parsed
                 .host_str()
-                .ok_or_else(|| anyhow!("HTTP URL must contain a host"))?;
+                .ok_or_else(|| manifest_invalid("HTTP URL 必须包含 host"))?;
             if host.eq_ignore_ascii_case("localhost") {
                 return Ok(());
             }
@@ -583,23 +651,25 @@ fn validate_url_policy(raw: &str) -> Result<()> {
                     return Ok(());
                 }
             }
-            Err(anyhow!(
-                "HTTP is only allowed for localhost/loopback endpoints"
-            ))
+            Err(manifest_invalid("HTTP 仅允许指向 localhost / loopback 端点").into())
         }
-        scheme => Err(anyhow!("unsupported URL scheme '{}'", scheme)),
+        scheme => Err(manifest_invalid(format!("不支持的 URL scheme '{}'", scheme))
+            .with_kv("scheme", scheme.to_string())
+            .into()),
     }
 }
 
 fn validate_models(models: &[ModelInfo]) -> Result<()> {
     if models.is_empty() {
-        return Err(anyhow!("models cannot be empty"));
+        return Err(manifest_invalid("models 不能为空").into());
     }
     let mut seen = BTreeSet::new();
     for model in models {
         validate_required("models[].id", &model.id)?;
         if !seen.insert(model.id.as_str()) {
-            return Err(anyhow!("duplicate model id: {}", model.id));
+            return Err(manifest_invalid(format!("模型 id 重复: {}", model.id))
+                .with_kv("model_id", model.id.clone())
+                .into());
         }
     }
     Ok(())
@@ -608,7 +678,9 @@ fn validate_models(models: &[ModelInfo]) -> Result<()> {
 fn validate_default_model(default_model: Option<&str>, models: &[ModelInfo]) -> Result<()> {
     if let Some(default_model) = default_model {
         if !models.iter().any(|model| model.id == default_model) {
-            return Err(anyhow!("default-model must match a model id"));
+            return Err(manifest_invalid("default-model 必须匹配某个已声明的 model id")
+                .with_kv("default_model", default_model.to_string())
+                .into());
         }
     }
     Ok(())
@@ -618,7 +690,9 @@ fn validate_unique_efforts(label: &str, efforts: &[ThinkingEffort]) -> Result<()
     let mut seen = BTreeSet::new();
     for effort in efforts {
         if !seen.insert(*effort) {
-            return Err(anyhow!("{} contains duplicate value {:?}", label, effort));
+            return Err(manifest_invalid(format!("{} 包含重复值 {:?}", label, effort))
+                .with_kv("field", label.to_string())
+                .into());
         }
     }
     Ok(())
@@ -626,7 +700,9 @@ fn validate_unique_efforts(label: &str, efforts: &[ThinkingEffort]) -> Result<()
 
 fn validate_positive(label: &str, value: Option<u64>) -> Result<()> {
     if value == Some(0) {
-        return Err(anyhow!("{} must be greater than 0", label));
+        return Err(manifest_invalid(format!("{} 必须大于 0", label))
+            .with_kv("field", label.to_string())
+            .into());
     }
     Ok(())
 }
@@ -673,7 +749,7 @@ mod tests {
         }"#;
 
         let err = PluginManifest::parse(raw).unwrap_err();
-        assert!(err.to_string().contains("old abi-version"));
+        assert!(err.to_string().contains("PLUGIN_VERSION_MISMATCH"));
     }
 
     #[test]
@@ -706,7 +782,7 @@ mod tests {
         let err = meta
             .validate_llm_request("model-a", Some(ThinkingEffort::High))
             .unwrap_err();
-        assert!(err.to_string().contains("not supported"));
+        assert!(err.to_string().contains("VALIDATION_FORMAT_ERROR"));
     }
 
     #[test]
@@ -729,6 +805,6 @@ mod tests {
 
         let manifest = PluginManifest::parse(raw).unwrap();
         let err = PluginMeta::from_manifest(manifest, PathBuf::from("p.fcplug")).unwrap_err();
-        assert!(err.to_string().contains("default-voice"));
+        assert!(err.to_string().contains("default-voice") || err.to_string().contains("default_voice"));
     }
 }
