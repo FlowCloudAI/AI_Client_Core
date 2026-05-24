@@ -1,7 +1,8 @@
 // llm/config.rs——会话配置
 
-use anyhow::anyhow;
 use anyhow::Result;
+
+use crate::error::{ClientError, ErrorCode};
 
 #[derive(Clone, Debug)]
 pub struct SessionConfig {
@@ -40,13 +41,26 @@ impl Default for SessionConfig {
 impl SessionConfig {
     pub fn validate(&self) -> Result<()> {
         if self.base_url.is_empty() {
-            return Err(anyhow!("base_url is empty"));
+            return Err(ClientError::new(
+                ErrorCode::ValidationMissingField,
+                "base_url 不能为空",
+            )
+            .with_kv("field", "base_url")
+            .into());
         }
         if !self.base_url.starts_with("http") {
-            return Err(anyhow!("base_url must start with http"));
+            return Err(ClientError::new(
+                ErrorCode::ValidationFormatError,
+                "base_url 必须以 http 开头",
+            )
+            .with_kv("field", "base_url")
+            .with_kv("value", self.base_url.clone())
+            .into());
         }
         if self.api_key.is_empty() {
-            return Err(anyhow!("api_key is empty"));
+            return Err(ClientError::new(ErrorCode::AuthApiKeyMissing, "api_key 不能为空")
+                .with_kv("field", "api_key")
+                .into());
         }
         Ok(())
     }

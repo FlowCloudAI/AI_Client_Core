@@ -1,3 +1,4 @@
+use crate::error::{ClientError, ErrorCode};
 use crate::llm::types::{
     ChatResponseStream, DecoderEvent, DecoderEventPayload, EventInfo, ToolCall, TurnStatus, Usage,
 };
@@ -60,9 +61,13 @@ impl StreamDecoder {
         let resp: ChatResponseStream = match serde_json::from_str(s) {
             Ok(v) => v,
             Err(e) => {
-                out.push(Err(anyhow::anyhow!(
-                    "[decoder] 解析 JSON 失败: {e};\nline={s}"
-                )));
+                out.push(Err(ClientError::new(
+                    ErrorCode::LlmStreamProtocolError,
+                    "流式响应 JSON 解析失败",
+                )
+                .with_kv("source", e.to_string())
+                .with_kv("line", s.to_string())
+                .into()));
                 return out;
             }
         };
