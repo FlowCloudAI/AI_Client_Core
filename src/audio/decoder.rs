@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::Result;
 use base64::Engine as _;
 use cpal::StreamConfig;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -11,6 +11,16 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use tokio::sync::Mutex;
+
+use crate::error::{ClientError, ErrorCode};
+
+fn decode_err(message: impl Into<String>, source: impl ToString) -> ClientError {
+    ClientError::new(ErrorCode::AudioDecodeFailed, message).with_kv("source", source.to_string())
+}
+
+fn playback_err(message: impl Into<String>, source: impl ToString) -> ClientError {
+    ClientError::new(ErrorCode::AudioPlaybackFailed, message).with_kv("source", source.to_string())
+}
 
 // ─────────────────────── 音频来源 ──────────────────────────
 
@@ -83,10 +93,11 @@ impl AudioDecoder {
     /// 将 AudioSource 解析为原始音频字节。
     pub async fn resolve(source: &AudioSource) -> Result<Vec<u8>> {
         match source {
-            AudioSource::Hex(hex) => hex::decode(hex).context("failed to decode hex audio"),
+            AudioSource::Hex(hex) => hex::decode(hex)
+                .map_err(|e| decode_err("hex 音频解码失败", e).into()),
             AudioSource::Base64(b64) => base64::engine::general_purpose::STANDARD
                 .decode(b64)
-                .context("failed to decode base64 audio"),
+                .map_err(|e| decode_err("base64 音频解码失败", e).into()),
             AudioSource::Url(url) => Self::fetch_url(url).await,
             AudioSource::Raw(bytes) => Ok(bytes.clone()),
         }
@@ -94,18 +105,28 @@ impl AudioDecoder {
 
     /// 从 URL 下载音频数据。
     async fn fetch_url(url: &str) -> Result<Vec<u8>> {
-        let resp = reqwest::get(url)
-            .await
-            .context("failed to fetch audio URL")?;
+        let resp = reqwest::get(url).await.map_err(|e| {
+            ClientError::new(ErrorCode::LlmRequestNetworkError, "下载音频 URL 失败")
+                .with_kv("url", url.to_string())
+                .with_kv("source", e.to_string())
+        })?;
 
         if !resp.status().is_success() {
-            return Err(anyhow!("audio URL returned status {}", resp.status()));
+            return Err(ClientError::new(
+                ErrorCode::HttpServerError,
+                format!("音频 URL 返回非成功状态 {}", resp.status()),
+            )
+            .with_kv("url", url.to_string())
+            .with_kv("status_code", resp.status().as_u16())
+            .into());
         }
 
-        resp.bytes()
-            .await
-            .map(|b| b.to_vec())
-            .context("failed to read audio response body")
+        resp.bytes().await.map(|b| b.to_vec()).map_err(|e| {
+            ClientError::new(ErrorCode::LlmRequestNetworkError, "读取音频响应体失败")
+                .with_kv("url", url.to_string())
+                .with_kv("source", e.to_string())
+                .into()
+        })
     }
 
     // ── 解码 ──
@@ -116,7 +137,7 @@ impl AudioDecoder {
     /// `format_hint` 可选，如 "mp3", "wav", "flac"。
     pub fn decode(data: &[u8], format_hint: Option<&str>) -> Result<DecodedAudio> {
         if data.is_empty() {
-            return Err(anyhow!("empty audio data"));
+            return Err(decode_err("音频数据为空", "empty").into());
         }
 
         let cursor = Cursor::new(data.to_vec());
@@ -134,18 +155,18 @@ impl AudioDecoder {
                 &FormatOptions::default(),
                 &MetadataOptions::default(),
             )
-            .context("failed to probe audio format")?;
+            .map_err(|e| decode_err("探测音频格式失败", e))?;
 
         let mut format_reader = probed.format;
 
         let track = format_reader
             .default_track()
-            .ok_or_else(|| anyhow!("no audio track found"))?;
+            .ok_or_else(|| decode_err("未找到音频轨道", "no_track"))?;
 
         let sample_rate = track
             .codec_params
             .sample_rate
-            .ok_or_else(|| anyhow!("unknown sample rate"))?;
+            .ok_or_else(|| decode_err("无法识别采样率", "unknown_sample_rate"))?;
         let channels = track
             .codec_params
             .channels
@@ -155,7 +176,7 @@ impl AudioDecoder {
 
         let mut decoder = symphonia::default::get_codecs()
             .make(&track.codec_params, &DecoderOptions::default())
-            .context("failed to create audio decoder")?;
+            .map_err(|e| decode_err("创建音频解码器失败", e))?;
 
         let mut all_samples: Vec<f32> = Vec::new();
 
@@ -167,7 +188,7 @@ impl AudioDecoder {
                 {
                     break;
                 }
-                Err(e) => return Err(anyhow!("read packet error: {}", e)),
+                Err(e) => return Err(decode_err("读取音频 packet 失败", e).into()),
             };
 
             if packet.track_id() != track_id {
@@ -177,7 +198,7 @@ impl AudioDecoder {
             let decoded = match decoder.decode(&packet) {
                 Ok(d) => d,
                 Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
-                Err(e) => return Err(anyhow!("decode error: {}", e)),
+                Err(e) => return Err(decode_err("音频帧解码失败", e).into()),
             };
 
             let spec = *decoded.spec();
@@ -189,7 +210,7 @@ impl AudioDecoder {
         }
 
         if all_samples.is_empty() {
-            return Err(anyhow!("decoded zero samples"));
+            return Err(decode_err("解码得到 0 个采样", "zero_samples").into());
         }
 
         Ok(DecodedAudio {
@@ -217,9 +238,9 @@ impl AudioDecoder {
     /// 阻塞直到播放完成。在 async 上下文中应 spawn_blocking。
     pub fn play(audio: &DecodedAudio) -> Result<()> {
         let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or_else(|| anyhow!("no audio output device found"))?;
+        let device = host.default_output_device().ok_or_else(|| {
+            ClientError::new(ErrorCode::AudioDeviceUnavailable, "未找到默认音频输出设备")
+        })?;
 
         let config = StreamConfig {
             channels: audio.channels,
@@ -260,9 +281,9 @@ impl AudioDecoder {
                 },
                 None,
             )
-            .context("failed to build audio output stream")?;
+            .map_err(|e| playback_err("构建音频输出流失败", e))?;
 
-        stream.play().context("failed to start playback")?;
+        stream.play().map_err(|e| playback_err("启动音频播放失败", e))?;
 
         // 等待播放完成
         let _ = done_rx.recv();
@@ -281,6 +302,6 @@ impl AudioDecoder {
         let audio = Self::decode_source(source, format_hint).await?;
         tokio::task::spawn_blocking(move || Self::play(&audio))
             .await
-            .context("playback task panicked")?
+            .map_err(|e| playback_err("播放任务 panic", e))?
     }
 }
