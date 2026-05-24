@@ -1,7 +1,8 @@
+use crate::error::{ClientError, ErrorCode};
 use crate::plugin::host::HostState;
 use crate::plugin::types::{PluginKind, PluginManifest, PluginMeta};
 use crate::{LoadedPlugin, PluginScanner};
-use anyhow::{Context, Result, anyhow};
+use anyhow::Result;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -40,12 +41,16 @@ impl PluginManager {
     pub fn new(plug_path: PathBuf) -> Result<Self> {
         let mut config = Config::new();
         config.wasm_component_model(true);
-        let engine = Engine::new(&config)
-            .map_err(|e| anyhow!("Failed to create WebAssembly engine: {}", e))?;
+        let engine = Engine::new(&config).map_err(|e| {
+            ClientError::new(ErrorCode::CoreClientInitFailed, "创建 WebAssembly 引擎失败")
+                .with_kv("source", e.to_string())
+        })?;
         let mut linker = Linker::new(&engine);
 
-        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
-            .map_err(|e| anyhow!("Failed to add WASI to linker: {}", e))?;
+        wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|e| {
+            ClientError::new(ErrorCode::CoreClientInitFailed, "向 linker 注册 WASI 失败")
+                .with_kv("source", e.to_string())
+        })?;
 
         let (plugins, load_report) = Self::load_plugins_report(Path::new(&plug_path))?;
 
@@ -65,9 +70,16 @@ impl PluginManager {
         let mut plugins: HashMap<String, PluginMeta> = HashMap::new();
         let mut report = PluginLoadReport::default();
 
-        for fcplug in
-            PluginScanner::scan_plugins(path).context("Failed to scan plugins directory")?
-        {
+        for fcplug in PluginScanner::scan_plugins(path).map_err(|e| {
+            // 如果已经是 ClientError 就透传，否则包装一层
+            if ClientError::from_anyhow(&e).is_some() {
+                e
+            } else {
+                ClientError::new(ErrorCode::FsOpenFailed, "扫描插件目录失败")
+                    .with_kv("source", e.to_string())
+                    .into()
+            }
+        })? {
             match PluginScanner::read_plugin_info(&fcplug) {
                 Ok(manifest) => {
                     if let Err(reason) = Self::validate_plugin(&manifest, &plugins) {
@@ -128,28 +140,46 @@ impl PluginManager {
     pub fn get_url(&self, id: &str) -> Result<&str> {
         self.plugins
             .get(id)
-            .ok_or_else(|| anyhow!("Plugin not found: {}", id))
+            .ok_or_else(|| {
+                ClientError::new(ErrorCode::PluginNotFound, format!("插件 '{}' 不存在", id))
+                    .with_kv("plugin_id", id.to_string())
+                    .into()
+            })
             .map(|meta| meta.url.as_str())
     }
 
     pub fn add_plugin(&mut self, plugin_path: &str) -> Result<()> {
-        let manifest = PluginScanner::read_plugin_info(plugin_path.as_ref())
-            .context("Failed to read plugin metadata")?;
+        let manifest = PluginScanner::read_plugin_info(plugin_path.as_ref())?;
 
         let info = &manifest.meta;
 
         if self.plugins.contains_key(&info.id) {
-            return Err(anyhow!("Plugin already exists: {}", info.id));
+            return Err(ClientError::new(
+                ErrorCode::PluginAlreadyExists,
+                format!("插件 '{}' 已存在", info.id),
+            )
+            .with_kv("plugin_id", info.id.clone())
+            .into());
         }
 
-        let filename = Path::new(plugin_path)
-            .file_name()
-            .ok_or_else(|| anyhow!("Invalid plugin filename: {}", plugin_path))?;
+        let filename = Path::new(plugin_path).file_name().ok_or_else(|| {
+            ClientError::new(
+                ErrorCode::ValidationFormatError,
+                format!("无效的插件文件名: {}", plugin_path),
+            )
+            .with_kv("path", plugin_path.to_string())
+        })?;
 
         let dst = Path::new(&self.plug_path).join(filename);
 
-        fs::copy(plugin_path, &dst)
-            .context(format!("Failed to copy plugin '{}' to {:?}", info.id, dst))?;
+        fs::copy(plugin_path, &dst).map_err(|e| {
+            ClientError::new(
+                ErrorCode::FsWriteFailed,
+                format!("复制插件 '{}' 到 {:?} 失败", info.id, dst),
+            )
+            .with_kv("plugin_id", info.id.clone())
+            .with_kv("source", e.to_string())
+        })?;
 
         let id = info.id.clone();
         let meta = PluginScanner::build_plugin_meta(manifest, &dst)?;
@@ -165,19 +195,16 @@ impl PluginManager {
     pub fn load_llm_plugin(&mut self, id: &str) -> Result<()> {
         self.llm_plugin
             .load(&self.plugins, &self.linker, &self.engine, id)
-            .context(format!("Failed to load LLM plugin '{}'", id))
     }
 
     pub fn load_image_plugin(&mut self, id: &str) -> Result<()> {
         self.image_plugin
             .load(&self.plugins, &self.linker, &self.engine, id)
-            .context(format!("Failed to load Image plugin '{}'", id))
     }
 
     pub fn load_tts_plugin(&mut self, id: &str) -> Result<()> {
         self.tts_plugin
             .load(&self.plugins, &self.linker, &self.engine, id)
-            .context(format!("Failed to load TTS plugin '{}'", id))
     }
 }
 
