@@ -1,4 +1,5 @@
 use crate::PluginScanner;
+use crate::error::{ClientError, ErrorCode};
 use crate::image::ImageSession;
 use crate::llm::config::SessionConfig;
 use crate::llm::session::LLMSession;
@@ -10,7 +11,7 @@ use crate::plugin::types::{PluginKind, PluginMeta};
 use crate::sense::Sense;
 use crate::tool::registry::ToolRegistry;
 use crate::tts::TTSSession;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -104,10 +105,13 @@ impl FlowCloudAIClient {
     /// - 文件操作失败：转换为 anyhow::Error 并附带上下文
     pub fn uninstall_plugin(&self, plugin_id: &str) -> Result<()> {
         // 1. 检查插件是否存在
-        let meta = self
-            .plugin_registry
-            .get_meta(plugin_id)
-            .ok_or_else(|| anyhow!("plugin '{}' not found", plugin_id))?;
+        let meta = self.plugin_registry.get_meta(plugin_id).ok_or_else(|| {
+            ClientError::new(
+                ErrorCode::PluginNotFound,
+                format!("插件 '{}' 不存在", plugin_id),
+            )
+            .with_kv("plugin_id", plugin_id.to_string())
+        })?;
 
         // 保存文件路径（因为后面要删除）
         let fcplug_path = meta.fcplug_path.clone();
@@ -115,12 +119,16 @@ impl FlowCloudAIClient {
         // 2. 检查引用计数
         let ref_count = self.plugin_registry.try_get_ref_count(plugin_id)?;
         if ref_count > 0 {
-            return Err(anyhow!(
-                "cannot uninstall plugin '{}': still in use by {} session(s). \
-                 Please close all sessions using this plugin first.",
-                plugin_id,
-                ref_count
-            ));
+            return Err(ClientError::new(
+                ErrorCode::PluginUnloadForbidden,
+                format!(
+                    "插件 '{}' 仍被 {} 个会话引用，请先关闭使用该插件的会话",
+                    plugin_id, ref_count
+                ),
+            )
+            .with_kv("plugin_id", plugin_id.to_string())
+            .with_kv("ref_count", ref_count)
+            .into());
         }
 
         // 3. 卸载插件（销毁 pool、module 和 meta）
@@ -128,11 +136,10 @@ impl FlowCloudAIClient {
 
         // 4. 删除磁盘文件
         std::fs::remove_file(&fcplug_path).map_err(|e| {
-            anyhow!(
-                "failed to remove plugin file '{}': {}",
-                fcplug_path.display(),
-                e
-            )
+            ClientError::new(ErrorCode::FsWriteFailed, "删除插件文件失败")
+                .with_kv("plugin_id", plugin_id.to_string())
+                .with_kv("path", fcplug_path.display().to_string())
+                .with_kv("source", e.to_string())
         })?;
 
         log::info!(
@@ -158,20 +165,19 @@ impl FlowCloudAIClient {
     /// - 文件复制失败：转换为 anyhow::Error 并附带上下文
     /// - WASM 编译失败：返回编译错误
     pub fn install_plugin_from_path(&self, source_path: &Path) -> Result<PluginMeta> {
-        // 1. 读取 manifest.json 校验
-        let manifest = PluginScanner::read_plugin_info(source_path).map_err(|e| {
-            anyhow!(
-                "failed to read plugin manifest from {:?}: {}",
-                source_path,
-                e
-            )
-        })?;
+        // 1. 读取 manifest.json 校验（read_plugin_info 已返回 ClientError，直接透传）
+        let manifest = PluginScanner::read_plugin_info(source_path)?;
 
         let info = &manifest.meta;
 
         // 校验 ID 唯一性
         if self.plugin_registry.get_meta(&info.id).is_some() {
-            return Err(anyhow!("plugin '{}' already exists", info.id));
+            return Err(ClientError::new(
+                ErrorCode::PluginAlreadyExists,
+                format!("插件 '{}' 已存在", info.id),
+            )
+            .with_kv("plugin_id", info.id.clone())
+            .into());
         }
 
         // 2. 复制文件到 plugins_dir，文件名固定为 {plugin_id}.fcplug
@@ -181,30 +187,40 @@ impl FlowCloudAIClient {
         let same_file = source_path.canonicalize().ok() == dest_path.canonicalize().ok();
         if !same_file {
             std::fs::copy(source_path, &dest_path).map_err(|e| {
-                anyhow!(
-                    "failed to copy plugin from {:?} to {:?}: {}",
-                    source_path,
-                    dest_path,
-                    e
-                )
+                ClientError::new(ErrorCode::FsWriteFailed, "复制插件文件失败")
+                    .with_kv("plugin_id", info.id.clone())
+                    .with_kv("source_path", source_path.display().to_string())
+                    .with_kv("dest_path", dest_path.display().to_string())
+                    .with_kv("source", e.to_string())
             })?;
         }
 
         // 3. 构建 PluginMeta
-        let meta = PluginScanner::build_plugin_meta(manifest.clone(), &dest_path)
-            .map_err(|e| anyhow!("failed to build plugin meta: {}", e))?;
+        let meta = PluginScanner::build_plugin_meta(manifest.clone(), &dest_path)?;
 
         // 4. 读取 wasm bytes 并添加到 registry
         let wasm_bytes = {
-            let file = std::fs::File::open(&dest_path)
-                .map_err(|e| anyhow!("cannot open plugin '{}': {}", info.id, e))?;
-            let mut archive = zip::ZipArchive::new(file)
-                .map_err(|e| anyhow!("cannot read zip for plugin '{}': {}", info.id, e))?;
-            let mut entry = archive
-                .by_name("plugin.wasm")
-                .map_err(|_| anyhow!("plugin.wasm not found in '{}'", info.id))?;
+            let file = std::fs::File::open(&dest_path).map_err(|e| {
+                ClientError::new(ErrorCode::FsOpenFailed, "无法打开已安装的插件包")
+                    .with_kv("plugin_id", info.id.clone())
+                    .with_kv("path", dest_path.display().to_string())
+                    .with_kv("source", e.to_string())
+            })?;
+            let mut archive = zip::ZipArchive::new(file).map_err(|e| {
+                ClientError::new(ErrorCode::PluginLoadFailed, "插件包不是合法 ZIP")
+                    .with_kv("plugin_id", info.id.clone())
+                    .with_kv("source", e.to_string())
+            })?;
+            let mut entry = archive.by_name("plugin.wasm").map_err(|_| {
+                ClientError::new(ErrorCode::PluginLoadFailed, "插件包缺少 plugin.wasm")
+                    .with_kv("plugin_id", info.id.clone())
+            })?;
             let mut buf = Vec::new();
-            std::io::Read::read_to_end(&mut entry, &mut buf)?;
+            std::io::Read::read_to_end(&mut entry, &mut buf).map_err(|e| {
+                ClientError::new(ErrorCode::PluginLoadFailed, "读取 plugin.wasm 失败")
+                    .with_kv("plugin_id", info.id.clone())
+                    .with_kv("source", e.to_string())
+            })?;
             buf
         };
 
@@ -225,9 +241,9 @@ impl FlowCloudAIClient {
     /// 多个 Sense 可以叠加安装（工具名不冲突即可）。
     pub fn install_sense(&mut self, sense: &dyn Sense) -> Result<()> {
         let reg = Arc::get_mut(&mut self.tool_registry).ok_or_else(|| {
-            anyhow!(
-                "cannot install sense while sessions hold a tool registry reference; \
-                     call install_sense before creating any session"
+            ClientError::new(
+                ErrorCode::CoreClientInternalError,
+                "已有会话持有 ToolRegistry 引用，无法安装 Sense；请在创建任何会话之前调用 install_sense",
             )
         })?;
         sense.install_tools(reg)
@@ -243,13 +259,13 @@ impl FlowCloudAIClient {
     /// 必须在没有任何 Session 持有 `Arc<ToolRegistry>` 克隆时调用，
     /// 否则返回错误。这与 `install_sense` / `install_tools` 的约束一致。
     pub fn tool_registry_mut(&mut self) -> Result<&mut ToolRegistry> {
-        Arc::get_mut(&mut self.tool_registry)
-            .ok_or_else(|| {
-                anyhow!(
-                    "cannot mutate tool registry while sessions hold a reference; \
-                     call tool_registry_mut before creating any session or after all sessions are dropped"
-                )
-            })
+        Arc::get_mut(&mut self.tool_registry).ok_or_else(|| {
+            ClientError::new(
+                ErrorCode::CoreClientInternalError,
+                "已有会话持有 ToolRegistry 引用，无法获取可变借用；请在创建任何会话之前或所有会话销毁后调用",
+            )
+            .into()
+        })
     }
 
     /// 安装自定义工具到全局 ToolRegistry。
@@ -261,27 +277,32 @@ impl FlowCloudAIClient {
         F: FnOnce(&mut ToolRegistry) -> Result<()>,
     {
         let reg = Arc::get_mut(&mut self.tool_registry).ok_or_else(|| {
-            anyhow!(
-                "cannot install tools while sessions hold a tool registry reference; \
-                     call install_tools before creating any session"
+            ClientError::new(
+                ErrorCode::CoreClientInternalError,
+                "已有会话持有 ToolRegistry 引用，无法安装工具；请在创建任何会话之前调用 install_tools",
             )
         })?;
         installer(reg)
     }
 
     fn ensure_plugin_kind(&self, plugin_id: &str, expected: PluginKind) -> Result<()> {
-        let meta = self
-            .plugin_registry
-            .try_get_meta(plugin_id)?
-            .ok_or_else(|| anyhow!("plugin '{}' not found", plugin_id))?;
+        let meta = self.plugin_registry.try_get_meta(plugin_id)?.ok_or_else(|| {
+            ClientError::new(
+                ErrorCode::PluginNotFound,
+                format!("插件 '{}' 不存在", plugin_id),
+            )
+            .with_kv("plugin_id", plugin_id.to_string())
+        })?;
 
         if meta.kind != expected {
-            return Err(anyhow!(
-                "plugin '{}' kind mismatch: expected {:?}, got {:?}",
-                plugin_id,
-                expected,
-                meta.kind
-            ));
+            return Err(ClientError::new(
+                ErrorCode::PluginKindMismatch,
+                format!("插件 '{}' 类型不匹配", plugin_id),
+            )
+            .with_kv("plugin_id", plugin_id.to_string())
+            .with_kv("expected_kind", format!("{:?}", expected))
+            .with_kv("actual_kind", format!("{:?}", meta.kind))
+            .into());
         }
 
         Ok(())
@@ -302,7 +323,13 @@ impl FlowCloudAIClient {
         self.ensure_plugin_kind(plugin_id, PluginKind::LLM)?;
         let url = self.plugin_registry.get_url(plugin_id)?;
         if !url.starts_with("http") {
-            return Err(anyhow!("plugin '{}' has invalid URL: {}", plugin_id, url));
+            return Err(ClientError::new(
+                ErrorCode::PluginManifestInvalid,
+                format!("插件 '{}' URL 非法: {}", plugin_id, url),
+            )
+            .with_kv("plugin_id", plugin_id.to_string())
+            .with_kv("url", url.to_string())
+            .into());
         }
 
         let mut config = config_override.unwrap_or_default();
@@ -342,7 +369,13 @@ impl FlowCloudAIClient {
         self.ensure_plugin_kind(plugin_id, PluginKind::LLM)?;
         let url = self.plugin_registry.get_url(plugin_id)?;
         if !url.starts_with("http") {
-            return Err(anyhow!("plugin '{}' has invalid URL: {}", plugin_id, url));
+            return Err(ClientError::new(
+                ErrorCode::PluginManifestInvalid,
+                format!("插件 '{}' URL 非法: {}", plugin_id, url),
+            )
+            .with_kv("plugin_id", plugin_id.to_string())
+            .with_kv("url", url.to_string())
+            .into());
         }
 
         let mut config = config_override.unwrap_or_default();
@@ -410,7 +443,13 @@ impl FlowCloudAIClient {
         self.ensure_plugin_kind(plugin_id, PluginKind::TTS)?;
         let url = self.plugin_registry.get_url(plugin_id)?;
         if !url.starts_with("http") {
-            return Err(anyhow!("plugin '{}' has invalid URL: {}", plugin_id, url));
+            return Err(ClientError::new(
+                ErrorCode::PluginManifestInvalid,
+                format!("插件 '{}' URL 非法: {}", plugin_id, url),
+            )
+            .with_kv("plugin_id", plugin_id.to_string())
+            .with_kv("url", url.to_string())
+            .into());
         }
 
         let mut config = config_override.unwrap_or_else(|| SessionConfig {
@@ -446,7 +485,13 @@ impl FlowCloudAIClient {
         self.ensure_plugin_kind(plugin_id, PluginKind::Image)?;
         let url = self.plugin_registry.get_url(plugin_id)?;
         if !url.starts_with("http") {
-            return Err(anyhow!("plugin '{}' has invalid URL: {}", plugin_id, url));
+            return Err(ClientError::new(
+                ErrorCode::PluginManifestInvalid,
+                format!("插件 '{}' URL 非法: {}", plugin_id, url),
+            )
+            .with_kv("plugin_id", plugin_id.to_string())
+            .with_kv("url", url.to_string())
+            .into());
         }
 
         let mut config = config_override.unwrap_or_else(|| SessionConfig {
