@@ -1,6 +1,7 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::Result;
 use futures_util::StreamExt;
 
+use crate::error::{ClientError, ErrorCode};
 use crate::http_poster::HttpPoster;
 use crate::image::types::*;
 use crate::llm::config::SessionConfig;
@@ -32,7 +33,10 @@ impl ImageSession {
 
     /// 完整调用：发送 ImageRequest，返回解析后的结果。
     pub async fn generate(&self, req: &ImageRequest) -> Result<ImageResult> {
-        let json = serde_json::to_value(req)?;
+        let json = serde_json::to_value(req).map_err(|e| {
+            ClientError::new(ErrorCode::ImageTaskInvalidParams, "图像请求序列化失败")
+                .with_kv("source", e.to_string())
+        })?;
         let mapped_json = self.pipeline.prepare_request_json(&json)?;
         log::debug!(
             "[image] mapped request bytes={}",
@@ -43,14 +47,22 @@ impl ImageSession {
 
         let normalized = self.pipeline.map_response(&raw_body)?;
 
-        let resp: ImageResponse =
-            serde_json::from_str(&normalized).context("failed to parse image response")?;
+        let resp: ImageResponse = serde_json::from_str(&normalized).map_err(|e| {
+            ClientError::new(ErrorCode::LlmResponseParseError, "图像响应解析失败")
+                .with_kv("source", e.to_string())
+        })?;
 
         // 检查错误
         if let Some(ref err) = resp.error {
             let code = err.code.as_deref().unwrap_or("unknown");
             let msg = err.message.as_deref().unwrap_or("unknown error");
-            return Err(anyhow!("Image generation error ({}): {}", code, msg));
+            return Err(ClientError::new(
+                ErrorCode::ImageTaskFailed,
+                format!("图像生成失败 ({}): {}", code, msg),
+            )
+            .with_kv("provider_code", code.to_string())
+            .with_kv("message", msg.to_string())
+            .into());
         }
 
         self.extract_result(resp)
@@ -87,37 +99,24 @@ impl ImageSession {
     // ── 内部方法 ──
 
     async fn post_and_collect(&self, json: serde_json::Value) -> Result<String> {
-        let stream = match self
+        let stream = self
             .client
             .post_json(&self.config.base_url, &self.config.api_key, json)
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                log::warn!("[image] post_json failed: {}", e);
-                return Err(anyhow!(
-                    "Image request failed [url={}]: {}",
-                    self.config.base_url,
-                    e
-                ));
-            }
-        };
+            .await?;
 
         tokio::pin!(stream);
 
         let mut body = String::new();
         while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(c) => body.push_str(&c),
-                Err(e) => {
-                    log::warn!("[image] stream chunk error: {}", e);
-                    return Err(anyhow!("Image request stream failed: {}", e));
-                }
-            }
+            body.push_str(&chunk?);
         }
 
         if body.is_empty() {
-            return Err(anyhow!("Image response empty"));
+            return Err(ClientError::new(
+                ErrorCode::ImageTaskEmptyResponse,
+                "图像响应为空",
+            )
+            .into());
         }
 
         log::debug!("[image] raw response bytes={}", body.len());
@@ -126,12 +125,16 @@ impl ImageSession {
     }
 
     fn extract_result(&self, resp: ImageResponse) -> Result<ImageResult> {
-        let data_list = resp
-            .data
-            .ok_or_else(|| anyhow!("Image response missing data"))?;
+        let data_list = resp.data.ok_or_else(|| {
+            ClientError::new(ErrorCode::ImageTaskEmptyResponse, "图像响应缺少 data")
+        })?;
 
         if data_list.is_empty() {
-            return Err(anyhow!("Image response returned no images"));
+            return Err(ClientError::new(
+                ErrorCode::ImageTaskEmptyResponse,
+                "图像响应未返回任何图片",
+            )
+            .into());
         }
 
         let mut images = Vec::with_capacity(data_list.len());
@@ -142,7 +145,13 @@ impl ImageSession {
                     use base64::Engine;
                     base64::engine::general_purpose::STANDARD
                         .decode(b64)
-                        .context("failed to decode b64_json image")?
+                        .map_err(|e| {
+                            ClientError::new(
+                                ErrorCode::ImageTaskFailed,
+                                "解码 b64_json 图片失败",
+                            )
+                            .with_kv("source", e.to_string())
+                        })?
                 } else {
                     Vec::new()
                 }

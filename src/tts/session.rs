@@ -1,6 +1,7 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::Result;
 use futures_util::StreamExt;
 
+use crate::error::{ClientError, ErrorCode};
 use crate::http_poster::HttpPoster;
 use crate::llm::config::SessionConfig;
 use crate::plugin::pipeline::ApiPipeline;
@@ -36,7 +37,10 @@ impl TTSSession {
     /// 插件通过 pipeline 自动做请求/响应映射。
     pub async fn synthesize(&self, req: &TTSRequest) -> Result<TTSResult> {
         // 序列化 → 插件映射 → 反序列化为 Value
-        let json = serde_json::to_value(req)?;
+        let json = serde_json::to_value(req).map_err(|e| {
+            ClientError::new(ErrorCode::LlmRequestBadPayload, "TTS 请求序列化失败")
+                .with_kv("source", e.to_string())
+        })?;
         let mapped_json = self.pipeline.prepare_request_json(&json)?;
 
         // 发送请求，读取完整响应（非流式）
@@ -46,8 +50,10 @@ impl TTSSession {
         let normalized = self.pipeline.map_response(&raw_body)?;
 
         // 解析响应
-        let resp: TTSResponse =
-            serde_json::from_str(&normalized).context("failed to parse TTS response")?;
+        let resp: TTSResponse = serde_json::from_str(&normalized).map_err(|e| {
+            ClientError::new(ErrorCode::LlmResponseParseError, "TTS 响应解析失败")
+                .with_kv("source", e.to_string())
+        })?;
 
         log::debug!(
             "[tts] response normalized: raw_bytes={}, normalized_bytes={}, has_data={}, trace_id={:?}, status_code={:?}",
@@ -62,7 +68,13 @@ impl TTSSession {
         if let Some(ref base) = resp.base_resp {
             if base.status_code != 0 {
                 let msg = base.status_msg.as_deref().unwrap_or("unknown error");
-                return Err(anyhow!("TTS error ({}): {}", base.status_code, msg));
+                return Err(ClientError::new(
+                    ErrorCode::TtsTaskFailed,
+                    format!("TTS 错误 ({}): {}", base.status_code, msg),
+                )
+                .with_kv("status_code", base.status_code)
+                .with_kv("message", msg.to_string())
+                .into());
             }
         }
 
@@ -83,8 +95,7 @@ impl TTSSession {
         let stream = self
             .client
             .post_json(&self.config.base_url, &self.config.api_key, json)
-            .await
-            .context("TTS request failed")?;
+            .await?;
 
         tokio::pin!(stream);
 
@@ -94,7 +105,7 @@ impl TTSSession {
         }
 
         if body.is_empty() {
-            return Err(anyhow!("TTS response empty"));
+            return Err(ClientError::new(ErrorCode::TtsResponseEmpty, "TTS 响应为空").into());
         }
 
         Ok(body)
@@ -102,16 +113,19 @@ impl TTSSession {
 
     /// 从响应中提取音频数据。
     fn extract_result(&self, resp: TTSResponse) -> Result<TTSResult> {
-        let data = resp
-            .data
-            .ok_or_else(|| anyhow!("TTS response missing audio data"))?;
+        let data = resp.data.ok_or_else(|| {
+            ClientError::new(ErrorCode::TtsResponseEmpty, "TTS 响应缺少 audio data")
+        })?;
 
         let extra = resp.extra_info.as_ref();
 
         // 优先用 hex 数据
         let audio = if let Some(ref hex_str) = data.audio {
             if !hex_str.is_empty() {
-                hex::decode(hex_str).context("failed to decode hex audio")?
+                hex::decode(hex_str).map_err(|e| {
+                    ClientError::new(ErrorCode::AudioDecodeFailed, "解码 hex 音频失败")
+                        .with_kv("source", e.to_string())
+                })?
             } else {
                 Vec::new()
             }
@@ -121,7 +135,11 @@ impl TTSSession {
 
         // hex 为空但有 URL → 标记为 url 模式，调用方自行下载
         if audio.is_empty() && data.url.as_ref().map_or(true, |u| u.is_empty()) {
-            return Err(anyhow!("empty audio data and no URL provided"));
+            return Err(ClientError::new(
+                ErrorCode::TtsResponseEmpty,
+                "音频数据为空且未提供 URL",
+            )
+            .into());
         }
 
         Ok(TTSResult {
