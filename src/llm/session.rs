@@ -1,3 +1,4 @@
+use crate::error::{ClientError, ErrorCode};
 use crate::http_poster::HttpPoster;
 use crate::llm::accumulator::ToolCallAccumulator;
 use crate::llm::config::SessionConfig;
@@ -12,7 +13,7 @@ use crate::orchestrator::{AssembledTurn, Orchestrate, TaskContext};
 use crate::plugin::pipeline::ApiPipeline;
 use crate::plugin::types::ThinkingEffort;
 use crate::tool::registry::ToolRegistry;
-use anyhow::{Context, Result, anyhow};
+use anyhow::Result;
 use futures_util::StreamExt;
 use futures_util::future::{self, Either};
 use serde_json::Value;
@@ -335,7 +336,13 @@ impl LLMSession {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .context("创建 session runtime 失败")?;
+            .map_err(|e| {
+                ClientError::new(
+                    ErrorCode::LlmSessionCreateFailed,
+                    "创建 session runtime 失败",
+                )
+                .with_kv("source", e.to_string())
+            })?;
 
         std::thread::spawn(move || {
             rt.block_on(async move {
@@ -375,7 +382,13 @@ impl LLMSession {
         match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .context("创建 session runtime 失败")
+            .map_err(|e| {
+                ClientError::new(
+                    ErrorCode::LlmSessionCreateFailed,
+                    "创建 session runtime 失败",
+                )
+                .with_kv("source", e.to_string())
+            })
         {
             Ok(rt) => {
                 std::thread::spawn(move || {
@@ -434,7 +447,13 @@ impl LLMSession {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .context("创建 session runtime 失败")?;
+            .map_err(|e| {
+                ClientError::new(
+                    ErrorCode::LlmSessionCreateFailed,
+                    "创建 session runtime 失败",
+                )
+                .with_kv("source", e.to_string())
+            })?;
 
         std::thread::spawn(move || {
             rt.block_on(async move {
@@ -485,7 +504,13 @@ impl LLMSession {
         match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .context("创建 session runtime 失败")
+            .map_err(|e| {
+                ClientError::new(
+                    ErrorCode::LlmSessionCreateFailed,
+                    "创建 session runtime 失败",
+                )
+                .with_kv("source", e.to_string())
+            })
         {
             Ok(rt) => {
                 std::thread::spawn(move || {
@@ -640,7 +665,14 @@ impl LLMSession {
                     .write()
                     .await
                     .checkout(node_id)
-                    .map_err(|e| anyhow!(e))?;
+                    .map_err(|e| {
+                        ClientError::new(
+                            ErrorCode::ValidationFormatError,
+                            format!("会话树 checkout 失败: {}", e),
+                        )
+                        .with_kv("node_id", node_id)
+                        .with_kv("source", e.to_string())
+                    })?;
                 event_tx
                     .send(SessionEvent::BranchChanged { node_id })
                     .await?;
@@ -1037,7 +1069,7 @@ impl LLMSession {
                 .client
                 .post_json(&self.config.base_url, &self.config.api_key, json);
             let stream = tokio::select! {
-                result = post_fut => result.context("创建请求失败")?,
+                result = post_fut => result?,
                 _ = cancel.cancelled() => {
                     return Ok(cancelled_turn_output(
                         String::new(),
@@ -1059,7 +1091,9 @@ impl LLMSession {
             );
             tokio::select! {
                 raw_line = stream.next() => {
-                    raw_line.ok_or_else(|| anyhow!("response empty"))??
+                    raw_line.ok_or_else(|| {
+                        ClientError::new(ErrorCode::LlmResponseEmpty, "LLM 响应为空")
+                    })??
                 }
                 _ = cancel.cancelled() => {
                     return Ok(cancelled_turn_output(
@@ -1087,11 +1121,13 @@ impl LLMSession {
         }
         let normalized = self.normalize_response(&raw_line)?;
 
-        let res: ChatResponse = serde_json::from_str(&normalized)?;
-        let choice = res
-            .choices
-            .first()
-            .ok_or_else(|| anyhow!("empty choices"))?;
+        let res: ChatResponse = serde_json::from_str(&normalized).map_err(|e| {
+            ClientError::new(ErrorCode::LlmResponseParseError, "LLM 响应 JSON 解析失败")
+                .with_kv("source", e.to_string())
+        })?;
+        let choice = res.choices.first().ok_or_else(|| {
+            ClientError::new(ErrorCode::LlmResponseParseError, "LLM 响应 choices 为空")
+        })?;
 
         let reasoning = choice.message.reasoning_content.clone().unwrap_or_default();
         let content = choice.message.content.clone().unwrap_or_default();
@@ -1186,7 +1222,7 @@ impl LLMSession {
             .client
             .post_json(&self.config.base_url, &self.config.api_key, json);
         let stream = tokio::select! {
-            result = post_fut => result.context("创建流式请求失败")?,
+            result = post_fut => result?,
             _ = cancel.cancelled() => {
                 return Ok(cancelled_turn_output(
                     String::new(),
@@ -1247,9 +1283,7 @@ impl LLMSession {
             }
 
             // acquire → map → release，每行独立借出，不跨 await
-            let normalized = self
-                .normalize_stream_line(&line)
-                .context("流式插件映射失败")?;
+            let normalized = self.normalize_stream_line(&line)?;
 
             let events = decoder.decode(&normalized);
 
@@ -1312,7 +1346,14 @@ impl LLMSession {
                             TurnStatus::Ok => "stop".to_string(),
                             TurnStatus::Cancelled => "cancelled".to_string(),
                             TurnStatus::Interrupted => "interrupted".to_string(),
-                            TurnStatus::Error(e) => return Err(anyhow!(e.clone())),
+                            TurnStatus::Error(e) => {
+                                return Err(ClientError::new(
+                                    ErrorCode::LlmStreamProtocolError,
+                                    format!("流式 TurnEnd 报告错误: {}", e),
+                                )
+                                .with_kv("source", e.clone())
+                                .into());
+                            }
                         });
 
                         // Qwen 的 OpenAI 兼容流式响应会先发送 finish_reason=stop，
