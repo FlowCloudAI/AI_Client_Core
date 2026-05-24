@@ -1,8 +1,9 @@
 // plugin/pipeline.rs——API 管道
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use serde_json::Value;
 use std::sync::Arc;
 
+use crate::error::{ClientError, ErrorCode};
 use crate::plugin::mapper::{ApiMapper, PassthroughMapper};
 use crate::plugin::registry::PluginRegistry;
 use crate::plugin::types::{PluginKind, ThinkingEffort};
@@ -108,17 +109,22 @@ impl ApiPipeline {
 
     /// 校验插件类型。
     pub fn ensure_plugin_kind(&self, plugin_id: &str, expected: PluginKind) -> Result<()> {
-        let meta = self
-            .registry
-            .try_get_meta(plugin_id)?
-            .ok_or_else(|| anyhow!("plugin '{}' not found", plugin_id))?;
+        let meta = self.registry.try_get_meta(plugin_id)?.ok_or_else(|| {
+            ClientError::new(
+                ErrorCode::PluginNotFound,
+                format!("插件 '{}' 不存在", plugin_id),
+            )
+            .with_kv("plugin_id", plugin_id.to_string())
+        })?;
         if meta.kind != expected {
-            return Err(anyhow!(
-                "plugin '{}' kind mismatch: expected {:?}, got {:?}",
-                plugin_id,
-                expected,
-                meta.kind
-            ));
+            return Err(ClientError::new(
+                ErrorCode::PluginKindMismatch,
+                format!("插件 '{}' 类型不匹配", plugin_id),
+            )
+            .with_kv("plugin_id", plugin_id.to_string())
+            .with_kv("expected_kind", format!("{:?}", expected))
+            .with_kv("actual_kind", format!("{:?}", meta.kind))
+            .into());
         }
         Ok(())
     }
@@ -132,10 +138,13 @@ impl ApiPipeline {
         let Some(plugin_id) = &self.plugin_id else {
             return Ok(());
         };
-        let meta = self
-            .registry
-            .try_get_meta(plugin_id)?
-            .ok_or_else(|| anyhow!("plugin '{}' not found", plugin_id))?;
+        let meta = self.registry.try_get_meta(plugin_id)?.ok_or_else(|| {
+            ClientError::new(
+                ErrorCode::PluginNotFound,
+                format!("插件 '{}' 不存在", plugin_id),
+            )
+            .with_kv("plugin_id", plugin_id.to_string())
+        })?;
         meta.validate_llm_request(model, thinking_effort)
     }
 
@@ -149,7 +158,12 @@ impl ApiPipeline {
             Some(_) if self.mode == PipelineMode::AllowPassthrough => {
                 Ok(Box::new(PassthroughMapper))
             }
-            Some(id) => Err(anyhow!("plugin '{}' is selected but not loaded", id)),
+            Some(id) => Err(ClientError::new(
+                ErrorCode::PluginNotLoaded,
+                format!("已选择插件 '{}' 但未加载", id),
+            )
+            .with_kv("plugin_id", id.clone())
+            .into()),
         }
     }
 
@@ -170,9 +184,16 @@ impl ApiPipeline {
 
     /// 便捷方法：序列化 → map → 反序列化
     pub fn prepare_request_json(&self, json: &Value) -> Result<Value> {
-        let raw = serde_json::to_string(json)?;
+        let raw = serde_json::to_string(json).map_err(|e| {
+            ClientError::new(ErrorCode::LlmRequestBadPayload, "请求 JSON 序列化失败")
+                .with_kv("source", e.to_string())
+        })?;
         let mapped = self.map_request(&raw)?;
-        Ok(serde_json::from_str(&mapped)?)
+        serde_json::from_str(&mapped).map_err(|e| {
+            ClientError::new(ErrorCode::LlmRequestBadPayload, "映射后请求 JSON 反序列化失败")
+                .with_kv("source", e.to_string())
+                .into()
+        })
     }
 
     fn validate_plugin_available(
@@ -186,7 +207,12 @@ impl ApiPipeline {
         if registry.try_is_loaded(plugin_id)? {
             Ok(())
         } else {
-            Err(anyhow!("plugin '{}' is selected but not loaded", plugin_id))
+            Err(ClientError::new(
+                ErrorCode::PluginNotLoaded,
+                format!("已选择插件 '{}' 但未加载", plugin_id),
+            )
+            .with_kv("plugin_id", plugin_id.to_string())
+            .into())
         }
     }
 }
@@ -211,7 +237,7 @@ mod tests {
 
         let err = pipeline.map_request("{}").unwrap_err();
         assert!(
-            err.to_string().contains("selected but not loaded"),
+            err.to_string().contains("PLUGIN_NOT_LOADED"),
             "unexpected error: {err:#}"
         );
     }
