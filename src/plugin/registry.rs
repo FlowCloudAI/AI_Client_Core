@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use wasmtime::{Config, Engine};
 
+use crate::error::{ClientError, ErrorCode};
 use crate::plugin::host::HostState;
 use crate::plugin::pool::{MapperPool, PooledMapper};
 use crate::plugin::types::{PluginKind, PluginMeta};
@@ -55,26 +56,34 @@ impl PluginRegistry {
     // ── 构建 ──
 
     fn state(&self) -> Result<MutexGuard<'_, RegistryState>> {
-        self.state
-            .lock()
-            .map_err(|e| anyhow!("plugin registry state poisoned: {}", e))
+        self.state.lock().map_err(|e| {
+            ClientError::new(ErrorCode::CoreClientInternalError, "插件注册表状态锁中毒")
+                .with_kv("source", e.to_string())
+                .into()
+        })
     }
 
     fn ref_counts_guard(&self) -> Result<MutexGuard<'_, HashMap<String, usize>>> {
-        self.ref_counts
-            .lock()
-            .map_err(|e| anyhow!("plugin registry ref_counts poisoned: {}", e))
+        self.ref_counts.lock().map_err(|e| {
+            ClientError::new(ErrorCode::CoreClientInternalError, "插件引用计数锁中毒")
+                .with_kv("source", e.to_string())
+                .into()
+        })
     }
 
     /// 空 registry，无插件。仅未指定插件的管道会走 passthrough。
     pub fn empty() -> Result<Self> {
         let mut config = Config::new();
         config.wasm_component_model(true);
-        let engine = Engine::new(&config)
-            .map_err(|e| anyhow!("failed to create WebAssembly engine: {}", e))?;
+        let engine = Engine::new(&config).map_err(|e| {
+            ClientError::new(ErrorCode::CoreClientInitFailed, "创建 WebAssembly 引擎失败")
+                .with_kv("source", e.to_string())
+        })?;
         let mut linker = Linker::new(&engine);
-        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
-            .map_err(|e| anyhow!("failed to add WASI to linker: {}", e))?;
+        wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|e| {
+            ClientError::new(ErrorCode::CoreClientInitFailed, "向 linker 注册 WASI 失败")
+                .with_kv("source", e.to_string())
+        })?;
         Ok(Self {
             state: Mutex::new(RegistryState {
                 plugins: HashMap::new(),
@@ -102,19 +111,34 @@ impl PluginRegistry {
 
         for (id, meta) in &plugin_metas {
             let wasm_bytes = {
-                let file = std::fs::File::open(&meta.fcplug_path)
-                    .map_err(|e| anyhow!("cannot open plugin '{}': {}", id, e))?;
-                let mut archive = zip::ZipArchive::new(file)
-                    .map_err(|e| anyhow!("cannot read zip for plugin '{}': {}", id, e))?;
-                let mut entry = archive.by_name("plugin.wasm")
-                    .map_err(|_| anyhow!("plugin.wasm not found in '{}'", id))?;
+                let file = std::fs::File::open(&meta.fcplug_path).map_err(|e| {
+                    ClientError::new(ErrorCode::FsOpenFailed, "无法打开插件包")
+                        .with_kv("plugin_id", id.clone())
+                        .with_kv("source", e.to_string())
+                })?;
+                let mut archive = zip::ZipArchive::new(file).map_err(|e| {
+                    ClientError::new(ErrorCode::PluginLoadFailed, "插件包不是合法 ZIP")
+                        .with_kv("plugin_id", id.clone())
+                        .with_kv("source", e.to_string())
+                })?;
+                let mut entry = archive.by_name("plugin.wasm").map_err(|_| {
+                    ClientError::new(ErrorCode::PluginLoadFailed, "插件包缺少 plugin.wasm")
+                        .with_kv("plugin_id", id.clone())
+                })?;
                 let mut buf = Vec::new();
-                std::io::Read::read_to_end(&mut entry, &mut buf)?;
+                std::io::Read::read_to_end(&mut entry, &mut buf).map_err(|e| {
+                    ClientError::new(ErrorCode::PluginLoadFailed, "读取 plugin.wasm 失败")
+                        .with_kv("plugin_id", id.clone())
+                        .with_kv("source", e.to_string())
+                })?;
                 buf
             };
 
-            let module = Component::from_binary(&engine, &wasm_bytes)
-                .map_err(|e| anyhow!("failed to compile wasm for plugin '{}': {}", id, e))?;
+            let module = Component::from_binary(&engine, &wasm_bytes).map_err(|e| {
+                ClientError::new(ErrorCode::PluginLoadFailed, "Wasm 组件编译失败")
+                    .with_kv("plugin_id", id.clone())
+                    .with_kv("source", e.to_string())
+            })?;
             modules.insert(id.clone(), module);
         }
 
@@ -146,7 +170,13 @@ impl PluginRegistry {
         let module = state
             .modules
             .get(id)
-            .ok_or_else(|| anyhow!("plugin '{}' not found in registry", id))?
+            .ok_or_else(|| {
+                ClientError::new(
+                    ErrorCode::PluginNotFound,
+                    format!("插件 '{}' 不在注册表中", id),
+                )
+                .with_kv("plugin_id", id.to_string())
+            })?
             .clone();
 
         let pool = Arc::new(MapperPool::new(
@@ -172,10 +202,13 @@ impl PluginRegistry {
 
         if let Some(&count) = ref_counts.get(id) {
             if count > 0 {
-                return Err(anyhow!(
-                    "cannot unload plugin '{}': still in use by {} session(s)",
-                    id, count
-                ));
+                return Err(ClientError::new(
+                    ErrorCode::PluginUnloadForbidden,
+                    format!("插件 '{}' 仍被 {} 个会话引用，无法卸载", id, count),
+                )
+                .with_kv("plugin_id", id.to_string())
+                .with_kv("ref_count", count)
+                .into());
             }
         }
         drop(ref_counts);
@@ -215,7 +248,13 @@ impl PluginRegistry {
         let pool = state
             .pools
             .get(plugin_id)
-            .ok_or_else(|| anyhow!("plugin '{}' not loaded", plugin_id))?
+            .ok_or_else(|| {
+                ClientError::new(
+                    ErrorCode::PluginNotLoaded,
+                    format!("插件 '{}' 未加载", plugin_id),
+                )
+                .with_kv("plugin_id", plugin_id.to_string())
+            })?
             .clone();
         drop(state);
         pool.acquire()
@@ -230,7 +269,14 @@ impl PluginRegistry {
             .plugins
             .get(plugin_id)
             .map(|meta| meta.url.clone())
-            .ok_or_else(|| anyhow!("plugin '{}' not found", plugin_id))
+            .ok_or_else(|| {
+                ClientError::new(
+                    ErrorCode::PluginNotFound,
+                    format!("插件 '{}' 不存在", plugin_id),
+                )
+                .with_kv("plugin_id", plugin_id.to_string())
+                .into()
+            })
     }
 
     /// 获取插件元数据。
@@ -357,12 +403,20 @@ impl PluginRegistry {
         let mut state = self.state()?;
         // 检查 ID 唯一性
         if state.plugins.contains_key(&id) {
-            return Err(anyhow!("plugin '{}' already exists", id));
+            return Err(ClientError::new(
+                ErrorCode::PluginAlreadyExists,
+                format!("插件 '{}' 已存在", id),
+            )
+            .with_kv("plugin_id", id.clone())
+            .into());
         }
 
         // 编译 wasm 模块
-        let module = Component::from_binary(&self.engine, wasm_bytes)
-            .map_err(|e| anyhow!("failed to compile wasm for plugin '{}': {}", id, e))?;
+        let module = Component::from_binary(&self.engine, wasm_bytes).map_err(|e| {
+            ClientError::new(ErrorCode::PluginLoadFailed, "Wasm 组件编译失败")
+                .with_kv("plugin_id", id.clone())
+                .with_kv("source", e.to_string())
+        })?;
 
         // 插入元数据和模块
         state.plugins.insert(id.clone(), meta);
