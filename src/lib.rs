@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod client;
+pub mod error;
 pub mod http_poster;
 pub mod image;
 pub mod llm;
@@ -13,6 +14,7 @@ pub const SUPPORTED_AGREEMENT_VERSION: u32 = 1;
 
 pub use audio::{AudioDecoder, AudioSource};
 pub use client::FlowCloudAIClient;
+pub use error::{ClientError, ErrorCode};
 pub use image::ImageSession;
 pub use llm::handle::SessionHandle;
 pub use llm::session::LLMSession;
