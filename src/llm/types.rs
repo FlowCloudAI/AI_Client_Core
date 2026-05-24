@@ -1,3 +1,4 @@
+use crate::error::ClientError;
 use crate::plugin::types::ThinkingEffort;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -353,7 +354,7 @@ pub enum TurnStatus {
     Ok,
     Cancelled,
     Interrupted,
-    Error(String),
+    Error(ClientError),
 }
 
 #[allow(dead_code)]
@@ -427,5 +428,5 @@ pub enum SessionEvent {
     BranchChanged {
         node_id: u64,
     },
-    Error(String),
+    Error(ClientError),
 }

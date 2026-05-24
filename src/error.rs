@@ -199,6 +199,17 @@ impl ClientError {
     pub fn from_anyhow(err: &anyhow::Error) -> Option<&ClientError> {
         err.downcast_ref::<ClientError>()
     }
+
+    /// 将任意 `anyhow::Error` 还原为 `ClientError`：
+    /// 若内层已是 `ClientError` 直接 clone，否则用
+    /// `CoreClientInternalError` 包装 `Display` 文本。
+    pub fn from_anyhow_owned(err: anyhow::Error) -> Self {
+        if let Some(ce) = err.downcast_ref::<ClientError>() {
+            ce.clone()
+        } else {
+            Self::new(ErrorCode::CoreClientInternalError, err.to_string())
+        }
+    }
 }
 
 impl fmt::Display for ClientError {

@@ -32,7 +32,7 @@ pub struct PluginLoadReport {
 #[derive(Debug, Clone)]
 pub struct PluginLoadError {
     pub path: PathBuf,
-    pub reason: String,
+    pub error: ClientError,
 }
 
 // ── 初始化 ──
@@ -82,10 +82,10 @@ impl PluginManager {
         })? {
             match PluginScanner::read_plugin_info(&fcplug) {
                 Ok(manifest) => {
-                    if let Err(reason) = Self::validate_plugin(&manifest, &plugins) {
+                    if let Err(err) = Self::validate_plugin(&manifest, &plugins) {
                         report.skipped.push(PluginLoadError {
                             path: fcplug,
-                            reason,
+                            error: err,
                         });
                         continue;
                     }
@@ -99,7 +99,7 @@ impl PluginManager {
                         Err(e) => {
                             report.skipped.push(PluginLoadError {
                                 path: fcplug,
-                                reason: format!("failed to build meta: {}", e),
+                                error: ClientError::from_anyhow_owned(e),
                             });
                         }
                     }
@@ -107,7 +107,7 @@ impl PluginManager {
                 Err(e) => {
                     report.skipped.push(PluginLoadError {
                         path: fcplug,
-                        reason: format!("invalid plugin: {}", e),
+                        error: ClientError::from_anyhow_owned(e),
                     });
                 }
             }
@@ -119,16 +119,21 @@ impl PluginManager {
     fn validate_plugin(
         manifest: &PluginManifest,
         existing: &HashMap<String, PluginMeta>,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<(), ClientError> {
         let info = &manifest.meta;
 
         if existing.contains_key(&info.id) {
-            return Err(format!("duplicate plugin ID: {}", info.id));
+            return Err(ClientError::new(
+                ErrorCode::PluginAlreadyExists,
+                format!("插件 ID 重复: {}", info.id),
+            )
+            .with_kv("plugin_id", info.id.clone()));
         }
 
         Ok(())
     }
 }
+
 
 // ── 插件管理 ──
 

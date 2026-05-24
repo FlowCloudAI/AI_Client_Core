@@ -350,7 +350,9 @@ impl LLMSession {
                     .drive(input_rx, ctrl_rx, Some(ctx_rx), cancel_rx, event_tx.clone())
                     .await
                 {
-                    let _ = event_tx.send(SessionEvent::Error(format!("{:#}", e))).await;
+                    let _ = event_tx
+                        .send(SessionEvent::Error(ClientError::from_anyhow_owned(e)))
+                        .await;
                 }
             });
         });
@@ -397,13 +399,15 @@ impl LLMSession {
                             .drive(input_rx, ctrl_rx, Some(ctx_rx), cancel_rx, event_tx.clone())
                             .await
                         {
-                            let _ = event_tx.send(SessionEvent::Error(format!("{:#}", e))).await;
+                            let _ = event_tx
+                        .send(SessionEvent::Error(ClientError::from_anyhow_owned(e)))
+                        .await;
                         }
                     });
                 });
             }
             Err(e) => {
-                let _ = event_tx.try_send(SessionEvent::Error(format!("{:#}", e)));
+                let _ = event_tx.try_send(SessionEvent::Error(e));
             }
         }
 
@@ -470,7 +474,9 @@ impl LLMSession {
                     .drive(input_rx, ctrl_rx, Some(ctx_rx), cancel_rx, event_tx.clone())
                     .await
                 {
-                    let _ = event_tx.send(SessionEvent::Error(format!("{:#}", e))).await;
+                    let _ = event_tx
+                        .send(SessionEvent::Error(ClientError::from_anyhow_owned(e)))
+                        .await;
                 }
             });
         });
@@ -527,13 +533,15 @@ impl LLMSession {
                             .drive(input_rx, ctrl_rx, Some(ctx_rx), cancel_rx, event_tx.clone())
                             .await
                         {
-                            let _ = event_tx.send(SessionEvent::Error(format!("{:#}", e))).await;
+                            let _ = event_tx
+                        .send(SessionEvent::Error(ClientError::from_anyhow_owned(e)))
+                        .await;
                         }
                     });
                 });
             }
             Err(e) => {
-                let _ = event_tx.try_send(SessionEvent::Error(format!("{:#}", e)));
+                let _ = event_tx.try_send(SessionEvent::Error(e));
             }
         }
 
@@ -894,10 +902,17 @@ impl LLMSession {
                 if let Some(calls) = tool_calls {
                     tool_rounds += 1;
                     if tool_rounds > self.config.max_tool_rounds {
-                        let status = TurnStatus::Error(format!(
-                            "工具调用超过最大连续轮数限制: {}",
-                            self.config.max_tool_rounds
-                        ));
+                        let status = TurnStatus::Error(
+                            ClientError::new(
+                                ErrorCode::LlmToolCallFailed,
+                                format!(
+                                    "工具调用超过最大连续轮数限制: {}",
+                                    self.config.max_tool_rounds
+                                ),
+                            )
+                            .with_kv("max_tool_rounds", self.config.max_tool_rounds as u64)
+                            .with_kv("tool_rounds", tool_rounds as u64),
+                        );
                         event_tx
                             .send(SessionEvent::TurnEnd {
                                 status,
@@ -1346,14 +1361,7 @@ impl LLMSession {
                             TurnStatus::Ok => "stop".to_string(),
                             TurnStatus::Cancelled => "cancelled".to_string(),
                             TurnStatus::Interrupted => "interrupted".to_string(),
-                            TurnStatus::Error(e) => {
-                                return Err(ClientError::new(
-                                    ErrorCode::LlmStreamProtocolError,
-                                    format!("流式 TurnEnd 报告错误: {}", e),
-                                )
-                                .with_kv("source", e.clone())
-                                .into());
-                            }
+                            TurnStatus::Error(e) => return Err(e.clone().into()),
                         });
 
                         // Qwen 的 OpenAI 兼容流式响应会先发送 finish_reason=stop，
