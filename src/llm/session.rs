@@ -322,7 +322,7 @@ impl LLMSession {
         let (event_tx, event_rx) = mpsc::channel::<SessionEvent>(self.config.event_buffer);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<CtrlMsg>(8);
         let (cancel_tx, cancel_rx) = watch::channel::<u64>(0);
-        let (ctx_tx, ctx_rx) = mpsc::channel::<TaskContext>(16);
+        let (ctx_tx, ctx_rx) = watch::channel::<TaskContext>(TaskContext::default());
 
         let handle = SessionHandle {
             inner: Arc::clone(&self.conversation),
@@ -370,7 +370,7 @@ impl LLMSession {
         let (event_tx, event_rx) = mpsc::channel::<SessionEvent>(self.config.event_buffer);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<CtrlMsg>(8);
         let (cancel_tx, cancel_rx) = watch::channel::<u64>(0);
-        let (ctx_tx, ctx_rx) = mpsc::channel::<TaskContext>(16);
+        let (ctx_tx, ctx_rx) = watch::channel::<TaskContext>(TaskContext::default());
 
         let handle = SessionHandle {
             inner: Arc::clone(&self.conversation),
@@ -419,7 +419,7 @@ impl LLMSession {
     /// 与 `run()` 的区别：
     /// - 调用方自己持有 `mpsc::Sender<TaskContext>`，可从任意异步上下文推送
     /// - `SessionHandle::set_task_context` 依然可用（内部合并两路来源）
-    /// - 两路上下文均在每轮 assemble 前以 `try_recv` 排空，取最新值
+    /// - 两路上下文都会覆盖内部最新值，每轮 assemble 前只读取最新上下文
     ///
     /// # 示例
     /// ```ignore
@@ -436,7 +436,7 @@ impl LLMSession {
         let (event_tx, event_rx) = mpsc::channel::<SessionEvent>(self.config.event_buffer);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<CtrlMsg>(8);
         let (cancel_tx, cancel_rx) = watch::channel::<u64>(0);
-        let (ctx_tx, ctx_rx) = mpsc::channel::<TaskContext>(16);
+        let (ctx_tx, ctx_rx) = watch::channel::<TaskContext>(TaskContext::default());
         let ctx_forward_tx = ctx_tx.clone();
 
         let handle = SessionHandle {
@@ -461,10 +461,10 @@ impl LLMSession {
 
         std::thread::spawn(move || {
             rt.block_on(async move {
-                // 将外部 ctx_rx 转发到内部 channel，与 handle.set_task_context 合并为同一路输入。
+                // 将外部 ctx_rx 转发到内部 latest-only 通道，与 handle.set_task_context 合并为同一路输入。
                 tokio::spawn(async move {
                     while let Some(ctx) = ext_ctx_rx.recv().await {
-                        if ctx_forward_tx.send(ctx).await.is_err() {
+                        if ctx_forward_tx.send(ctx).is_err() {
                             break;
                         }
                     }
@@ -495,7 +495,7 @@ impl LLMSession {
         let (event_tx, event_rx) = mpsc::channel::<SessionEvent>(self.config.event_buffer);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<CtrlMsg>(8);
         let (cancel_tx, cancel_rx) = watch::channel::<u64>(0);
-        let (ctx_tx, ctx_rx) = mpsc::channel::<TaskContext>(16);
+        let (ctx_tx, ctx_rx) = watch::channel::<TaskContext>(TaskContext::default());
         let ctx_forward_tx = ctx_tx.clone();
 
         let handle = SessionHandle {
@@ -523,7 +523,7 @@ impl LLMSession {
                     rt.block_on(async move {
                         tokio::spawn(async move {
                             while let Some(ctx) = ext_ctx_rx.recv().await {
-                                if ctx_forward_tx.send(ctx).await.is_err() {
+                                if ctx_forward_tx.send(ctx).is_err() {
                                     break;
                                 }
                             }
@@ -693,7 +693,7 @@ impl LLMSession {
         mut self,
         mut input_rx: mpsc::Receiver<String>,
         mut ctrl_rx: mpsc::Receiver<CtrlMsg>,
-        mut ctx_rx: Option<mpsc::Receiver<TaskContext>>,
+        mut ctx_rx: Option<watch::Receiver<TaskContext>>,
         cancel_rx: watch::Receiver<u64>,
         event_tx: mpsc::Sender<SessionEvent>,
     ) -> Result<()> {
@@ -749,18 +749,13 @@ impl LLMSession {
                 }
             }
 
-            // 每轮开始前尝试更新 context（非阻塞）
+            // 每轮开始前尝试更新 context（非阻塞）。上下文只保留最新值，避免等待用户输入时积压。
             if let Some(ref mut rx) = ctx_rx {
-                let mut drained_context_count = 0usize;
-                while let Ok(ctx) = rx.try_recv() {
-                    current_ctx = ctx;
-                    drained_context_count += 1;
-                }
-                if drained_context_count > 0 {
+                if rx.has_changed().unwrap_or(false) {
+                    current_ctx = rx.borrow_and_update().clone();
                     log::info!(
-                        "[client:drive][context_drained] next_turn_id={} count={} project_id={:?} task_type={} attributes={} flags={}",
+                        "[client:drive][context_updated] next_turn_id={} project_id={:?} task_type={} attributes={} flags={}",
                         self.turn_id + 1,
-                        drained_context_count,
                         current_ctx.project_id.as_deref(),
                         current_ctx.task_type,
                         current_ctx.attributes.len(),
@@ -1512,6 +1507,7 @@ mod tests {
     use crate::llm::types::{
         Message, SessionEvent, ToolCall, ToolFunctionArg, ToolFunctionCall, TurnStatus, Usage,
     };
+    use crate::orchestrator::TaskContext;
     use crate::plugin::pipeline::ApiPipeline;
     use crate::plugin::registry::PluginRegistry;
     use crate::tool::registry::ToolRegistry;
@@ -1849,6 +1845,25 @@ mod tests {
 
         let (status, _) = wait_for_turn_end(&mut events).await;
         assert!(matches!(status, TurnStatus::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn set_task_context_keeps_latest_without_waiting_for_drive() {
+        let session = new_test_session();
+        let (input_tx, input_rx) = mpsc::channel(1);
+        let (_events, handle) = session.try_run(input_rx).unwrap();
+
+        for index in 0..64 {
+            let mut ctx = TaskContext::default();
+            ctx.attributes
+                .insert("index".to_string(), index.to_string());
+            tokio::time::timeout(Duration::from_millis(100), handle.set_task_context(ctx))
+                .await
+                .expect("上下文更新不应等待会话开始下一轮")
+                .unwrap();
+        }
+
+        drop(input_tx);
     }
 
     #[derive(Clone)]

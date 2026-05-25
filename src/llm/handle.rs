@@ -22,7 +22,7 @@ pub struct SessionHandle {
     pub(crate) system_messages: Arc<Vec<Message>>,
     pub(crate) ctrl_tx: mpsc::Sender<CtrlMsg>,
     pub(crate) cancel_tx: watch::Sender<u64>,
-    pub(crate) ctx_tx: mpsc::Sender<TaskContext>,
+    pub(crate) ctx_tx: watch::Sender<TaskContext>,
 }
 
 impl SessionHandle {
@@ -191,14 +191,11 @@ impl SessionHandle {
 
     /// 更新编排上下文（下一轮对话开始前生效）。
     ///
-    /// Session 在每轮开始前会通过 `try_recv` 拉取最新的 `TaskContext`，
+    /// Session 在每轮开始前读取最新的 `TaskContext`，
     /// 再交给 `Orchestrate::assemble` 决定本轮配置。
     ///
     /// 高级用法：可在同一轮之间多次调用，Session 只会取最后一个值。
     pub async fn set_task_context(&self, ctx: TaskContext) -> Result<(), String> {
-        self.ctx_tx
-            .send(ctx)
-            .await
-            .map_err(|_| "会话已关闭".to_string())
+        self.ctx_tx.send(ctx).map_err(|_| "会话已关闭".to_string())
     }
 }
