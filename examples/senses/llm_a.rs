@@ -4,7 +4,7 @@ use flowcloudai_client::tool::registry::ToolRegistry;
 
 pub struct LLMASense {
     prompt: String,
-    config: ChatRequest
+    config: ChatRequest,
 }
 
 impl LLMASense {
@@ -31,7 +31,6 @@ impl Sense for LLMASense {
     }
 
     fn install_tools(&self, _tools: &mut ToolRegistry) -> anyhow::Result<()> {
-
         Ok(())
     }
 }

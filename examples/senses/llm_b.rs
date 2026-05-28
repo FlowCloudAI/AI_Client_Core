@@ -31,7 +31,6 @@ impl Sense for LLMBSense {
     }
 
     fn install_tools(&self, _tools: &mut ToolRegistry) -> anyhow::Result<()> {
-
         Ok(())
     }
 }

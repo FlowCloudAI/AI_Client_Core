@@ -135,11 +135,9 @@ impl TTSSession {
 
         // hex 为空但有 URL → 标记为 url 模式，调用方自行下载
         if audio.is_empty() && data.url.as_ref().map_or(true, |u| u.is_empty()) {
-            return Err(ClientError::new(
-                ErrorCode::TtsResponseEmpty,
-                "音频数据为空且未提供 URL",
-            )
-            .into());
+            return Err(
+                ClientError::new(ErrorCode::TtsResponseEmpty, "音频数据为空且未提供 URL").into(),
+            );
         }
 
         Ok(TTSResult {

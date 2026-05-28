@@ -112,11 +112,7 @@ impl ImageSession {
         }
 
         if body.is_empty() {
-            return Err(ClientError::new(
-                ErrorCode::ImageTaskEmptyResponse,
-                "图像响应为空",
-            )
-            .into());
+            return Err(ClientError::new(ErrorCode::ImageTaskEmptyResponse, "图像响应为空").into());
         }
 
         log::debug!("[image] raw response bytes={}", body.len());
@@ -146,11 +142,8 @@ impl ImageSession {
                     base64::engine::general_purpose::STANDARD
                         .decode(b64)
                         .map_err(|e| {
-                            ClientError::new(
-                                ErrorCode::ImageTaskFailed,
-                                "解码 b64_json 图片失败",
-                            )
-                            .with_kv("source", e.to_string())
+                            ClientError::new(ErrorCode::ImageTaskFailed, "解码 b64_json 图片失败")
+                                .with_kv("source", e.to_string())
                         })?
                 } else {
                     Vec::new()

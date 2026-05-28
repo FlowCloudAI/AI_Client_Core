@@ -7,11 +7,11 @@ mod apis;
 mod senses;
 
 use anyhow::Result;
+use flowcloudai_client::FlowCloudAIClient;
 use flowcloudai_client::llm::types::SessionEvent;
 use flowcloudai_client::llm::types::TurnStatus;
-use flowcloudai_client::FlowCloudAIClient;
 use futures_util::StreamExt;
-use std::io::{stdin, stdout, Write};
+use std::io::{Write, stdin, stdout};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -41,20 +41,26 @@ async fn main() -> Result<()> {
     let mut session = client.create_llm_session("deepseek-llm", apis::DEEPSEEK.key, None)?;
 
     session
-        .load_sense(acs_sense).await?
-        .set_model("deepseek-v4-pro").await
-        .set_thinking(true).await
-        .set_stream(true).await
-        .set_temperature(0.75).await;
+        .load_sense(acs_sense)
+        .await?
+        .set_model("deepseek-v4-pro")
+        .await
+        .set_thinking(true)
+        .await
+        .set_stream(true)
+        .await
+        .set_temperature(0.75)
+        .await;
 
-    println!("[debug] after install_sense, tool count: {:?}", client.tool_registry().tool_names());
+    println!(
+        "[debug] after install_sense, tool count: {:?}",
+        client.tool_registry().tool_names()
+    );
 
     let (input_tx, input_rx) = mpsc::channel::<String>(32);
 
     // run() 返回事件流 + 句柄；句柄用于在任意时刻修改对话参数
     let (event_stream, _handle) = session.run(input_rx);
-
-
 
     run_chat_loop(event_stream, input_tx).await?;
 
@@ -113,18 +119,32 @@ async fn run_chat_loop(
                 );
             }
 
-            SessionEvent::ToolResult { index, output, is_error } => {
+            SessionEvent::ToolResult {
+                index,
+                output,
+                is_error,
+            } => {
                 if is_error {
                     println!(
                         "\n{}[ToolResult:{}ERR{}] index={}{}\n{}{}",
-                        TOOL_CALL_COLOR, TOOL_ERROR_COLOR, TOOL_CALL_COLOR,
-                        index, TOOL_COLOR, output, COLOR_RESET
+                        TOOL_CALL_COLOR,
+                        TOOL_ERROR_COLOR,
+                        TOOL_CALL_COLOR,
+                        index,
+                        TOOL_COLOR,
+                        output,
+                        COLOR_RESET
                     );
                 } else {
                     println!(
                         "\n{}[ToolResult:{}OK{}] index={}{}\n{}{}",
-                        TOOL_CALL_COLOR, TOOL_OK_COLOR, TOOL_CALL_COLOR,
-                        index, TOOL_COLOR, output, COLOR_RESET
+                        TOOL_CALL_COLOR,
+                        TOOL_OK_COLOR,
+                        TOOL_CALL_COLOR,
+                        index,
+                        TOOL_COLOR,
+                        output,
+                        COLOR_RESET
                     );
                 }
             }

@@ -190,9 +190,12 @@ impl ApiPipeline {
         })?;
         let mapped = self.map_request(&raw)?;
         serde_json::from_str(&mapped).map_err(|e| {
-            ClientError::new(ErrorCode::LlmRequestBadPayload, "映射后请求 JSON 反序列化失败")
-                .with_kv("source", e.to_string())
-                .into()
+            ClientError::new(
+                ErrorCode::LlmRequestBadPayload,
+                "映射后请求 JSON 反序列化失败",
+            )
+            .with_kv("source", e.to_string())
+            .into()
         })
     }
 

@@ -41,12 +41,11 @@ impl Default for SessionConfig {
 impl SessionConfig {
     pub fn validate(&self) -> Result<()> {
         if self.base_url.is_empty() {
-            return Err(ClientError::new(
-                ErrorCode::ValidationMissingField,
-                "base_url 不能为空",
-            )
-            .with_kv("field", "base_url")
-            .into());
+            return Err(
+                ClientError::new(ErrorCode::ValidationMissingField, "base_url 不能为空")
+                    .with_kv("field", "base_url")
+                    .into(),
+            );
         }
         if !self.base_url.starts_with("http") {
             return Err(ClientError::new(
@@ -58,9 +57,11 @@ impl SessionConfig {
             .into());
         }
         if self.api_key.is_empty() {
-            return Err(ClientError::new(ErrorCode::AuthApiKeyMissing, "api_key 不能为空")
-                .with_kv("field", "api_key")
-                .into());
+            return Err(
+                ClientError::new(ErrorCode::AuthApiKeyMissing, "api_key 不能为空")
+                    .with_kv("field", "api_key")
+                    .into(),
+            );
         }
         Ok(())
     }

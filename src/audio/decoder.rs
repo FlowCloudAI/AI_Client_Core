@@ -93,8 +93,9 @@ impl AudioDecoder {
     /// 将 AudioSource 解析为原始音频字节。
     pub async fn resolve(source: &AudioSource) -> Result<Vec<u8>> {
         match source {
-            AudioSource::Hex(hex) => hex::decode(hex)
-                .map_err(|e| decode_err("hex 音频解码失败", e).into()),
+            AudioSource::Hex(hex) => {
+                hex::decode(hex).map_err(|e| decode_err("hex 音频解码失败", e).into())
+            }
             AudioSource::Base64(b64) => base64::engine::general_purpose::STANDARD
                 .decode(b64)
                 .map_err(|e| decode_err("base64 音频解码失败", e).into()),
@@ -283,7 +284,9 @@ impl AudioDecoder {
             )
             .map_err(|e| playback_err("构建音频输出流失败", e))?;
 
-        stream.play().map_err(|e| playback_err("启动音频播放失败", e))?;
+        stream
+            .play()
+            .map_err(|e| playback_err("启动音频播放失败", e))?;
 
         // 等待播放完成
         let _ = done_rx.recv();

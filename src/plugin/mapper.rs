@@ -50,14 +50,23 @@ pub struct WasmMapper {
 
 impl ApiMapper for WasmMapper {
     fn map_request(&mut self, json: &str) -> Result<String> {
-        Ok(self.api.mapper_plugin_mapper().call_map_request(&mut self.store, json)?)
+        Ok(self
+            .api
+            .mapper_plugin_mapper()
+            .call_map_request(&mut self.store, json)?)
     }
 
     fn map_response(&mut self, json: &str) -> Result<String> {
-        Ok(self.api.mapper_plugin_mapper().call_map_response(&mut self.store, json)?)
+        Ok(self
+            .api
+            .mapper_plugin_mapper()
+            .call_map_response(&mut self.store, json)?)
     }
 
     fn map_stream_line(&mut self, line: &str) -> Result<String> {
-        Ok(self.api.mapper_plugin_mapper().call_map_stream_line(&mut self.store, line)?)
+        Ok(self
+            .api
+            .mapper_plugin_mapper()
+            .call_map_stream_line(&mut self.store, line)?)
     }
 }

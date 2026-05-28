@@ -2,13 +2,13 @@
 // 不代表生产环境中的推荐架构或最佳实践。
 
 use anyhow::Context;
-use flowcloudai_client::tool::{arg_i32, arg_str};
 use flowcloudai_client::llm::types::{ChatRequest, ThinkingType, ToolFunctionArg};
 use flowcloudai_client::sense::SenseState;
-use flowcloudai_client::sense::{sense_state_new, Sense};
+use flowcloudai_client::sense::{Sense, sense_state_new};
 use flowcloudai_client::tool::ToolRegistry;
+use flowcloudai_client::tool::{arg_i32, arg_str};
 use serde_json::Value;
-use std::io::{stdin, stdout, Write};
+use std::io::{Write, stdin, stdout};
 
 #[allow(dead_code)]
 pub struct ACSSense {

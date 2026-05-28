@@ -21,7 +21,6 @@ use std::collections::HashMap;
 #[derive(Clone, Debug, Default)]
 pub struct TaskContext {
     // ── 中性扩展字段（推荐使用） ──
-
     /// 任意字符串键值对上下文（推荐用于自定义 Orchestrate 实现）。
     ///
     /// 示例：`{"scene": "editor", "language": "zh"}`
@@ -36,7 +35,6 @@ pub struct TaskContext {
     pub payload: Option<Value>,
 
     // ── 遗留字段（DefaultOrchestrator 使用） ──
-
     /// 任务类型（如 "creative_writing", "proofreading", "code_generation"）。
     /// `DefaultOrchestrator` 用此字段决定参数覆盖策略。
     pub task_type: String,

@@ -12,7 +12,10 @@ fn main() -> Result<()> {
     }
     plugin_manager.load_llm_plugin("demo")?;
 
-    println!("{}", plugin_manager.map_request(PluginKind::LLM, "hello world")?);
+    println!(
+        "{}",
+        plugin_manager.map_request(PluginKind::LLM, "hello world")?
+    );
 
     Ok(())
 }

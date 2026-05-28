@@ -5,8 +5,8 @@ use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
-use crate::error::{ClientError, ErrorCode};
 use crate::SUPPORTED_AGREEMENT_VERSION;
+use crate::error::{ClientError, ErrorCode};
 
 // ─────────────────────── 插件类型 ─────────────────────────
 
@@ -133,12 +133,12 @@ impl PluginMeta {
                 .with_kv("source", e.to_string())
         };
         let spec = match kind {
-            PluginKind::LLM => PluginSpec::LLM(
-                serde_json::from_value(manifest.ext.clone()).map_err(map_ext_err)?,
-            ),
-            PluginKind::TTS => PluginSpec::TTS(
-                serde_json::from_value(manifest.ext.clone()).map_err(map_ext_err)?,
-            ),
+            PluginKind::LLM => {
+                PluginSpec::LLM(serde_json::from_value(manifest.ext.clone()).map_err(map_ext_err)?)
+            }
+            PluginKind::TTS => {
+                PluginSpec::TTS(serde_json::from_value(manifest.ext.clone()).map_err(map_ext_err)?)
+            }
             PluginKind::Image => PluginSpec::Image(
                 serde_json::from_value(manifest.ext.clone()).map_err(map_ext_err)?,
             ),
@@ -653,9 +653,11 @@ fn validate_url_policy(raw: &str) -> Result<()> {
             }
             Err(manifest_invalid("HTTP 仅允许指向 localhost / loopback 端点").into())
         }
-        scheme => Err(manifest_invalid(format!("不支持的 URL scheme '{}'", scheme))
-            .with_kv("scheme", scheme.to_string())
-            .into()),
+        scheme => Err(
+            manifest_invalid(format!("不支持的 URL scheme '{}'", scheme))
+                .with_kv("scheme", scheme.to_string())
+                .into(),
+        ),
     }
 }
 
@@ -678,9 +680,11 @@ fn validate_models(models: &[ModelInfo]) -> Result<()> {
 fn validate_default_model(default_model: Option<&str>, models: &[ModelInfo]) -> Result<()> {
     if let Some(default_model) = default_model {
         if !models.iter().any(|model| model.id == default_model) {
-            return Err(manifest_invalid("default-model 必须匹配某个已声明的 model id")
-                .with_kv("default_model", default_model.to_string())
-                .into());
+            return Err(
+                manifest_invalid("default-model 必须匹配某个已声明的 model id")
+                    .with_kv("default_model", default_model.to_string())
+                    .into(),
+            );
         }
     }
     Ok(())
@@ -690,9 +694,11 @@ fn validate_unique_efforts(label: &str, efforts: &[ThinkingEffort]) -> Result<()
     let mut seen = BTreeSet::new();
     for effort in efforts {
         if !seen.insert(*effort) {
-            return Err(manifest_invalid(format!("{} 包含重复值 {:?}", label, effort))
-                .with_kv("field", label.to_string())
-                .into());
+            return Err(
+                manifest_invalid(format!("{} 包含重复值 {:?}", label, effort))
+                    .with_kv("field", label.to_string())
+                    .into(),
+            );
         }
     }
     Ok(())
@@ -805,6 +811,8 @@ mod tests {
 
         let manifest = PluginManifest::parse(raw).unwrap();
         let err = PluginMeta::from_manifest(manifest, PathBuf::from("p.fcplug")).unwrap_err();
-        assert!(err.to_string().contains("default-voice") || err.to_string().contains("default_voice"));
+        assert!(
+            err.to_string().contains("default-voice") || err.to_string().contains("default_voice")
+        );
     }
 }

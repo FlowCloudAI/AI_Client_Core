@@ -380,6 +380,7 @@ pub enum DecoderEventPayload {
     ToolCallsRequired,
     TurnEnd {
         status: TurnStatus,
+        finish_reason: Option<String>,
         usage: Option<Usage>,
     },
 }

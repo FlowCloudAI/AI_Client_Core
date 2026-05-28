@@ -1,7 +1,7 @@
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use crate::llm::types::ChatRequest;
 use crate::tool::registry::ToolRegistry;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// 模式预设。
 ///

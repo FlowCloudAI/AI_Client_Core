@@ -394,12 +394,7 @@ impl PluginRegistry {
     ///
     /// 此方法编译 wasm 并添加到 modules HashMap，但不创建 pool。
     /// 需要后续调用 `load()` 来激活插件。
-    pub fn add_module(
-        &self,
-        id: String,
-        meta: PluginMeta,
-        wasm_bytes: &[u8],
-    ) -> Result<()> {
+    pub fn add_module(&self, id: String, meta: PluginMeta, wasm_bytes: &[u8]) -> Result<()> {
         let mut state = self.state()?;
         // 检查 ID 唯一性
         if state.plugins.contains_key(&id) {
@@ -434,7 +429,7 @@ impl PluginRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     #[test]
     fn ref_count_poison_returns_error_and_legacy_busy() {

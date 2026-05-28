@@ -19,8 +19,8 @@ use wasmtime_wasi::WasiCtxBuilder;
 /// - `Mutex` 只保护 `Vec::push / pop`（纳秒级），wasm 计算本身无锁并行。
 pub struct MapperPool {
     engine: Engine,
-    component: Component,           // 改名 module → component
-    linker: Linker<HostState>,      // component::Linker（组件链接器）
+    component: Component,      // 改名 module → component
+    linker: Linker<HostState>, // component::Linker（组件链接器）
     idle: Mutex<Vec<Box<dyn ApiMapper + Send>>>,
     max_idle: usize,
 }
@@ -54,9 +54,7 @@ impl MapperPool {
         let mapper = {
             match self.idle.lock() {
                 Ok(mut guard) => guard.pop(),
-                Err(poisoned) => {
-                    poisoned.into_inner().pop()
-                },
+                Err(poisoned) => poisoned.into_inner().pop(),
             }
         };
 
@@ -83,10 +81,13 @@ impl MapperPool {
 
     /// 创建一个全新的 wasm 实例。
     fn instantiate(&self) -> Result<Box<dyn ApiMapper + Send>> {
-        let mut store = Store::new(&self.engine, HostState {
-            table: ResourceTable::new(),
-            wasi: WasiCtxBuilder::new().build(),
-        });
+        let mut store = Store::new(
+            &self.engine,
+            HostState {
+                table: ResourceTable::new(),
+                wasi: WasiCtxBuilder::new().build(),
+            },
+        );
         let api = Api::instantiate(&mut store, &self.component, &self.linker)?;
 
         Ok(Box::new(WasmMapper { store, api }))
@@ -160,7 +161,7 @@ impl ApiMapper for PooledMapper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     struct TestMapper;
 

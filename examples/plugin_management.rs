@@ -1,10 +1,9 @@
 /// 插件管理功能测试示例
-/// 
+///
 /// 演示如何使用 FlowCloudAIClient 的插件管理 API：
 /// - list_all_plugins: 列出所有已识别插件
 /// - install_plugin_from_path: 从外部路径安装插件
 /// - uninstall_plugin: 卸载插件（含引用计数检查）
-
 use anyhow::Result;
 use flowcloudai_client::FlowCloudAIClient;
 use std::path::PathBuf;
@@ -51,13 +50,13 @@ fn main() -> Result<()> {
     // if let Some(first_plugin) = plugins.first() {
     //     // 先创建一个 session（会增加引用计数）
     //     let _session = client.create_llm_session(&first_plugin.id, "test-key", None)?;
-    //     
+    //
     //     // 尝试卸载（应该失败，因为引用计数 > 0）
     //     match client.uninstall_plugin(&first_plugin.id) {
     //         Ok(_) => println!("意外成功卸载"),
     //         Err(e) => println!("预期错误: {}", e),
     //     }
-    //     
+    //
     //     // session drop 后引用计数归零，可以卸载
     //     drop(_session);
     //     match client.uninstall_plugin(&first_plugin.id) {

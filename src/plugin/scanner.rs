@@ -12,9 +12,12 @@ impl PluginScanner {
     pub fn read_plugin_info(fcplug: &Path) -> Result<PluginManifest> {
         let path_str = fcplug.display().to_string();
         let file = File::open(fcplug).map_err(|e| {
-            ClientError::new(ErrorCode::FsOpenFailed, format!("无法打开插件包: {}", path_str))
-                .with_kv("path", path_str.clone())
-                .with_kv("source", e.to_string())
+            ClientError::new(
+                ErrorCode::FsOpenFailed,
+                format!("无法打开插件包: {}", path_str),
+            )
+            .with_kv("path", path_str.clone())
+            .with_kv("source", e.to_string())
         })?;
         let mut archive = ZipArchive::new(file).map_err(|e| {
             ClientError::new(ErrorCode::PluginLoadFailed, "插件包不是合法 ZIP")
@@ -66,10 +69,12 @@ impl PluginScanner {
             }
             Err(e) => {
                 log::warn!("[plugin] failed to read directory: {}", e);
-                return Err(ClientError::new(ErrorCode::FsOpenFailed, "读取插件目录失败")
-                    .with_kv("path", dir_str)
-                    .with_kv("source", e.to_string())
-                    .into());
+                return Err(
+                    ClientError::new(ErrorCode::FsOpenFailed, "读取插件目录失败")
+                        .with_kv("path", dir_str)
+                        .with_kv("source", e.to_string())
+                        .into(),
+                );
             }
         }
 

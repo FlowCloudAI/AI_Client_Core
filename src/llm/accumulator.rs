@@ -1,5 +1,5 @@
-use std::collections::{HashMap, HashSet};
 use crate::llm::types::{ToolCall, ToolFunctionCall};
+use std::collections::{HashMap, HashSet};
 
 // ═════════════════════════════════════════════════════════════
 //                    工具调用累积器

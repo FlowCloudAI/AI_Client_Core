@@ -1,7 +1,7 @@
-use std::path::PathBuf;
-use flowcloudai_client::audio::{AudioDecoder, AudioSource};
-use flowcloudai_client::tts::{TTSRequest, AudioFormat};
 use flowcloudai_client::FlowCloudAIClient;
+use flowcloudai_client::audio::{AudioDecoder, AudioSource};
+use flowcloudai_client::tts::{AudioFormat, TTSRequest};
+use std::path::PathBuf;
 #[cfg(feature = "local-apis")]
 #[path = "apis/mod.rs"]
 mod apis;
@@ -17,7 +17,9 @@ async fn main() -> anyhow::Result<()> {
     let tts = client.create_tts_session("qwen-tts", apis::QWEN_LLM.key, None)?;
 
     // ── 方式 1：最简调用 + 播放 ──
-    let result = tts.speak("qwen3-tts-flash", "你好，世界。", "Ethan").await?;
+    let result = tts
+        .speak("qwen3-tts-flash", "你好，世界。", "Ethan")
+        .await?;
 
     if result.audio.is_empty() {
         if let Some(url) = &result.url {
@@ -31,7 +33,11 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref url) = result.url {
         AudioDecoder::play_source(&AudioSource::Url(url.clone()), Some("wav")).await?;
     } else if !result.audio.is_empty() {
-        AudioDecoder::play_source(&AudioSource::Raw(result.audio.clone()), Some(&result.format)).await?;
+        AudioDecoder::play_source(
+            &AudioSource::Raw(result.audio.clone()),
+            Some(&result.format),
+        )
+        .await?;
     }
 
     // ── 方式 2：完整参数 + 保存文件 ──
@@ -44,10 +50,19 @@ async fn main() -> anyhow::Result<()> {
 
     if !result.audio.is_empty() {
         std::fs::write("output.mp3", &result.audio)?;
-        println!("saved {} bytes, duration {:?}ms", result.audio.len(), result.duration_ms);
+        println!(
+            "saved {} bytes, duration {:?}ms",
+            result.audio.len(),
+            result.duration_ms
+        );
 
         let pcm = AudioDecoder::decode(&result.audio, Some("mp3"))?;
-        println!("{}Hz, {} channels, {} samples", pcm.sample_rate, pcm.channels, pcm.samples.len());
+        println!(
+            "{}Hz, {} channels, {} samples",
+            pcm.sample_rate,
+            pcm.channels,
+            pcm.samples.len()
+        );
     } else if let Some(ref url) = result.url {
         println!("Audio URL: {}", url);
         AudioDecoder::play_source(&AudioSource::Url(url.clone()), Some("wav")).await?;
@@ -59,11 +74,16 @@ async fn main() -> anyhow::Result<()> {
     if !result.audio.is_empty() {
         // 方式 3
         let pcm = AudioDecoder::decode(&result.audio, Some("mp3"))?;
-        println!("{}Hz, {} channels, {} samples", pcm.sample_rate, pcm.channels, pcm.samples.len());
+        println!(
+            "{}Hz, {} channels, {} samples",
+            pcm.sample_rate,
+            pcm.channels,
+            pcm.samples.len()
+        );
     }
 
     // ── 方式 4：从字符串自动检测编码 ──
-    let source = AudioSource::detect("68656c6c6f");  // 十六进制
+    let source = AudioSource::detect("68656c6c6f"); // 十六进制
     let bytes = AudioDecoder::resolve(&source).await?;
     println!("resolved {} bytes", bytes.len());
 

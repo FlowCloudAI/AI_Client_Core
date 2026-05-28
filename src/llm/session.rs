@@ -122,7 +122,6 @@ pub struct LLMSession {
     turn_id: u64,
 
     orchestrator: Option<Box<dyn Orchestrate>>,
-
 }
 
 // ── 构建 & 配置 ──
@@ -390,8 +389,7 @@ impl LLMSession {
                     "创建 session runtime 失败",
                 )
                 .with_kv("source", e.to_string())
-            })
-        {
+            }) {
             Ok(rt) => {
                 std::thread::spawn(move || {
                     rt.block_on(async move {
@@ -400,8 +398,8 @@ impl LLMSession {
                             .await
                         {
                             let _ = event_tx
-                        .send(SessionEvent::Error(ClientError::from_anyhow_owned(e)))
-                        .await;
+                                .send(SessionEvent::Error(ClientError::from_anyhow_owned(e)))
+                                .await;
                         }
                     });
                 });
@@ -516,8 +514,7 @@ impl LLMSession {
                     "创建 session runtime 失败",
                 )
                 .with_kv("source", e.to_string())
-            })
-        {
+            }) {
             Ok(rt) => {
                 std::thread::spawn(move || {
                     rt.block_on(async move {
@@ -534,8 +531,8 @@ impl LLMSession {
                             .await
                         {
                             let _ = event_tx
-                        .send(SessionEvent::Error(ClientError::from_anyhow_owned(e)))
-                        .await;
+                                .send(SessionEvent::Error(ClientError::from_anyhow_owned(e)))
+                                .await;
                         }
                     });
                 });
@@ -669,18 +666,14 @@ impl LLMSession {
                 self.pipeline.try_set_plugin(Some(plugin_id))?;
             }
             CtrlMsg::Checkout { node_id } => {
-                self.tree
-                    .write()
-                    .await
-                    .checkout(node_id)
-                    .map_err(|e| {
-                        ClientError::new(
-                            ErrorCode::ValidationFormatError,
-                            format!("会话树 checkout 失败: {}", e),
-                        )
-                        .with_kv("node_id", node_id)
-                        .with_kv("source", e.to_string())
-                    })?;
+                self.tree.write().await.checkout(node_id).map_err(|e| {
+                    ClientError::new(
+                        ErrorCode::ValidationFormatError,
+                        format!("会话树 checkout 失败: {}", e),
+                    )
+                    .with_kv("node_id", node_id)
+                    .with_kv("source", e.to_string())
+                })?;
                 event_tx
                     .send(SessionEvent::BranchChanged { node_id })
                     .await?;
@@ -1256,6 +1249,7 @@ impl LLMSession {
         let mut turn_status = TurnStatus::Ok;
         let mut usage: Option<Usage> = None;
         let mut line_count = 0usize;
+        let mut saw_tool_call_start = false;
 
         'outer: loop {
             let raw_line = tokio::select! {
@@ -1312,6 +1306,7 @@ impl LLMSession {
                     }
 
                     DecoderEventPayload::ToolCallStart { index, tool_name } => {
+                        saw_tool_call_start = true;
                         acc.on_start(index, Some(&tool_name));
                         event_tx
                             .send(SessionEvent::ToolCall {
@@ -1347,17 +1342,60 @@ impl LLMSession {
                         break 'outer;
                     }
 
-                    DecoderEventPayload::TurnEnd { status, usage: u } => {
+                    DecoderEventPayload::TurnEnd {
+                        status,
+                        finish_reason: stream_finish_reason,
+                        usage: u,
+                    } => {
                         turn_status = status.clone();
                         if u.is_some() {
                             usage = u;
                         }
-                        finish_reason = Some(match &turn_status {
-                            TurnStatus::Ok => "stop".to_string(),
+                        let normalized_finish_reason = match &turn_status {
+                            TurnStatus::Ok => stream_finish_reason
+                                .clone()
+                                .unwrap_or_else(|| "stop".to_string()),
                             TurnStatus::Cancelled => "cancelled".to_string(),
                             TurnStatus::Interrupted => "interrupted".to_string(),
                             TurnStatus::Error(e) => return Err(e.clone().into()),
-                        });
+                        };
+                        finish_reason = Some(normalized_finish_reason.clone());
+                        log::info!(
+                            "[client:llm][stream_turn_end_event] turn_id={} status={} finish_reason={} saw_tool_call_start={} content_chars={} reasoning_chars={}",
+                            self.turn_id,
+                            match &turn_status {
+                                TurnStatus::Ok => "ok",
+                                TurnStatus::Cancelled => "cancelled",
+                                TurnStatus::Interrupted => "interrupted",
+                                TurnStatus::Error(_) => "error",
+                            },
+                            normalized_finish_reason,
+                            saw_tool_call_start,
+                            full_content.chars().count(),
+                            full_reasoning.chars().count()
+                        );
+
+                        if saw_tool_call_start && normalized_finish_reason != "tool_calls" {
+                            let status = TurnStatus::Error(
+                                ClientError::new(
+                                    ErrorCode::LlmStreamProtocolError,
+                                    "模型开始输出工具调用，但未以 tool_calls 结束，工具未执行",
+                                )
+                                .with_kv("finish_reason", normalized_finish_reason.clone())
+                                .with_kv("turn_id", self.turn_id)
+                                .with_kv("content_chars", full_content.chars().count() as u64)
+                                .with_kv("reasoning_chars", full_reasoning.chars().count() as u64),
+                            );
+                            log::warn!(
+                                "[client:llm][incomplete_tool_call_stream] turn_id={} finish_reason={} content_chars={} reasoning_chars={}",
+                                self.turn_id,
+                                normalized_finish_reason,
+                                full_content.chars().count(),
+                                full_reasoning.chars().count()
+                            );
+                            turn_status = status;
+                            break 'outer;
+                        }
 
                         // Qwen 的 OpenAI 兼容流式响应会先发送 finish_reason=stop，
                         // 再发送 choices=[] 的 usage-only chunk，最后发送 [DONE]。
@@ -1416,23 +1454,64 @@ impl LLMSession {
         cancel: &mut TurnCancel,
         event_tx: &mpsc::Sender<SessionEvent>,
     ) -> Result<bool> {
-        for call in tool_calls {
+        let total_calls = tool_calls.len();
+        let enabled_scope = enabled_tools
+            .as_ref()
+            .map(|tools| tools.len().to_string())
+            .unwrap_or_else(|| "all".to_string());
+        log::info!(
+            "[client:tools][batch_start] turn_id={} calls={} read_only={} enabled_scope={}",
+            self.turn_id,
+            total_calls,
+            read_only,
+            enabled_scope
+        );
+
+        for (call_position, call) in tool_calls.into_iter().enumerate() {
             if cancel.is_cancelled() {
+                log::warn!(
+                    "[client:tools][batch_cancelled_before_call] turn_id={} next_call_position={} calls={}",
+                    self.turn_id,
+                    call_position + 1,
+                    total_calls
+                );
                 return Ok(true);
             }
 
             let func_name = &call.function.name;
             let args_str = call.function.arguments.trim();
+            log::info!(
+                "[client:tools][call_start] turn_id={} call_position={}/{} index={} name={} args_chars={} args_preview={:?}",
+                self.turn_id,
+                call_position + 1,
+                total_calls,
+                call.index,
+                func_name,
+                args_str.chars().count(),
+                Self::log_preview(args_str, 512)
+            );
 
             let (output, is_error) = if enabled_tools
                 .as_ref()
                 .is_some_and(|tools| !tools.contains(func_name))
             {
+                log::warn!(
+                    "[client:tools][call_blocked_not_enabled] turn_id={} index={} name={}",
+                    self.turn_id,
+                    call.index,
+                    func_name
+                );
                 (
                     format!("工具执行失败: 本轮不允许调用工具 '{}'", func_name),
                     true,
                 )
             } else if read_only && Self::is_write_like_tool(func_name) {
+                log::warn!(
+                    "[client:tools][call_blocked_read_only] turn_id={} index={} name={}",
+                    self.turn_id,
+                    call.index,
+                    func_name
+                );
                 (
                     format!("工具执行失败: 只读模式下禁止调用写入类工具 '{}'", func_name),
                     true,
@@ -1445,6 +1524,14 @@ impl LLMSession {
                         Ok(v) => v,
                         Err(e) => {
                             let output = format!("工具执行失败: 工具参数不是合法 JSON: {}", e);
+                            log::warn!(
+                                "[client:tools][call_args_parse_failed] turn_id={} index={} name={} error={} args_preview={:?}",
+                                self.turn_id,
+                                call.index,
+                                func_name,
+                                e,
+                                Self::log_preview(args_str, 512)
+                            );
                             event_tx
                                 .send(SessionEvent::ToolResult {
                                     index: call.index,
@@ -1452,9 +1539,28 @@ impl LLMSession {
                                     is_error: true,
                                 })
                                 .await?;
+                            log::info!(
+                                "[client:tools][tool_result_event_sent] turn_id={} index={} name={} is_error=true output_chars={}",
+                                self.turn_id,
+                                call.index,
+                                func_name,
+                                output.chars().count()
+                            );
                             let tool_call_id = Self::synth_tool_call_id(self.turn_id, call.index);
                             let _ = self.add_message(Message::tool(output, tool_call_id)).await;
+                            log::info!(
+                                "[client:tools][tool_message_added] turn_id={} index={} name={}",
+                                self.turn_id,
+                                call.index,
+                                func_name
+                            );
                             if cancel.is_cancelled() {
+                                log::warn!(
+                                    "[client:tools][batch_cancelled_after_parse_error] turn_id={} index={} name={}",
+                                    self.turn_id,
+                                    call.index,
+                                    func_name
+                                );
                                 return Ok(true);
                             }
                             continue;
@@ -1462,15 +1568,51 @@ impl LLMSession {
                     }
                 };
 
+                log::info!(
+                    "[client:tools][conduct_start] turn_id={} index={} name={}",
+                    self.turn_id,
+                    call.index,
+                    func_name
+                );
+                let conduct_started = Instant::now();
                 let conduct_fut =
                     self.tool_registry
                         .conduct(func_name, Some(&args_v), Duration::from_secs(600));
                 match tokio::select! {
                     result = conduct_fut => result,
-                    _ = cancel.cancelled() => return Ok(true),
+                    _ = cancel.cancelled() => {
+                        log::warn!(
+                            "[client:tools][conduct_cancelled] turn_id={} index={} name={} elapsed_ms={}",
+                            self.turn_id,
+                            call.index,
+                            func_name,
+                            conduct_started.elapsed().as_millis()
+                        );
+                        return Ok(true);
+                    },
                 } {
-                    Ok(o) => (o, false),
-                    Err(e) => (format!("工具执行失败: {}", e), true),
+                    Ok(o) => {
+                        log::info!(
+                            "[client:tools][conduct_done] turn_id={} index={} name={} elapsed_ms={} output_chars={}",
+                            self.turn_id,
+                            call.index,
+                            func_name,
+                            conduct_started.elapsed().as_millis(),
+                            o.chars().count()
+                        );
+                        (o, false)
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "[client:tools][conduct_failed] turn_id={} index={} name={} elapsed_ms={} error={}",
+                            self.turn_id,
+                            call.index,
+                            func_name,
+                            conduct_started.elapsed().as_millis(),
+                            e
+                        );
+                        (format!("工具执行失败: {}", e), true)
+                    }
                 }
             };
 
@@ -1483,14 +1625,50 @@ impl LLMSession {
                     is_error,
                 })
                 .await?;
+            log::info!(
+                "[client:tools][tool_result_event_sent] turn_id={} index={} name={} is_error={} output_chars={} output_preview={:?}",
+                self.turn_id,
+                call.index,
+                func_name,
+                is_error,
+                output.chars().count(),
+                Self::log_preview(&output, 512)
+            );
 
             let _ = self.add_message(Message::tool(output, tool_call_id)).await;
+            log::info!(
+                "[client:tools][tool_message_added] turn_id={} index={} name={}",
+                self.turn_id,
+                call.index,
+                func_name
+            );
             if cancel.is_cancelled() {
+                log::warn!(
+                    "[client:tools][batch_cancelled_after_call] turn_id={} index={} name={}",
+                    self.turn_id,
+                    call.index,
+                    func_name
+                );
                 return Ok(true);
             }
         }
 
+        log::info!(
+            "[client:tools][batch_done] turn_id={} calls={}",
+            self.turn_id,
+            total_calls
+        );
         Ok(false)
+    }
+
+    fn log_preview(value: &str, max_chars: usize) -> String {
+        let mut chars = value.chars();
+        let preview: String = chars.by_ref().take(max_chars).collect();
+        if chars.next().is_some() {
+            format!("{}...(truncated)", preview)
+        } else {
+            preview
+        }
     }
 
     #[inline]
@@ -1513,8 +1691,8 @@ mod tests {
     use crate::tool::registry::ToolRegistry;
     use futures_util::StreamExt;
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};

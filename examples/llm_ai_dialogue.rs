@@ -7,10 +7,10 @@ mod apis;
 mod senses;
 
 use anyhow::Result;
-use flowcloudai_client::llm::types::{SessionEvent, TurnStatus};
 use flowcloudai_client::FlowCloudAIClient;
+use flowcloudai_client::llm::types::{SessionEvent, TurnStatus};
 use futures_util::StreamExt;
-use std::io::{stdout, Write};
+use std::io::{Write, stdout};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -43,26 +43,37 @@ async fn main() -> Result<()> {
 
     // ── 初始化客户端与插件 ──
     let mut client = FlowCloudAIClient::new(PathBuf::from("./plugins"))?;
-    
+
     client.install_sense(&senses_a)?;
     client.install_sense(&senses_b)?;
-    
+
     client.load_plugin("deepseek-llm")?;
 
     // ── 机器人 A ──
     let mut bot_a = client.create_llm_session("deepseek-llm", apis::DEEPSEEK.key, None)?;
-    bot_a.load_sense(senses_a).await?
-        .set_model("deepseek-chat").await
-        .set_thinking(false).await
-        .set_stream(true).await
-        .set_frequency_penalty(0.0).await;
+    bot_a
+        .load_sense(senses_a)
+        .await?
+        .set_model("deepseek-chat")
+        .await
+        .set_thinking(false)
+        .await
+        .set_stream(true)
+        .await
+        .set_frequency_penalty(0.0)
+        .await;
 
     // ── 机器人 B ──
     let mut bot_b = client.create_llm_session("deepseek-llm", apis::DEEPSEEK.key, None)?;
-    bot_b.load_sense(senses_b).await?
-        .set_model("deepseek-chat").await
-        .set_thinking(false).await
-        .set_stream(true).await;
+    bot_b
+        .load_sense(senses_b)
+        .await?
+        .set_model("deepseek-chat")
+        .await
+        .set_thinking(false)
+        .await
+        .set_stream(true)
+        .await;
 
     let (a_tx, a_rx) = mpsc::channel::<String>(32);
     let (b_tx, b_rx) = mpsc::channel::<String>(32);

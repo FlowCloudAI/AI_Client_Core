@@ -286,13 +286,16 @@ impl FlowCloudAIClient {
     }
 
     fn ensure_plugin_kind(&self, plugin_id: &str, expected: PluginKind) -> Result<()> {
-        let meta = self.plugin_registry.try_get_meta(plugin_id)?.ok_or_else(|| {
-            ClientError::new(
-                ErrorCode::PluginNotFound,
-                format!("插件 '{}' 不存在", plugin_id),
-            )
-            .with_kv("plugin_id", plugin_id.to_string())
-        })?;
+        let meta = self
+            .plugin_registry
+            .try_get_meta(plugin_id)?
+            .ok_or_else(|| {
+                ClientError::new(
+                    ErrorCode::PluginNotFound,
+                    format!("插件 '{}' 不存在", plugin_id),
+                )
+                .with_kv("plugin_id", plugin_id.to_string())
+            })?;
 
         if meta.kind != expected {
             return Err(ClientError::new(

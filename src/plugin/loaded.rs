@@ -1,3 +1,7 @@
+use crate::error::{ClientError, ErrorCode};
+use crate::plugin::bindings::plugin_bindings;
+use crate::plugin::host::HostState;
+use crate::plugin::types::{PluginKind, PluginMeta};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
@@ -5,10 +9,6 @@ use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Engine, Store};
 use wasmtime_wasi::WasiCtxBuilder;
 use zip::ZipArchive;
-use crate::error::{ClientError, ErrorCode};
-use crate::plugin::bindings::plugin_bindings;
-use crate::plugin::host::HostState;
-use crate::plugin::types::{PluginKind, PluginMeta};
 
 pub struct LoadedPlugin {
     pub kind: PluginKind,
@@ -21,7 +21,7 @@ enum PluginState {
         store: Store<HostState>,
         api: plugin_bindings::Api,
         icon: Vec<u8>,
-    }
+    },
 }
 
 impl LoadedPlugin {
@@ -39,7 +39,7 @@ impl LoadedPlugin {
     pub fn icon(&self) -> &[u8] {
         match &self.state {
             PluginState::Loaded { icon, .. } => icon,
-            PluginState::Unloaded => &[]
+            PluginState::Unloaded => &[],
         }
     }
 
@@ -57,10 +57,9 @@ impl LoadedPlugin {
         &mut self,
         plugins: &HashMap<String, PluginMeta>,
         linker: &Linker<HostState>,
-        engine: &Engine, 
-        id: &str
+        engine: &Engine,
+        id: &str,
     ) -> anyhow::Result<()> {
-
         let meta = plugins.get(id).ok_or_else(|| {
             ClientError::new(ErrorCode::PluginNotFound, format!("插件 '{}' 不存在", id))
                 .with_kv("plugin_id", id.to_string())
@@ -114,13 +113,12 @@ impl LoadedPlugin {
 
         let mut store = Store::new(&engine, state);
 
-        let api = plugin_bindings::Api::instantiate(&mut store, &component, linker).map_err(
-            |e| {
+        let api =
+            plugin_bindings::Api::instantiate(&mut store, &component, linker).map_err(|e| {
                 ClientError::new(ErrorCode::PluginLoadFailed, "Wasm 组件实例化失败")
                     .with_kv("plugin_id", id.to_string())
                     .with_kv("source", e.to_string())
-            },
-        )?;
+            })?;
 
         self.state = PluginState::Loaded { store, api, icon };
 

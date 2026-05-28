@@ -18,7 +18,7 @@ use flowcloudai_client::llm::types::TurnStatus;
 use flowcloudai_client::{AssembledTurn, FlowCloudAIClient, Orchestrate, TaskContext};
 use futures_util::StreamExt;
 use std::collections::HashMap;
-use std::io::{stdin, stdout, Write};
+use std::io::{Write, stdin, stdout};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
@@ -92,23 +92,30 @@ async fn main() -> Result<()> {
 
     // ── 方式 B：自定义 ModeOrchestrator（本示例实际运行）─────────────────────
     let orch = ModeOrchestrator::new("你是一个通用助手，请用中文回复。");
-    let mut session = client
-        .create_orchestrated_session("deepseek-llm", apis::DEEPSEEK.key, Box::new(orch), None)?;
+    let mut session = client.create_orchestrated_session(
+        "deepseek-llm",
+        apis::DEEPSEEK.key,
+        Box::new(orch),
+        None,
+    )?;
 
     session
-        .set_model("deepseek-chat").await
-        .set_stream(true).await;
+        .set_model("deepseek-chat")
+        .await
+        .set_stream(true)
+        .await;
 
     let (input_tx, input_rx) = mpsc::channel::<String>(32);
     let (mut events, handle) = session.run(input_rx);
 
     // 对话开始前设置初始上下文（可在每轮前更新）
-    handle.set_task_context(TaskContext {
-        attributes: HashMap::from([
-            ("mode".to_string(), "default".to_string()),
-        ]),
-        ..Default::default()
-    }).await.ok();
+    handle
+        .set_task_context(TaskContext {
+            attributes: HashMap::from([("mode".to_string(), "default".to_string())]),
+            ..Default::default()
+        })
+        .await
+        .ok();
 
     println!("提示：输入 !precise / !creative / !default 在运行时切换模式");
     println!("      输入 exit 退出\n");
@@ -135,9 +142,7 @@ async fn main() -> Result<()> {
                         // 运行时切换模式：更新上下文后继续提示输入，Session 不感知
                         if let Some(mode) = s.strip_prefix('!') {
                             let new_ctx = TaskContext {
-                                attributes: HashMap::from([
-                                    ("mode".to_string(), mode.to_string()),
-                                ]),
+                                attributes: HashMap::from([("mode".to_string(), mode.to_string())]),
                                 ..Default::default()
                             };
                             handle_clone.set_task_context(new_ctx).await.ok();

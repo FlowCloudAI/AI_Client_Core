@@ -110,11 +110,7 @@ impl DefaultOrchestrator {
         //   1. flags["read_only"] 存在 → 以它为准
         //   2. 无 flags 但有遗留字段 → 走兼容回退
         //   3. 均未设置 → false（AssembledTurn::default()）
-        turn.read_only = ctx
-            .flags
-            .get("read_only")
-            .copied()
-            .unwrap_or(ctx.read_only);
+        turn.read_only = ctx.flags.get("read_only").copied().unwrap_or(ctx.read_only);
 
         // 参数覆盖：根据任务类型选择最佳参数
         match ctx.task_type.as_str() {

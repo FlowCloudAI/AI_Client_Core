@@ -52,6 +52,7 @@ impl StreamDecoder {
                 event_info: self.next_info(),
                 payload: DecoderEventPayload::TurnEnd {
                     status: TurnStatus::Ok,
+                    finish_reason: None,
                     usage: self.pending_usage.take(),
                 },
             }));
@@ -106,6 +107,13 @@ impl StreamDecoder {
 
             // 关键：当模型声明要调用工具时，flush 出 ToolCallStart
             if let Some(fr) = choice.finish_reason.as_deref() {
+                log::info!(
+                    "[client:stream_decoder][finish_reason] turn_id={} choice={} finish_reason={} pending_tool_starts={}",
+                    self.turn_id,
+                    choice_i,
+                    fr,
+                    self.started.len()
+                );
                 if fr == "tool_calls" {
                     out.push(Ok(DecoderEvent {
                         event_info: self.next_info(),
@@ -119,6 +127,7 @@ impl StreamDecoder {
                     event_info: self.next_info(),
                     payload: DecoderEventPayload::TurnEnd {
                         status: TurnStatus::Ok,
+                        finish_reason: Some(fr.to_string()),
                         usage: self.pending_usage.take(),
                     },
                 }));
