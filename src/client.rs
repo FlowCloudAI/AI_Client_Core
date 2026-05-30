@@ -4,7 +4,7 @@ use crate::image::ImageSession;
 use crate::llm::config::{SecretString, SessionConfig};
 use crate::llm::session::LLMSession;
 use crate::orchestrator::Orchestrate;
-use crate::plugin::manager::PluginManager;
+use crate::plugin::manager::{PluginLoadError, PluginLoadReport, PluginManager};
 use crate::plugin::pipeline::ApiPipeline;
 use crate::plugin::registry::PluginRegistry;
 use crate::plugin::types::{PluginKind, PluginMeta};
@@ -21,6 +21,7 @@ pub struct FlowCloudAIClient {
     plugin_registry: Arc<PluginRegistry>,
     tool_registry: Arc<ToolRegistry>,
     plugins_dir: PathBuf,
+    plugin_load_report: PluginLoadReport,
 }
 
 impl FlowCloudAIClient {
@@ -33,17 +34,34 @@ impl FlowCloudAIClient {
             log::info!("[plugin] found: {} ({:?})", id, meta.kind);
         }
 
-        let registry =
-            PluginRegistry::build(pm.engine.clone(), pm.linker.clone(), pm.plugins.clone(), 8)?;
+        let mut load_report = pm.load_report.clone();
+        let (registry, compile_report) =
+            PluginRegistry::build_with_report(pm.engine.clone(), pm.linker.clone(), pm.plugins, 8)?;
+        load_report.loaded = compile_report.loaded;
+        load_report.skipped.extend(compile_report.skipped);
 
         // 扫描到的插件默认自动激活，避免 session 在未显式 load_plugin 时无法使用。
-        let plugin_ids: Vec<String> = registry
-            .try_list_plugins()?
-            .into_iter()
-            .map(|m| m.id)
-            .collect();
-        for id in plugin_ids {
-            registry.load(&id)?;
+        let plugin_metas = registry.try_list_plugins()?;
+        let mut active_plugins = Vec::new();
+        for meta in plugin_metas {
+            match registry.load(&meta.id) {
+                Ok(()) => active_plugins.push(meta),
+                Err(err) => {
+                    load_report.skipped.push(PluginLoadError {
+                        path: meta.fcplug_path.clone(),
+                        error: ClientError::from_anyhow_owned(err),
+                    });
+                }
+            }
+        }
+        load_report.loaded = active_plugins;
+
+        for skipped in &load_report.skipped {
+            log::warn!(
+                "[plugin] skipped: {} ({})",
+                skipped.path.display(),
+                skipped.error
+            );
         }
 
         let plugin_registry = registry;
@@ -52,6 +70,7 @@ impl FlowCloudAIClient {
             plugin_registry: Arc::new(plugin_registry),
             tool_registry: Arc::new(ToolRegistry::new()),
             plugins_dir,
+            plugin_load_report: load_report,
         })
     }
 
@@ -71,6 +90,11 @@ impl FlowCloudAIClient {
 
     pub fn pool_stats(&self) -> HashMap<String, usize> {
         self.plugin_registry.pool_stats()
+    }
+
+    /// 返回客户端初始化时的插件加载报告。
+    pub fn plugin_load_report(&self) -> &PluginLoadReport {
+        &self.plugin_load_report
     }
 
     /// 返回所有已识别插件的完整元数据列表。

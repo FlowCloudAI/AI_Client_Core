@@ -6,6 +6,7 @@ use wasmtime::{Config, Engine};
 
 use crate::error::{ClientError, ErrorCode};
 use crate::plugin::host::HostState;
+use crate::plugin::manager::{PluginLoadError, PluginLoadReport};
 use crate::plugin::pool::{MapperPool, PooledMapper};
 use crate::plugin::types::{PluginKind, PluginMeta};
 use wasmtime::component::{Component, Linker};
@@ -118,44 +119,89 @@ impl PluginRegistry {
         plugin_metas: HashMap<String, PluginMeta>,
         max_idle_per_pool: usize,
     ) -> Result<Self> {
+        Self::build_with_report(engine, linker, plugin_metas, max_idle_per_pool)
+            .map(|(registry, _)| registry)
+    }
+
+    /// 从 PluginManager 的扫描结果构建 Registry，并隔离单个插件的编译失败。
+    ///
+    /// 能成功编译的插件会进入注册表；失败插件会进入报告的 `skipped`，
+    /// 不再阻断整个客户端初始化。
+    pub fn build_with_report(
+        engine: Engine,
+        linker: Linker<HostState>,
+        plugin_metas: HashMap<String, PluginMeta>,
+        max_idle_per_pool: usize,
+    ) -> Result<(Self, PluginLoadReport)> {
         let mut modules = HashMap::new();
+        let mut plugins = HashMap::new();
+        let mut report = PluginLoadReport::default();
 
-        for (id, meta) in &plugin_metas {
-            let wasm_bytes = {
-                let file = std::fs::File::open(&meta.fcplug_path).map_err(|e| {
-                    ClientError::new(ErrorCode::FsOpenFailed, "无法打开插件包")
-                        .with_kv("plugin_id", id.clone())
-                        .with_kv("source", e.to_string())
-                })?;
-                let mut archive = zip::ZipArchive::new(file).map_err(|e| {
-                    ClientError::new(ErrorCode::PluginLoadFailed, "插件包不是合法 ZIP")
-                        .with_kv("plugin_id", id.clone())
-                        .with_kv("source", e.to_string())
-                })?;
-                let mut entry = archive.by_name("plugin.wasm").map_err(|_| {
-                    ClientError::new(ErrorCode::PluginLoadFailed, "插件包缺少 plugin.wasm")
-                        .with_kv("plugin_id", id.clone())
-                })?;
-                let mut buf = Vec::new();
-                std::io::Read::read_to_end(&mut entry, &mut buf).map_err(|e| {
-                    ClientError::new(ErrorCode::PluginLoadFailed, "读取 plugin.wasm 失败")
-                        .with_kv("plugin_id", id.clone())
-                        .with_kv("source", e.to_string())
-                })?;
-                buf
-            };
-
-            let module = Component::from_binary(&engine, &wasm_bytes).map_err(|e| {
-                ClientError::new(ErrorCode::PluginLoadFailed, "Wasm 组件编译失败")
-                    .with_kv("plugin_id", id.clone())
-                    .with_kv("source", e.to_string())
-            })?;
-            modules.insert(id.clone(), module);
+        for (id, meta) in plugin_metas {
+            match Self::compile_plugin_module(&engine, &id, &meta) {
+                Ok(module) => {
+                    modules.insert(id.clone(), module);
+                    report.loaded.push(meta.clone());
+                    plugins.insert(id, meta);
+                }
+                Err(err) => {
+                    report.skipped.push(PluginLoadError {
+                        path: meta.fcplug_path.clone(),
+                        error: ClientError::from_anyhow_owned(err),
+                    });
+                }
+            }
         }
 
-        Ok(Self {
+        Ok((
+            Self::from_parts(engine, linker, plugins, modules, max_idle_per_pool),
+            report,
+        ))
+    }
+
+    fn compile_plugin_module(engine: &Engine, id: &str, meta: &PluginMeta) -> Result<Component> {
+        let wasm_bytes = {
+            let file = std::fs::File::open(&meta.fcplug_path).map_err(|e| {
+                ClientError::new(ErrorCode::FsOpenFailed, "无法打开插件包")
+                    .with_kv("plugin_id", id.to_string())
+                    .with_kv("source", e.to_string())
+            })?;
+            let mut archive = zip::ZipArchive::new(file).map_err(|e| {
+                ClientError::new(ErrorCode::PluginLoadFailed, "插件包不是合法 ZIP")
+                    .with_kv("plugin_id", id.to_string())
+                    .with_kv("source", e.to_string())
+            })?;
+            let mut entry = archive.by_name("plugin.wasm").map_err(|_| {
+                ClientError::new(ErrorCode::PluginLoadFailed, "插件包缺少 plugin.wasm")
+                    .with_kv("plugin_id", id.to_string())
+            })?;
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut buf).map_err(|e| {
+                ClientError::new(ErrorCode::PluginLoadFailed, "读取 plugin.wasm 失败")
+                    .with_kv("plugin_id", id.to_string())
+                    .with_kv("source", e.to_string())
+            })?;
+            buf
+        };
+
+        Component::from_binary(engine, &wasm_bytes).map_err(|e| {
+            ClientError::new(ErrorCode::PluginLoadFailed, "Wasm 组件编译失败")
+                .with_kv("plugin_id", id.to_string())
+                .with_kv("source", e.to_string())
+                .into()
+        })
+    }
+
+    fn from_parts(
+        engine: Engine,
+        linker: Linker<HostState>,
+        plugins: HashMap<String, PluginMeta>,
+        modules: HashMap<String, Component>,
+        max_idle_per_pool: usize,
+    ) -> Self {
+        Self {
             state: Mutex::new(RegistryState {
-                plugins: plugin_metas,
+                plugins,
                 modules,
                 pools: HashMap::new(),
                 ref_counts: HashMap::new(),
@@ -163,7 +209,7 @@ impl PluginRegistry {
             engine,
             linker,
             max_idle_per_pool,
-        })
+        }
     }
 
     // ── 插件加载 ──
@@ -464,7 +510,43 @@ impl PluginRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin::types::PluginManifest;
+    use std::collections::HashMap;
+    use std::fs;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn bad_plugin_path() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "flowcloudai-bad-plugin-{}-{nanos}.fcplug",
+            std::process::id()
+        ))
+    }
+
+    fn llm_meta(path: PathBuf) -> PluginMeta {
+        let manifest = PluginManifest::parse(
+            r#"{
+              "meta": {
+                "id": "bad-llm",
+                "version": "1.0.0",
+                "author": "flowcloudai",
+                "agreement-version": 1,
+                "name": "Bad LLM",
+                "description": "Bad plugin package",
+                "kind": "llm",
+                "url": "https://api.example.com/v1/chat"
+              },
+              "models": [{ "id": "model-a" }]
+            }"#,
+        )
+        .unwrap();
+        PluginMeta::from_manifest(manifest, path).unwrap()
+    }
 
     #[test]
     fn state_poison_try_api_returns_error_legacy_api_is_safe() {
@@ -487,6 +569,29 @@ mod tests {
 
         assert!(registry.try_increment_loaded_ref("missing").is_err());
         assert_eq!(registry.try_get_ref_count("missing").unwrap(), 0);
+    }
+
+    #[test]
+    fn build_with_report_skips_bad_plugin_package() {
+        let path = bad_plugin_path();
+        fs::write(&path, b"not a zip").unwrap();
+
+        let meta = llm_meta(path.clone());
+        let mut metas = HashMap::new();
+        metas.insert(meta.id.clone(), meta);
+
+        let base = PluginRegistry::empty().unwrap();
+        let (registry, report) =
+            PluginRegistry::build_with_report(base.engine.clone(), base.linker.clone(), metas, 8)
+                .unwrap();
+
+        assert!(registry.try_list_plugins().unwrap().is_empty());
+        assert!(report.loaded.is_empty());
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].path, path);
+        assert_eq!(report.skipped[0].error.code, ErrorCode::PluginLoadFailed);
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]
