@@ -285,7 +285,13 @@ impl PluginRegistry {
     ///
     /// 兼容旧 API：锁异常时保守返回 false，严格路径请使用 `try_is_loaded`。
     pub fn is_loaded(&self, id: &str) -> bool {
-        self.try_is_loaded(id).unwrap_or(false)
+        match self.try_is_loaded(id) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                log::error!("[plugin] legacy is_loaded failed for '{id}': {error:#}");
+                false
+            }
+        }
     }
 
     // ── 实例借出 ──
@@ -342,7 +348,13 @@ impl PluginRegistry {
     ///
     /// 兼容旧 API：锁异常时返回 None，严格路径请使用 `try_get_meta`。
     pub fn get_meta(&self, plugin_id: &str) -> Option<PluginMeta> {
-        self.try_get_meta(plugin_id).ok().flatten()
+        match self.try_get_meta(plugin_id) {
+            Ok(meta) => meta,
+            Err(error) => {
+                log::error!("[plugin] legacy get_meta failed for '{plugin_id}': {error:#}");
+                None
+            }
+        }
     }
 
     /// 获取所有插件元数据列表。
@@ -354,7 +366,13 @@ impl PluginRegistry {
     ///
     /// 兼容旧 API：锁异常时返回空列表，严格路径请使用 `try_list_plugins`。
     pub fn list_plugins(&self) -> Vec<PluginMeta> {
-        self.try_list_plugins().unwrap_or_default()
+        match self.try_list_plugins() {
+            Ok(plugins) => plugins,
+            Err(error) => {
+                log::error!("[plugin] legacy list_plugins failed: {error:#}");
+                Vec::new()
+            }
+        }
     }
 
     /// 按类型筛选插件。
@@ -372,7 +390,13 @@ impl PluginRegistry {
     ///
     /// 兼容旧 API：锁异常时返回空列表，严格路径请使用 `try_list_by_kind`。
     pub fn list_by_kind(&self, kind: PluginKind) -> Vec<PluginMeta> {
-        self.try_list_by_kind(kind).unwrap_or_default()
+        match self.try_list_by_kind(kind) {
+            Ok(plugins) => plugins,
+            Err(error) => {
+                log::error!("[plugin] legacy list_by_kind failed: {error:#}");
+                Vec::new()
+            }
+        }
     }
 
     /// 获取所有已加载插件的池状态（诊断用）。
@@ -389,7 +413,13 @@ impl PluginRegistry {
     ///
     /// 兼容旧 API：锁异常时返回空 map，严格路径请使用 `try_pool_stats`。
     pub fn pool_stats(&self) -> HashMap<String, usize> {
-        self.try_pool_stats().unwrap_or_default()
+        match self.try_pool_stats() {
+            Ok(stats) => stats,
+            Err(error) => {
+                log::error!("[plugin] legacy pool_stats failed: {error:#}");
+                HashMap::new()
+            }
+        }
     }
 
     // ── 引用计数管理 ──
@@ -436,25 +466,11 @@ impl PluginRegistry {
         Ok(())
     }
 
-    /// 增加插件引用计数（session 创建时调用）。
-    ///
-    /// 兼容旧 API：锁异常时忽略，严格路径请使用 `try_increment_ref`。
-    pub fn increment_ref(&self, plugin_id: &str) {
-        let _ = self.try_increment_ref(plugin_id);
-    }
-
     /// 减少插件引用计数（session 销毁时调用）。
     pub fn try_decrement_ref(&self, plugin_id: &str) -> Result<()> {
         let mut state = self.state()?;
         Self::decrement_ref_in_state(&mut state, plugin_id);
         Ok(())
-    }
-
-    /// 减少插件引用计数（session 销毁时调用）。
-    ///
-    /// 兼容旧 API：锁异常时忽略，严格路径请使用 `try_decrement_ref`。
-    pub fn decrement_ref(&self, plugin_id: &str) {
-        let _ = self.try_decrement_ref(plugin_id);
     }
 
     /// 获取插件引用计数。
@@ -471,7 +487,13 @@ impl PluginRegistry {
     ///
     /// 兼容旧 API：锁异常时返回 `usize::MAX`，代表未知且应视为 busy。
     pub fn get_ref_count(&self, plugin_id: &str) -> usize {
-        self.try_get_ref_count(plugin_id).unwrap_or(usize::MAX)
+        match self.try_get_ref_count(plugin_id) {
+            Ok(count) => count,
+            Err(error) => {
+                log::error!("[plugin] legacy get_ref_count failed for '{plugin_id}': {error:#}");
+                usize::MAX
+            }
+        }
     }
 
     // ── 动态模块加载 ──

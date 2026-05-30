@@ -41,13 +41,18 @@ impl ApiPipeline {
         plugin_id: Option<String>,
         mode: PipelineMode,
     ) -> Self {
-        if let Some(id) = &plugin_id {
-            registry.increment_ref(id);
-        }
-        Self {
-            registry,
-            plugin_id,
-            mode,
+        match Self::try_with_mode(Arc::clone(&registry), plugin_id.clone(), mode) {
+            Ok(pipeline) => pipeline,
+            Err(error) => {
+                log::error!(
+                    "[plugin] legacy ApiPipeline::with_mode failed to update ref-count: {error:#}"
+                );
+                Self {
+                    registry,
+                    plugin_id,
+                    mode,
+                }
+            }
         }
     }
 
@@ -80,7 +85,11 @@ impl ApiPipeline {
     ///
     /// 兼容旧 API：切换失败时保留原插件配置。新代码应优先使用 `try_set_plugin`。
     pub fn set_plugin(&mut self, new_plugin_id: Option<String>) {
-        let _ = self.try_set_plugin(new_plugin_id);
+        if let Err(error) = self.try_set_plugin(new_plugin_id) {
+            log::error!(
+                "[plugin] legacy ApiPipeline::set_plugin failed to update ref-count: {error:#}"
+            );
+        }
     }
 
     /// 切换到另一个插件，失败时返回错误并尽量保留原插件配置。
@@ -200,7 +209,9 @@ impl Drop for ApiPipeline {
     fn drop(&mut self) {
         // Session 销毁时减少引用计数
         if let Some(id) = &self.plugin_id {
-            let _ = self.registry.try_decrement_ref(id);
+            if let Err(error) = self.registry.try_decrement_ref(id) {
+                log::error!("[plugin] failed to decrement ref-count for '{id}': {error:#}");
+            }
         }
     }
 }
@@ -212,7 +223,8 @@ mod tests {
     #[test]
     fn strict_mode_rejects_selected_unloaded_plugin() {
         let registry = Arc::new(PluginRegistry::empty().unwrap());
-        let pipeline = ApiPipeline::new(registry, Some("missing".to_string()));
+        let pipeline = ApiPipeline::new(Arc::clone(&registry), Some("missing".to_string()));
+        assert_eq!(registry.try_get_ref_count("missing").unwrap(), 0);
 
         let err = pipeline.map_request("{}").unwrap_err();
         assert!(

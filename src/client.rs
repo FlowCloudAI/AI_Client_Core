@@ -81,15 +81,33 @@ impl FlowCloudAIClient {
     }
 
     pub fn list_plugins(&self) -> Vec<PluginMeta> {
-        self.plugin_registry.list_plugins()
+        match self.plugin_registry.try_list_plugins() {
+            Ok(plugins) => plugins,
+            Err(error) => {
+                log::error!("[plugin] list_plugins failed: {error:#}");
+                Vec::new()
+            }
+        }
     }
 
     pub fn list_by_kind(&self, kind: PluginKind) -> Vec<PluginMeta> {
-        self.plugin_registry.list_by_kind(kind)
+        match self.plugin_registry.try_list_by_kind(kind) {
+            Ok(plugins) => plugins,
+            Err(error) => {
+                log::error!("[plugin] list_by_kind failed: {error:#}");
+                Vec::new()
+            }
+        }
     }
 
     pub fn pool_stats(&self) -> HashMap<String, usize> {
-        self.plugin_registry.pool_stats()
+        match self.plugin_registry.try_pool_stats() {
+            Ok(stats) => stats,
+            Err(error) => {
+                log::error!("[plugin] pool_stats failed: {error:#}");
+                HashMap::new()
+            }
+        }
     }
 
     /// 返回客户端初始化时的插件加载报告。
@@ -101,12 +119,18 @@ impl FlowCloudAIClient {
     ///
     /// 包括 id, name, version, description, author, kind, fcplug_path 等字段。
     pub fn list_all_plugins(&self) -> Vec<PluginMeta> {
-        self.plugin_registry.list_plugins()
+        self.list_plugins()
     }
 
     /// 获取插件的引用计数（用于诊断）。
     pub fn get_plugin_ref_count(&self, plugin_id: &str) -> usize {
-        self.plugin_registry.get_ref_count(plugin_id)
+        match self.plugin_registry.try_get_ref_count(plugin_id) {
+            Ok(count) => count,
+            Err(error) => {
+                log::error!("[plugin] get_plugin_ref_count failed for '{plugin_id}': {error:#}");
+                usize::MAX
+            }
+        }
     }
 
     /// 严格获取插件的引用计数。
@@ -129,13 +153,16 @@ impl FlowCloudAIClient {
     /// - 文件操作失败：转换为 anyhow::Error 并附带上下文
     pub fn uninstall_plugin(&self, plugin_id: &str) -> Result<()> {
         // 1. 检查插件是否存在
-        let meta = self.plugin_registry.get_meta(plugin_id).ok_or_else(|| {
-            ClientError::new(
-                ErrorCode::PluginNotFound,
-                format!("插件 '{}' 不存在", plugin_id),
-            )
-            .with_kv("plugin_id", plugin_id.to_string())
-        })?;
+        let meta = self
+            .plugin_registry
+            .try_get_meta(plugin_id)?
+            .ok_or_else(|| {
+                ClientError::new(
+                    ErrorCode::PluginNotFound,
+                    format!("插件 '{}' 不存在", plugin_id),
+                )
+                .with_kv("plugin_id", plugin_id.to_string())
+            })?;
 
         // 保存文件路径（因为后面要删除）
         let fcplug_path = meta.fcplug_path.clone();
@@ -195,7 +222,7 @@ impl FlowCloudAIClient {
         let info = &manifest.meta;
 
         // 校验 ID 唯一性
-        if self.plugin_registry.get_meta(&info.id).is_some() {
+        if self.plugin_registry.try_get_meta(&info.id)?.is_some() {
             return Err(ClientError::new(
                 ErrorCode::PluginAlreadyExists,
                 format!("插件 '{}' 已存在", info.id),
