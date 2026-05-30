@@ -1,8 +1,51 @@
 // llm/config.rs——会话配置
 
 use anyhow::Result;
+use std::fmt;
+use zeroize::Zeroize;
 
 use crate::error::{ClientError, ErrorCode};
+
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SecretString(\"***\")")
+    }
+}
+
+impl From<String> for SecretString {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&str> for SecretString {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl Drop for SecretString {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct SessionConfig {
@@ -10,7 +53,7 @@ pub struct SessionConfig {
     pub base_url: String,
 
     /// API 密钥
-    pub api_key: String,
+    pub api_key: SecretString,
 
     /// 事件 channel 缓冲大小
     pub event_buffer: usize,
@@ -29,7 +72,7 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             base_url: String::new(),
-            api_key: String::new(),
+            api_key: SecretString::default(),
             event_buffer: 256,
             request_timeout: 120,
             max_tool_rounds: 20,
@@ -64,5 +107,31 @@ impl SessionConfig {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SecretString, SessionConfig};
+
+    #[test]
+    fn session_config_debug_redacts_api_key() {
+        let config = SessionConfig {
+            base_url: "https://example.test".to_string(),
+            api_key: SecretString::from("sk-test-secret"),
+            ..SessionConfig::default()
+        };
+
+        let output = format!("{config:?}");
+        assert!(output.contains("api_key"));
+        assert!(output.contains("***"));
+        assert!(!output.contains("sk-test-secret"));
+    }
+
+    #[test]
+    fn secret_string_exposes_value_for_request_auth() {
+        let secret = SecretString::from("sk-test-secret");
+        assert_eq!(secret.expose(), "sk-test-secret");
+        assert!(!secret.is_empty());
     }
 }

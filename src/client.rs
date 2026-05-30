@@ -1,7 +1,7 @@
 use crate::PluginScanner;
 use crate::error::{ClientError, ErrorCode};
 use crate::image::ImageSession;
-use crate::llm::config::SessionConfig;
+use crate::llm::config::{SecretString, SessionConfig};
 use crate::llm::session::LLMSession;
 use crate::orchestrator::Orchestrate;
 use crate::plugin::manager::PluginManager;
@@ -337,7 +337,7 @@ impl FlowCloudAIClient {
 
         let mut config = config_override.unwrap_or_default();
         config.base_url = url.to_string();
-        config.api_key = api_key.to_string();
+        config.api_key = SecretString::from(api_key);
 
         let pipeline = ApiPipeline::try_new(
             Arc::clone(&self.plugin_registry),
@@ -383,7 +383,7 @@ impl FlowCloudAIClient {
 
         let mut config = config_override.unwrap_or_default();
         config.base_url = url.to_string();
-        config.api_key = api_key.to_string();
+        config.api_key = SecretString::from(api_key);
 
         let pipeline = ApiPipeline::try_new(
             Arc::clone(&self.plugin_registry),
@@ -457,7 +457,7 @@ impl FlowCloudAIClient {
 
         let mut config = config_override.unwrap_or_else(|| SessionConfig {
             base_url: url.to_string(),
-            api_key: api_key.to_string(),
+            api_key: SecretString::from(api_key),
             event_buffer: 0,      // TTS 不用事件流
             request_timeout: 120, // TTS 合成可能较慢
             max_tool_rounds: 0,
@@ -465,7 +465,7 @@ impl FlowCloudAIClient {
         });
         // 如果调用方传入了自定义 config，仍需覆盖 url 和 api_key
         config.base_url = url.to_string();
-        config.api_key = api_key.to_string();
+        config.api_key = SecretString::from(api_key);
 
         let pipeline = ApiPipeline::try_new(
             Arc::clone(&self.plugin_registry),
@@ -499,7 +499,7 @@ impl FlowCloudAIClient {
 
         let mut config = config_override.unwrap_or_else(|| SessionConfig {
             base_url: url.to_string(),
-            api_key: api_key.to_string(),
+            api_key: SecretString::from(api_key),
             event_buffer: 0,
             request_timeout: 180, // 图像生成较慢
             max_tool_rounds: 0,
@@ -507,7 +507,7 @@ impl FlowCloudAIClient {
         });
         // 如果调用方传入了自定义 config，仍需覆盖 url 和 api_key
         config.base_url = url.to_string();
-        config.api_key = api_key.to_string();
+        config.api_key = SecretString::from(api_key);
 
         let pipeline = ApiPipeline::try_new(
             Arc::clone(&self.plugin_registry),

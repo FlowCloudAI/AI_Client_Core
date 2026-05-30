@@ -194,7 +194,7 @@ impl LLMSession {
     }
 
     pub fn set_api(&mut self, api_key: &str) {
-        self.config.api_key = api_key.to_string();
+        self.config.api_key = api_key.into();
     }
 
     pub fn set_url(&mut self, url: &str) {
@@ -1068,9 +1068,9 @@ impl LLMSession {
                 self.config.base_url
             );
             let stage_started = Instant::now();
-            let post_fut = self
-                .client
-                .post_json(&self.config.base_url, &self.config.api_key, json);
+            let post_fut =
+                self.client
+                    .post_json(&self.config.base_url, self.config.api_key.expose(), json);
             let stream = tokio::select! {
                 result = post_fut => result?,
                 _ = cancel.cancelled() => {
@@ -1221,9 +1221,9 @@ impl LLMSession {
             self.config.base_url
         );
         let stage_started = Instant::now();
-        let post_fut = self
-            .client
-            .post_json(&self.config.base_url, &self.config.api_key, json);
+        let post_fut =
+            self.client
+                .post_json(&self.config.base_url, self.config.api_key.expose(), json);
         let stream = tokio::select! {
             result = post_fut => result?,
             _ = cancel.cancelled() => {
@@ -1740,7 +1740,7 @@ mod tests {
         let pipeline = ApiPipeline::try_new(registry, None).unwrap();
         let mut config = SessionConfig::default();
         config.base_url = base_url;
-        config.api_key = "test-key".to_string();
+        config.api_key = "test-key".into();
         config.event_buffer = 64;
         config.max_tool_rounds = 4;
 

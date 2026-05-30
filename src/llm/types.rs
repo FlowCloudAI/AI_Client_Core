@@ -1,4 +1,5 @@
 use crate::error::ClientError;
+use crate::llm::config::SecretString;
 use crate::plugin::types::ThinkingEffort;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -389,7 +390,10 @@ pub enum DecoderEventPayload {
 #[derive(Debug)]
 pub(crate) enum CtrlMsg {
     /// 切换到另一个插件（下一轮生效）
-    SwitchPlugin { plugin_id: String, api_key: String },
+    SwitchPlugin {
+        plugin_id: String,
+        api_key: SecretString,
+    },
     /// 将消息树 head 移动到指定节点（重说 / 分支 / 历史回退）
     Checkout { node_id: u64 },
 }

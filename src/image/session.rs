@@ -101,7 +101,7 @@ impl ImageSession {
     async fn post_and_collect(&self, json: serde_json::Value) -> Result<String> {
         let stream = self
             .client
-            .post_json(&self.config.base_url, &self.config.api_key, json)
+            .post_json(&self.config.base_url, self.config.api_key.expose(), json)
             .await?;
 
         tokio::pin!(stream);

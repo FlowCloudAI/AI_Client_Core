@@ -137,7 +137,7 @@ impl SessionHandle {
         self.ctrl_tx
             .send(CtrlMsg::SwitchPlugin {
                 plugin_id: plugin_id.to_string(),
-                api_key: api_key.to_string(),
+                api_key: api_key.into(),
             })
             .await
             .map_err(|_| "会话已关闭".to_string())
