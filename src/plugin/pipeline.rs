@@ -63,8 +63,11 @@ impl ApiPipeline {
         mode: PipelineMode,
     ) -> Result<Self> {
         if let Some(id) = &plugin_id {
-            Self::validate_plugin_available(&registry, id, mode)?;
-            registry.try_increment_ref(id)?;
+            if mode == PipelineMode::Strict {
+                registry.try_increment_loaded_ref(id)?;
+            } else {
+                registry.try_increment_ref(id)?;
+            }
         }
         Ok(Self {
             registry,
@@ -86,19 +89,12 @@ impl ApiPipeline {
             return Ok(());
         }
 
-        if let Some(id) = &new_plugin_id {
-            Self::validate_plugin_available(&self.registry, id, self.mode)?;
-        }
-
-        if let Some(id) = &self.plugin_id {
-            self.registry.try_decrement_ref(id)?;
-        }
-        self.plugin_id = None;
-
-        if let Some(id) = new_plugin_id {
-            self.registry.try_increment_ref(&id)?;
-            self.plugin_id = Some(id);
-        }
+        self.registry.try_switch_ref(
+            self.plugin_id.as_deref(),
+            new_plugin_id.as_deref(),
+            self.mode == PipelineMode::Strict,
+        )?;
+        self.plugin_id = new_plugin_id;
         Ok(())
     }
 
@@ -197,26 +193,6 @@ impl ApiPipeline {
             .with_kv("source", e.to_string())
             .into()
         })
-    }
-
-    fn validate_plugin_available(
-        registry: &PluginRegistry,
-        plugin_id: &str,
-        mode: PipelineMode,
-    ) -> Result<()> {
-        if mode == PipelineMode::AllowPassthrough {
-            return Ok(());
-        }
-        if registry.try_is_loaded(plugin_id)? {
-            Ok(())
-        } else {
-            Err(ClientError::new(
-                ErrorCode::PluginNotLoaded,
-                format!("已选择插件 '{}' 但未加载", plugin_id),
-            )
-            .with_kv("plugin_id", plugin_id.to_string())
-            .into())
-        }
     }
 }
 

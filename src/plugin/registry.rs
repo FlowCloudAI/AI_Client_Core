@@ -17,6 +17,7 @@ struct RegistryState {
     plugins: HashMap<String, PluginMeta>,
     modules: HashMap<String, Component>,
     pools: HashMap<String, Arc<MapperPool>>,
+    ref_counts: HashMap<String, usize>,
 }
 
 // ─────────────────────── 插件注册中心 ──────────────────────
@@ -46,10 +47,6 @@ pub struct PluginRegistry {
 
     /// 每个池的最大空闲实例数
     max_idle_per_pool: usize,
-
-    /// 插件引用计数（id → 引用数）
-    /// 用于追踪有多少 session 正在使用该插件
-    ref_counts: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl PluginRegistry {
@@ -63,12 +60,26 @@ impl PluginRegistry {
         })
     }
 
-    fn ref_counts_guard(&self) -> Result<MutexGuard<'_, HashMap<String, usize>>> {
-        self.ref_counts.lock().map_err(|e| {
-            ClientError::new(ErrorCode::CoreClientInternalError, "插件引用计数锁中毒")
-                .with_kv("source", e.to_string())
-                .into()
-        })
+    fn plugin_not_loaded(plugin_id: &str) -> ClientError {
+        ClientError::new(
+            ErrorCode::PluginNotLoaded,
+            format!("已选择插件 '{}' 但未加载", plugin_id),
+        )
+        .with_kv("plugin_id", plugin_id.to_string())
+    }
+
+    fn increment_ref_in_state(state: &mut RegistryState, plugin_id: &str) {
+        *state.ref_counts.entry(plugin_id.to_string()).or_insert(0) += 1;
+    }
+
+    fn decrement_ref_in_state(state: &mut RegistryState, plugin_id: &str) {
+        if let Some(count) = state.ref_counts.get_mut(plugin_id) {
+            if *count > 1 {
+                *count -= 1;
+            } else {
+                state.ref_counts.remove(plugin_id);
+            }
+        }
     }
 
     /// 空 registry，无插件。仅未指定插件的管道会走 passthrough。
@@ -89,11 +100,11 @@ impl PluginRegistry {
                 plugins: HashMap::new(),
                 modules: HashMap::new(),
                 pools: HashMap::new(),
+                ref_counts: HashMap::new(),
             }),
             engine,
             linker,
             max_idle_per_pool: 0,
-            ref_counts: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -147,11 +158,11 @@ impl PluginRegistry {
                 plugins: plugin_metas,
                 modules,
                 pools: HashMap::new(),
+                ref_counts: HashMap::new(),
             }),
             engine,
             linker,
             max_idle_per_pool,
-            ref_counts: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -197,27 +208,24 @@ impl PluginRegistry {
     /// 注意：调用方应确保没有活跃的 PooledMapper 引用该 pool，
     /// 否则会导致悬垂引用。实践中应先停止所有使用该插件的 session。
     pub fn unload(&self, id: &str) -> Result<()> {
-        // 检查引用计数
-        let ref_counts = self.ref_counts_guard()?;
+        let mut state = self.state()?;
 
-        if let Some(&count) = ref_counts.get(id) {
-            if count > 0 {
-                return Err(ClientError::new(
-                    ErrorCode::PluginUnloadForbidden,
-                    format!("插件 '{}' 仍被 {} 个会话引用，无法卸载", id, count),
-                )
-                .with_kv("plugin_id", id.to_string())
-                .with_kv("ref_count", count)
-                .into());
-            }
+        let count = state.ref_counts.get(id).copied().unwrap_or(0);
+        if count > 0 {
+            return Err(ClientError::new(
+                ErrorCode::PluginUnloadForbidden,
+                format!("插件 '{}' 仍被 {} 个会话引用，无法卸载", id, count),
+            )
+            .with_kv("plugin_id", id.to_string())
+            .with_kv("ref_count", count)
+            .into());
         }
-        drop(ref_counts);
 
         // 移除 pool、module 和 meta
-        let mut state = self.state()?;
         state.pools.remove(id);
         state.modules.remove(id);
         state.plugins.remove(id);
+        state.ref_counts.remove(id);
 
         Ok(())
     }
@@ -342,8 +350,43 @@ impl PluginRegistry {
 
     /// 增加插件引用计数（session 创建时调用）。
     pub fn try_increment_ref(&self, plugin_id: &str) -> Result<()> {
-        let mut counts = self.ref_counts_guard()?;
-        *counts.entry(plugin_id.to_string()).or_insert(0) += 1;
+        let mut state = self.state()?;
+        Self::increment_ref_in_state(&mut state, plugin_id);
+        Ok(())
+    }
+
+    /// 仅当插件当前已加载时增加引用计数。
+    pub fn try_increment_loaded_ref(&self, plugin_id: &str) -> Result<()> {
+        let mut state = self.state()?;
+        if !state.pools.contains_key(plugin_id) {
+            return Err(Self::plugin_not_loaded(plugin_id).into());
+        }
+        Self::increment_ref_in_state(&mut state, plugin_id);
+        Ok(())
+    }
+
+    /// 在同一把 registry state 锁下切换引用计数，并可要求新插件已加载。
+    pub fn try_switch_ref(
+        &self,
+        old_plugin_id: Option<&str>,
+        new_plugin_id: Option<&str>,
+        require_new_loaded: bool,
+    ) -> Result<()> {
+        let mut state = self.state()?;
+
+        if let Some(new_id) = new_plugin_id {
+            if require_new_loaded && !state.pools.contains_key(new_id) {
+                return Err(Self::plugin_not_loaded(new_id).into());
+            }
+        }
+
+        if let Some(old_id) = old_plugin_id {
+            Self::decrement_ref_in_state(&mut state, old_id);
+        }
+        if let Some(new_id) = new_plugin_id {
+            Self::increment_ref_in_state(&mut state, new_id);
+        }
+
         Ok(())
     }
 
@@ -356,12 +399,8 @@ impl PluginRegistry {
 
     /// 减少插件引用计数（session 销毁时调用）。
     pub fn try_decrement_ref(&self, plugin_id: &str) -> Result<()> {
-        let mut counts = self.ref_counts_guard()?;
-        if let Some(count) = counts.get_mut(plugin_id) {
-            if *count > 0 {
-                *count -= 1;
-            }
-        }
+        let mut state = self.state()?;
+        Self::decrement_ref_in_state(&mut state, plugin_id);
         Ok(())
     }
 
@@ -375,7 +414,8 @@ impl PluginRegistry {
     /// 获取插件引用计数。
     pub fn try_get_ref_count(&self, plugin_id: &str) -> Result<usize> {
         Ok(self
-            .ref_counts_guard()?
+            .state()?
+            .ref_counts
             .get(plugin_id)
             .copied()
             .unwrap_or(0))
@@ -419,29 +459,12 @@ impl PluginRegistry {
 
         Ok(())
     }
-
-    /// 获取引用计数的 Arc（供 Session 持有）。
-    pub fn ref_counts(&self) -> Arc<Mutex<HashMap<String, usize>>> {
-        Arc::clone(&self.ref_counts)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::panic::{AssertUnwindSafe, catch_unwind};
-
-    #[test]
-    fn ref_count_poison_returns_error_and_legacy_busy() {
-        let registry = PluginRegistry::empty().unwrap();
-        let _ = catch_unwind(AssertUnwindSafe(|| {
-            let _guard = registry.ref_counts.lock().unwrap();
-            panic!("制造引用计数 poison");
-        }));
-
-        assert!(registry.try_get_ref_count("p").is_err());
-        assert_eq!(registry.get_ref_count("p"), usize::MAX);
-    }
 
     #[test]
     fn state_poison_try_api_returns_error_legacy_api_is_safe() {
@@ -452,8 +475,30 @@ mod tests {
         }));
 
         assert!(registry.try_list_plugins().is_err());
+        assert!(registry.try_get_ref_count("p").is_err());
         assert!(registry.list_plugins().is_empty());
         assert!(!registry.is_loaded("p"));
+        assert_eq!(registry.get_ref_count("p"), usize::MAX);
+    }
+
+    #[test]
+    fn loaded_ref_increment_rejects_unloaded_plugin() {
+        let registry = PluginRegistry::empty().unwrap();
+
+        assert!(registry.try_increment_loaded_ref("missing").is_err());
+        assert_eq!(registry.try_get_ref_count("missing").unwrap(), 0);
+    }
+
+    #[test]
+    fn unload_observes_ref_count_under_registry_state_lock() {
+        let registry = PluginRegistry::empty().unwrap();
+        registry.try_increment_ref("p").unwrap();
+
+        let err = registry.unload("p").unwrap_err();
+        assert!(
+            err.to_string().contains("PLUGIN_UNLOAD_FORBIDDEN"),
+            "unexpected error: {err:#}"
+        );
     }
 }
 
