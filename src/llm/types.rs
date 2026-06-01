@@ -245,6 +245,11 @@ pub struct ToolFunctionArg {
     pub default: Option<Value>,
     pub max: Option<Value>,
     pub min: Option<Value>,
+    pub enum_values: Option<Vec<Value>>,
+    pub items: Option<Box<Value>>,
+    pub format: Option<String>,
+    pub properties: Option<Value>,
+    pub additional_properties: Option<Value>,
 }
 
 impl ToolFunctionArg {
@@ -253,11 +258,16 @@ impl ToolFunctionArg {
         Self {
             name: name.into(),
             r#type: r#type.into(),
-            required: Some(true),
+            required: Some(false),
             description: None,
             default: None,
             max: None,
             min: None,
+            enum_values: None,
+            items: None,
+            format: None,
+            properties: None,
+            additional_properties: None,
         }
     }
 
@@ -292,9 +302,46 @@ impl ToolFunctionArg {
     }
 
     #[allow(dead_code)]
+    pub fn enum_values<I, V>(mut self, values: I) -> Self
+    where
+        I: IntoIterator<Item = V>,
+        V: Into<Value>,
+    {
+        self.enum_values = Some(values.into_iter().map(Into::into).collect());
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn items<V: Into<Value>>(mut self, items: V) -> Self {
+        self.items = Some(Box::new(items.into()));
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn format(mut self, format: impl Into<String>) -> Self {
+        self.format = Some(format.into());
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn properties<V: Into<Value>>(mut self, properties: V) -> Self {
+        self.properties = Some(properties.into());
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn additional_properties<V: Into<Value>>(mut self, additional_properties: V) -> Self {
+        self.additional_properties = Some(additional_properties.into());
+        self
+    }
+
+    #[allow(dead_code)]
     pub fn schema(&self) -> Value {
         let mut v = serde_json::json!({"type": self.r#type});
 
+        if let Some(desc) = &self.description {
+            v["description"] = serde_json::json!(desc);
+        }
         if let Some(vv) = &self.default {
             v["default"] = vv.clone();
         }
@@ -303,6 +350,21 @@ impl ToolFunctionArg {
         }
         if let Some(vv) = &self.min {
             v["minimum"] = vv.clone();
+        }
+        if let Some(vv) = &self.enum_values {
+            v["enum"] = serde_json::json!(vv);
+        }
+        if let Some(vv) = &self.items {
+            v["items"] = (**vv).clone();
+        }
+        if let Some(vv) = &self.format {
+            v["format"] = serde_json::json!(vv);
+        }
+        if let Some(vv) = &self.properties {
+            v["properties"] = vv.clone();
+        }
+        if let Some(vv) = &self.additional_properties {
+            v["additionalProperties"] = vv.clone();
         }
         v
     }

@@ -156,13 +156,14 @@ impl Sense for ACSSense {
             "manual_review",
             "Submit the customer's request to manual review and return the review result",
             vec![
-                ToolFunctionArg::new("request", "string"),
-                ToolFunctionArg::new("reason", "string"),
+                ToolFunctionArg::new("request", "string").required(true),
+                ToolFunctionArg::new("reason", "string").required(true),
                 ToolFunctionArg::new("priority", "integer")
+                    .required(true)
                     .desc("Priority, 1-5, 5 is the highest")
                     .min(1)
                     .max(5),
-                ToolFunctionArg::new("risk_assessment", "string"),
+                ToolFunctionArg::new("risk_assessment", "string").required(true),
             ],
             |_st, _args| {
                 Box::pin(async move {
@@ -212,7 +213,7 @@ impl Sense for ACSSense {
         registry.register::<ACSState, _>(
             "get_service",
             "Get company specific services",
-            vec![ToolFunctionArg::new("service_name", "string")],
+            vec![ToolFunctionArg::new("service_name", "string").required(true)],
             |st, _args| {
                 let service_name = arg_str(_args, "service_name")?;
 
@@ -247,8 +248,8 @@ impl Sense for ACSSense {
             "send_encrypted_email",
             "Send the specified message to the specified email address over an encrypted channel",
             vec![
-                ToolFunctionArg::new("email", "string"),
-                ToolFunctionArg::new("message", "string"),
+                ToolFunctionArg::new("email", "string").required(true),
+                ToolFunctionArg::new("message", "string").required(true),
             ],
             |_st, _args| Ok("The message has been sent.".to_string()),
         );

@@ -385,4 +385,45 @@ mod tests {
 
         assert!(registry.schemas_filtered(&[]).is_none());
     }
+
+    #[test]
+    fn tool_arg_schema_keeps_descriptions_optional_required_and_structured_constraints() {
+        let mut registry = ToolRegistry::new();
+        registry.put_state(sense_state_new::<()>());
+        registry.register::<(), _>(
+            "schema_probe",
+            "测试工具 schema",
+            vec![
+                ToolFunctionArg::new("name", "string")
+                    .required(true)
+                    .desc("名称"),
+                ToolFunctionArg::new("mode", "string")
+                    .desc("模式")
+                    .enum_values(["preview", "apply"]),
+                ToolFunctionArg::new("items", "array")
+                    .desc("条目列表")
+                    .items(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string" }
+                        },
+                        "required": ["id"],
+                        "additionalProperties": false
+                    })),
+                ToolFunctionArg::new("callback", "string").format("uri"),
+            ],
+            |_state, _args| Ok("ok".to_string()),
+        );
+
+        let schema = registry.schemas().expect("应生成工具 schema");
+        let params = &schema[0]["function"]["parameters"];
+        assert_eq!(params["required"], serde_json::json!(["name"]));
+        assert_eq!(params["properties"]["name"]["description"], "名称");
+        assert_eq!(
+            params["properties"]["mode"]["enum"],
+            serde_json::json!(["preview", "apply"])
+        );
+        assert_eq!(params["properties"]["items"]["items"]["type"], "object");
+        assert_eq!(params["properties"]["callback"]["format"], "uri");
+    }
 }
