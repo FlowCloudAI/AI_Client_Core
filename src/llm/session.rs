@@ -819,12 +819,18 @@ impl LLMSession {
             } else {
                 (req, AssembledTurn::default().read_only)
             };
+            let auto_confirm_writes = current_ctx
+                .flags
+                .get("auto_confirm_writes")
+                .copied()
+                .unwrap_or(false);
             let enabled_tools = Self::enabled_tool_names_from_request(&req);
             log::info!(
-                "[client:drive][assemble_done] turn_id={} elapsed_ms={} read_only={} messages={} tool_count={}",
+                "[client:drive][assemble_done] turn_id={} elapsed_ms={} read_only={} auto_confirm_writes={} messages={} tool_count={}",
                 self.turn_id,
                 stage_started.elapsed().as_millis(),
                 read_only,
+                auto_confirm_writes,
                 req.messages.len(),
                 req.tools.as_ref().map_or(0, Vec::len)
             );
@@ -915,6 +921,7 @@ impl LLMSession {
                             calls,
                             &enabled_tools,
                             read_only,
+                            auto_confirm_writes,
                             &mut turn_cancel,
                             &event_tx,
                         )
@@ -1451,6 +1458,7 @@ impl LLMSession {
         tool_calls: Vec<ToolCall>,
         enabled_tools: &Option<HashSet<String>>,
         read_only: bool,
+        auto_confirm_writes: bool,
         cancel: &mut TurnCancel,
         event_tx: &mpsc::Sender<SessionEvent>,
     ) -> Result<bool> {
@@ -1575,9 +1583,11 @@ impl LLMSession {
                     func_name
                 );
                 let conduct_started = Instant::now();
-                let conduct_fut =
+                let conduct_fut = crate::tool::with_auto_confirm_writes(
+                    auto_confirm_writes,
                     self.tool_registry
-                        .conduct(func_name, Some(&args_v), Duration::from_secs(600));
+                        .conduct(func_name, Some(&args_v), Duration::from_secs(600)),
+                );
                 match tokio::select! {
                     result = conduct_fut => result,
                     _ = cancel.cancelled() => {
