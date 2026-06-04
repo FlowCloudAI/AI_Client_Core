@@ -19,7 +19,9 @@ incremental = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-wasmtime = { version = "42", features = ["component-model"] }
+# all-arch 引入 Cranelift 的 Pulley 后端，移动端据此把 wasm 编成可移植字节码并解释执行，
+# 绕开 JIT 可执行内存在 16KB/64KB 页设备上的对齐崩溃（详见 src/plugin/engine.rs）。
+wasmtime = { version = "42", features = ["component-model", "all-arch"] }
 anyhow = "1"
 log = "0.4"
 reqwest = { version = "0.13", features = ["json", "stream", "gzip"] }

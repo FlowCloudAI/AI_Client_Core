@@ -1,3 +1,4 @@
+pub mod engine;
 pub mod mapper;
 pub mod pool;
 pub mod registry;

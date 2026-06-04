@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use wasmtime::component::Linker;
-use wasmtime::{Config, Engine};
+use wasmtime::Engine;
 
 pub struct PluginManager {
     plug_path: PathBuf,
@@ -39,12 +39,7 @@ pub struct PluginLoadError {
 
 impl PluginManager {
     pub fn new(plug_path: PathBuf) -> Result<Self> {
-        let mut config = Config::new();
-        config.wasm_component_model(true);
-        let engine = Engine::new(&config).map_err(|e| {
-            ClientError::new(ErrorCode::CoreClientInitFailed, "创建 WebAssembly 引擎失败")
-                .with_kv("source", e.to_string())
-        })?;
+        let engine = super::engine::build_plugin_engine()?;
         let mut linker = Linker::new(&engine);
 
         wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|e| {

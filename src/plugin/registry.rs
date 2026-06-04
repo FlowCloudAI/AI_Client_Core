@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::Result;
-use wasmtime::{Config, Engine};
+use wasmtime::Engine;
 
 use crate::error::{ClientError, ErrorCode};
 use crate::plugin::host::HostState;
@@ -85,12 +85,7 @@ impl PluginRegistry {
 
     /// 空 registry，无插件。仅未指定插件的管道会走 passthrough。
     pub fn empty() -> Result<Self> {
-        let mut config = Config::new();
-        config.wasm_component_model(true);
-        let engine = Engine::new(&config).map_err(|e| {
-            ClientError::new(ErrorCode::CoreClientInitFailed, "创建 WebAssembly 引擎失败")
-                .with_kv("source", e.to_string())
-        })?;
+        let engine = super::engine::build_plugin_engine()?;
         let mut linker = Linker::new(&engine);
         wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|e| {
             ClientError::new(ErrorCode::CoreClientInitFailed, "向 linker 注册 WASI 失败")
