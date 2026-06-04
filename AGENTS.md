@@ -64,5 +64,5 @@ core_ai_client/
 
 ## 文档同步依据（本次核对）
 
-- 同步时间：2026-06-03 21:04:46 +08:00
+- 同步时间：2026-06-04 17:03:10 +08:00
 - 依据文件：`core_ai_client/Cargo.toml`、`core_ai_client/src`、`core_ai_client/examples`、`core_ai_client/plugins`、`core_ai_client/wit`
