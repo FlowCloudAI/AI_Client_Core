@@ -1,36 +1,43 @@
-# 流云AI 客户端核心库（core_ai_client）
+# FlowCloudAI 客户端核心库（core_ai_client）
 
-`core_ai_client` 是 FlowCloudAI 的 Rust 核心 AI 能力库，统一封装文本、图片与语音能力的调用和会话状态管理。  
-仓库通过统一接口对外输出 LLM、工具编排和插件映射能力，供桌面端与服务端复用。
+`core_ai_client` 是 FlowCloudAI 的 Rust AI 核心客户端，提供统一会话入口与能力编排，对接文本、图片、语音和工具调用能力，并对外输出稳定的 `.fcplug` 映射。
+
+## 项目简介
+
+仓库以“能力库 + 可复现示例”组织，核心目标是把多模态模型和插件能力统一成同一调用风格，避免上层应用重复适配。  
+在修改能力口径时，需要同步关注上下文状态、错误语义和兼容边界。
 
 ## 快速开始
 
-### 安装与运行
+### 安装与编译
 
 ```bash
 cd core_ai_client
 cargo build
+cargo build --release
 cargo test
-cargo run --example main
 ```
 
-### 最小示例
+### 体验示例
 
-1. 运行 `cargo run --example llm_ai_dialogue`，验证流式 LLM 输出。  
-2. 运行 `cargo run --example orchestrate`，验证工具链编排与恢复逻辑。  
-3. 运行 `cargo run --example image` 或 `cargo run --example tts`，验证多模态能力入口。
+```bash
+cargo run --example main
+cargo run --example llm_ai_dialogue
+cargo run --example orchestrate
+cargo run --example image
+cargo run --example tts
+```
 
 ## 主要功能 / 使用方式
 
-- 统一会话管理与会话状态机。  
-- 文本、图片、语音、工具链统一调度。  
-- 与 `.fcplug` 插件能力映射对接。  
-- 提供可运行示例作为接口回归入口。
+- 会话管理、状态转发与错误边界定义。  
+- 文本、图片、语音等多模态能力统一入口。  
+- `.fcplug` 插件映射与版本兼容检查。  
+- 示例程序作为 API 行为回归与复现脚本。  
 
 ## 技术栈
 
-- Rust 2024、Tokio、策略化会话抽象。  
-- `anyhow`、`serde`、`reqwest`、`wasmtime` 与 WIT 约定。  
+- Rust 2024、Tokio、serde、reqwest、wasmtime、WIT  
 
 ## 目录结构（仅顶层）
 
@@ -44,5 +51,8 @@ core_ai_client/
 
 ## 许可证与贡献方式
 
-许可证以子仓库与上级声明为准。  
-提交前补充 `cargo test`、示例命令输出和兼容影响说明。
+- 许可证：`core_ai_client/LICENSE`。  
+- 贡献前请补充 `cargo test` 与关键示例命令的复现结果（含示例名与关键日志）。  
+- PR 需说明兼容影响、凭据条件和回退场景。  
+
+文档同步时间：2026-06-03 21:04:46 +08:00

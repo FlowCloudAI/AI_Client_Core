@@ -2,8 +2,8 @@
 
 ## 项目概览
 
-`core_ai_client` 是 FlowCloudAI 的 Rust 核心 AI 库，负责统一接入 LLM、图片、语音等能力，并提供会话与工具编排抽象。  
-它承接桌面端与网站端的能力调用，并与插件协议保持兼容。
+`core_ai_client` 是 FlowCloudAI 的 AI 核心库，统一封装文本、图片、语音与工具编排能力，负责与 `.fcplug` 映射的一致性对齐。  
+上层应用通过该库调用稳定接口，因此兼容性和错误语义边界是该仓库的核心约束。
 
 ## 构建 / 运行 / 测试 / lint
 
@@ -21,42 +21,48 @@ cargo run --example tts
 cargo run --example orchestrate
 ```
 
-该仓库未单独声明 `cargo fmt` 脚本，但通常以 `cargo test` 与示例结果作为最低回归线。
-
 ## 代码风格与命名约定
 
-- Rust `Edition 2024`，类型 `PascalCase`，函数与变量 `snake_case`。  
-- `anyhow::Result` 或显式错误类型统一错误语义。  
-- 示例与库代码的行为边界应保持一致，变更公开接口前需同步 `examples` 与调用方约束。
+- Rust 2024，类型 `PascalCase`，函数/变量 `snake_case`，常量 `SCREAMING_SNAKE_CASE`。  
+- 错误处理优先显式传播上下文，避免吞掉模型/网络关键状态。  
+- 与公开接口相关的结构体和枚举需保持语义字段命名稳定，避免无意义重构。  
 
-## 目录结构与职责
+## 目录结构与模块职责
 
 ```text
 core_ai_client/
-├── src/          # 会话、适配层、能力抽象
-├── examples/     # 可执行示例（main/orchestrate/image/tts 等）
-├── plugins/      # 插件协作相关定义与能力桥
-└── wit/          # WIT 交互约定
+├── src/
+│   ├── audio/       # 语音采集与解码
+│   ├── image/       # 图像输入与格式处理
+│   ├── llm/         # 文本与大模型能力
+│   ├── orchestrator/# 多能力编排
+│   ├── plugin/      # 插件调用映射
+│   ├── sense/       # 感知/事件能力
+│   └── tool/        # 工具调用接口
+├── examples/        # 可复现示例
+├── plugins/         # 插件公共约定
+└── wit/             # WIT 接口映射
 ```
 
 ## 安全 / 禁止事项
 
-- 不提交真实模型 API Key、密钥和内部测试账号。  
-- 不在仓库提交环境变量文件或生产凭据。  
-- 工具调用与模型输出需避免直接记录敏感 prompt 与用户原始输入。
+- 不提交真实模型 API Key、测试密钥、签名密钥和用户隐感数据。  
+- 示例输出、日志中不得保留会话明文、Token 或路径级凭据。  
+- 外部服务调用需保留超时与失败回退边界。  
 
-## 贡献方式与 PR 规范
+## 提交与 PR 规范
 
-- 变更接口时同步补齐最小可运行示例，至少给出受影响示例输出预期。  
-- PR 说明需包含变更路径、兼容性影响与回归命令。  
-- 提交信息默认中文。
+- 提交信息默认中文，单次变更聚焦单一能力域（如 LLM、TTS、插件映射等）。  
+- PR 必须给出 `cargo test` 与关键 `cargo run --example ...` 的结果。  
+- 修改公共接口时，附明示兼容性影响与回退方案。  
 
 ## 项目特有坑点
 
-- 示例运行依赖模型和网络环境，离线环境需在 PR 说明中标注。  
-- 与调用端协议约定不一致会导致上层会话链路静默降级，需同步更新映射测试。
+- 外部模型服务依赖较强，示例运行需具备网络与凭据条件。  
+- 与上层世界观语义口径不一致时，常见症状是流式响应静默或上下文丢失。  
+- WIT 字段变更会联动 `tool_fcplug` 与插件仓库，需统一同步验证。  
 
 ## 文档同步依据（本次核对）
 
-- 同步时间：2026-05-28 18:02:58 +08:00  
-- 依据文件：`core_ai_client/Cargo.toml`、`core_ai_client/examples`、`core_ai_client/src`
+- 同步时间：2026-06-03 21:04:46 +08:00
+- 依据文件：`core_ai_client/Cargo.toml`、`core_ai_client/src`、`core_ai_client/examples`、`core_ai_client/plugins`、`core_ai_client/wit`
