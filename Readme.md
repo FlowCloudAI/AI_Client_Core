@@ -1,15 +1,15 @@
 # FlowCloudAI 客户端核心库（core_ai_client）
 
-`core_ai_client` 是 FlowCloudAI 的 Rust AI 核心客户端，提供统一会话入口与能力编排，对接文本、图片、语音和工具调用能力，并对外输出稳定的 `.fcplug` 映射。
+`core_ai_client` 是 FlowCloudAI 的 Rust AI 核心客户端，统一提供会话入口、多模态能力与工具编排，并输出与 `.fcplug` 一致的能力映射。
 
 ## 项目简介
 
-仓库以“能力库 + 可复现示例”组织，核心目标是把多模态模型和插件能力统一成同一调用风格，避免上层应用重复适配。  
-在修改能力口径时，需要同步关注上下文状态、错误语义和兼容边界。
+仓库通过示例和可复用接口将模型、插件和上层应用行为对齐，降低桌面端与站点端重复适配成本。  
+修改能力模型时需要同步关注上下文管理、错误语义和兼容边界。
 
 ## 快速开始
 
-### 安装与编译
+### 安装与构建
 
 ```bash
 cd core_ai_client
@@ -22,22 +22,24 @@ cargo test
 
 ```bash
 cargo run --example main
+cargo run --example plugin_management
+cargo run --example llm
 cargo run --example llm_ai_dialogue
-cargo run --example orchestrate
 cargo run --example image
 cargo run --example tts
+cargo run --example orchestrate
 ```
 
 ## 主要功能 / 使用方式
 
-- 会话管理、状态转发与错误边界定义。  
+- 会话管理、状态转发与错误边界统一定义。  
 - 文本、图片、语音等多模态能力统一入口。  
-- `.fcplug` 插件映射与版本兼容检查。  
-- 示例程序作为 API 行为回归与复现脚本。  
+- `.fcplug` 插件映射、兼容性与版本验证。  
+- 示例用于 API 行为回归与复现场景。  
 
 ## 技术栈
 
-- Rust 2024、Tokio、serde、reqwest、wasmtime、WIT  
+- Rust 2024、Tokio、serde、reqwest、wasmtime、WIT
 
 ## 目录结构（仅顶层）
 
@@ -52,7 +54,7 @@ core_ai_client/
 ## 许可证与贡献方式
 
 - 许可证：`core_ai_client/LICENSE`。  
-- 贡献前请补充 `cargo test` 与关键示例命令的复现结果（含示例名与关键日志）。  
-- PR 需说明兼容影响、凭据条件和回退场景。  
+- PR 建议先跑通 `cargo test` 与关键示例，补充复现步骤与结果。  
+- 兼容性变更需附回退策略与影响范围。  
 
-文档同步时间：2026-06-04 17:03:10 +08:00
+文档同步时间：2026-06-05 12:44:21 +08:00
