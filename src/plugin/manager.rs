@@ -6,8 +6,8 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use wasmtime::component::Linker;
 use wasmtime::Engine;
+use wasmtime::component::Linker;
 
 pub struct PluginManager {
     plug_path: PathBuf,
