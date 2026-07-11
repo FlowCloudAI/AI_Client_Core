@@ -220,6 +220,12 @@ pub struct Delta {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// 插件可将厂商返回的累计正文标记为快照，由流解码器转换为增量。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_snapshot: Option<String>,
+    /// 插件可将厂商返回的累计思考内容标记为快照，由流解码器转换为增量。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content_snapshot: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
