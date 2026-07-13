@@ -108,16 +108,6 @@ impl PluginRegistry {
     ///
     /// 此阶段只编译 wasm module，不创建任何 Store 实例。
     /// 实例在首次 `acquire` 时按需创建。
-    pub fn build(
-        engine: Engine,
-        linker: Linker<HostState>,
-        plugin_metas: HashMap<String, PluginMeta>,
-        max_idle_per_pool: usize,
-    ) -> Result<Self> {
-        Self::build_with_report(engine, linker, plugin_metas, max_idle_per_pool)
-            .map(|(registry, _)| registry)
-    }
-
     /// 从 PluginManager 的扫描结果构建 Registry，并隔离单个插件的编译失败。
     ///
     /// 能成功编译的插件会进入注册表；失败插件会进入报告的 `skipped`，
@@ -276,19 +266,6 @@ impl PluginRegistry {
         Ok(self.state()?.pools.contains_key(id))
     }
 
-    /// 插件是否已加载（有活跃的实例池）。
-    ///
-    /// 兼容旧 API：锁异常时保守返回 false，严格路径请使用 `try_is_loaded`。
-    pub fn is_loaded(&self, id: &str) -> bool {
-        match self.try_is_loaded(id) {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                log::error!("[plugin] legacy is_loaded failed for '{id}': {error:#}");
-                false
-            }
-        }
-    }
-
     // ── 实例借出 ──
 
     /// 从指定插件的池中借出一个 mapper。
@@ -339,35 +316,9 @@ impl PluginRegistry {
         Ok(self.state()?.plugins.get(plugin_id).cloned())
     }
 
-    /// 获取插件元数据。
-    ///
-    /// 兼容旧 API：锁异常时返回 None，严格路径请使用 `try_get_meta`。
-    pub fn get_meta(&self, plugin_id: &str) -> Option<PluginMeta> {
-        match self.try_get_meta(plugin_id) {
-            Ok(meta) => meta,
-            Err(error) => {
-                log::error!("[plugin] legacy get_meta failed for '{plugin_id}': {error:#}");
-                None
-            }
-        }
-    }
-
     /// 获取所有插件元数据列表。
     pub fn try_list_plugins(&self) -> Result<Vec<PluginMeta>> {
         Ok(self.state()?.plugins.values().cloned().collect())
-    }
-
-    /// 获取所有插件元数据列表。
-    ///
-    /// 兼容旧 API：锁异常时返回空列表，严格路径请使用 `try_list_plugins`。
-    pub fn list_plugins(&self) -> Vec<PluginMeta> {
-        match self.try_list_plugins() {
-            Ok(plugins) => plugins,
-            Err(error) => {
-                log::error!("[plugin] legacy list_plugins failed: {error:#}");
-                Vec::new()
-            }
-        }
     }
 
     /// 按类型筛选插件。
@@ -381,19 +332,6 @@ impl PluginRegistry {
             .collect())
     }
 
-    /// 按类型筛选插件。
-    ///
-    /// 兼容旧 API：锁异常时返回空列表，严格路径请使用 `try_list_by_kind`。
-    pub fn list_by_kind(&self, kind: PluginKind) -> Vec<PluginMeta> {
-        match self.try_list_by_kind(kind) {
-            Ok(plugins) => plugins,
-            Err(error) => {
-                log::error!("[plugin] legacy list_by_kind failed: {error:#}");
-                Vec::new()
-            }
-        }
-    }
-
     /// 获取所有已加载插件的池状态（诊断用）。
     pub fn try_pool_stats(&self) -> Result<HashMap<String, usize>> {
         Ok(self
@@ -404,27 +342,7 @@ impl PluginRegistry {
             .collect())
     }
 
-    /// 获取所有已加载插件的池状态（诊断用）。
-    ///
-    /// 兼容旧 API：锁异常时返回空 map，严格路径请使用 `try_pool_stats`。
-    pub fn pool_stats(&self) -> HashMap<String, usize> {
-        match self.try_pool_stats() {
-            Ok(stats) => stats,
-            Err(error) => {
-                log::error!("[plugin] legacy pool_stats failed: {error:#}");
-                HashMap::new()
-            }
-        }
-    }
-
     // ── 引用计数管理 ──
-
-    /// 增加插件引用计数（session 创建时调用）。
-    pub fn try_increment_ref(&self, plugin_id: &str) -> Result<()> {
-        let mut state = self.state()?;
-        Self::increment_ref_in_state(&mut state, plugin_id);
-        Ok(())
-    }
 
     /// 仅当插件当前已加载时增加引用计数。
     pub fn try_increment_loaded_ref(&self, plugin_id: &str) -> Result<()> {
@@ -445,10 +363,11 @@ impl PluginRegistry {
     ) -> Result<()> {
         let mut state = self.state()?;
 
-        if let Some(new_id) = new_plugin_id {
-            if require_new_loaded && !state.pools.contains_key(new_id) {
-                return Err(Self::plugin_not_loaded(new_id).into());
-            }
+        if let Some(new_id) = new_plugin_id
+            && require_new_loaded
+            && !state.pools.contains_key(new_id)
+        {
+            return Err(Self::plugin_not_loaded(new_id).into());
         }
 
         if let Some(old_id) = old_plugin_id {
@@ -476,19 +395,6 @@ impl PluginRegistry {
             .get(plugin_id)
             .copied()
             .unwrap_or(0))
-    }
-
-    /// 获取插件引用计数。
-    ///
-    /// 兼容旧 API：锁异常时返回 `usize::MAX`，代表未知且应视为 busy。
-    pub fn get_ref_count(&self, plugin_id: &str) -> usize {
-        match self.try_get_ref_count(plugin_id) {
-            Ok(count) => count,
-            Err(error) => {
-                log::error!("[plugin] legacy get_ref_count failed for '{plugin_id}': {error:#}");
-                usize::MAX
-            }
-        }
     }
 
     // ── 动态模块加载 ──
@@ -566,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn state_poison_try_api_returns_error_legacy_api_is_safe() {
+    fn state_poison_try_api_returns_error() {
         let registry = PluginRegistry::empty().unwrap();
         let _ = catch_unwind(AssertUnwindSafe(|| {
             let _guard = registry.state.lock().unwrap();
@@ -575,9 +481,6 @@ mod tests {
 
         assert!(registry.try_list_plugins().is_err());
         assert!(registry.try_get_ref_count("p").is_err());
-        assert!(registry.list_plugins().is_empty());
-        assert!(!registry.is_loaded("p"));
-        assert_eq!(registry.get_ref_count("p"), usize::MAX);
     }
 
     #[test]
@@ -614,7 +517,11 @@ mod tests {
     #[test]
     fn unload_observes_ref_count_under_registry_state_lock() {
         let registry = PluginRegistry::empty().unwrap();
-        registry.try_increment_ref("p").unwrap();
+        registry
+            .state()
+            .unwrap()
+            .ref_counts
+            .insert("p".to_string(), 1);
 
         let err = registry.unload("p").unwrap_err();
         assert!(

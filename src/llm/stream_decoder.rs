@@ -85,13 +85,13 @@ impl StreamDecoder {
 
         for (choice_i, choice) in resp.choices.into_iter().enumerate() {
             // content delta / reasoning delta 你照旧发给 Session -> UI
-            if let Some(delta) = choice.delta.content {
-                if !delta.is_empty() {
-                    out.push(Ok(DecoderEvent {
-                        event_info: self.next_info(),
-                        payload: DecoderEventPayload::AssistantContentDelta { delta },
-                    }));
-                }
+            if let Some(delta) = choice.delta.content
+                && !delta.is_empty()
+            {
+                out.push(Ok(DecoderEvent {
+                    event_info: self.next_info(),
+                    payload: DecoderEventPayload::AssistantContentDelta { delta },
+                }));
             }
             if let Some(snapshot) = choice.delta.content_snapshot {
                 let delta = snapshot_delta(&mut self.content_snapshots, choice_i, snapshot);
@@ -102,13 +102,13 @@ impl StreamDecoder {
                     }));
                 }
             }
-            if let Some(delta) = choice.delta.reasoning_content {
-                if !delta.is_empty() {
-                    out.push(Ok(DecoderEvent {
-                        event_info: self.next_info(),
-                        payload: DecoderEventPayload::AssistantReasoningDelta { delta },
-                    }));
-                }
+            if let Some(delta) = choice.delta.reasoning_content
+                && !delta.is_empty()
+            {
+                out.push(Ok(DecoderEvent {
+                    event_info: self.next_info(),
+                    payload: DecoderEventPayload::AssistantReasoningDelta { delta },
+                }));
             }
             if let Some(snapshot) = choice.delta.reasoning_content_snapshot {
                 let delta = snapshot_delta(&mut self.reasoning_snapshots, choice_i, snapshot);

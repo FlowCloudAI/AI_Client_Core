@@ -1,5 +1,5 @@
 use crate::error::{ClientError, ErrorCode};
-use crate::plugin::types::{PluginManifest, PluginMeta};
+use crate::plugin::types::PluginManifest;
 use anyhow::Result;
 use std::fs;
 use std::fs::File;
@@ -38,10 +38,6 @@ impl PluginScanner {
         })?;
         let info = PluginManifest::parse(&buf)?;
         Ok(info)
-    }
-
-    pub fn build_plugin_meta(manifest: PluginManifest, fcplug: &Path) -> Result<PluginMeta> {
-        PluginMeta::from_manifest(manifest, fcplug.to_path_buf())
     }
 
     pub fn scan_plugins(dir: &Path) -> Result<Vec<PathBuf>> {

@@ -66,6 +66,12 @@ pub struct ToolRegistry {
     state: HashMap<TypeId, Box<dyn Any + Send + Sync + 'static>>,
 }
 
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
@@ -109,9 +115,7 @@ impl ToolRegistry {
         let handler = Arc::new(handler);
 
         let wrapped: Handler = Arc::new(move |reg, args| {
-            let arc = reg
-                .state_or_err::<crate::sense::SenseState<T>>()
-                .map(|x| x.clone());
+            let arc = reg.state_or_err::<crate::sense::SenseState<T>>().cloned();
             let handler = Arc::clone(&handler);
 
             Box::pin(async move {
@@ -146,9 +150,7 @@ impl ToolRegistry {
         let handler = Arc::new(handler);
 
         let wrapped: Handler = Arc::new(move |reg, args| {
-            let arc = reg
-                .state_or_err::<crate::sense::SenseState<T>>()
-                .map(|x| x.clone());
+            let arc = reg.state_or_err::<crate::sense::SenseState<T>>().cloned();
             let handler = Arc::clone(&handler);
 
             Box::pin(async move {

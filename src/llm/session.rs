@@ -208,7 +208,7 @@ impl LLMSession {
             let mut conv = self.conversation.write().await;
             if let Some(mut request) = sense.default_request() {
                 // 将 default_request 中预置的 messages 移入 system_messages
-                sys_msgs.extend(request.messages.drain(..));
+                sys_msgs.append(&mut request.messages);
                 *conv = request;
                 conv.messages.clear();
             }
@@ -744,18 +744,18 @@ impl LLMSession {
             }
 
             // 每轮开始前尝试更新 context（非阻塞）。上下文只保留最新值，避免等待用户输入时积压。
-            if let Some(ref mut rx) = ctx_rx {
-                if rx.has_changed().unwrap_or(false) {
-                    current_ctx = rx.borrow_and_update().clone();
-                    log::info!(
-                        "[client:drive][context_updated] next_turn_id={} project_id={:?} task_type={} attributes={} flags={}",
-                        self.turn_id + 1,
-                        current_ctx.project_id.as_deref(),
-                        current_ctx.task_type,
-                        current_ctx.attributes.len(),
-                        current_ctx.flags.len()
-                    );
-                }
+            if let Some(ref mut rx) = ctx_rx
+                && rx.has_changed().unwrap_or(false)
+            {
+                current_ctx = rx.borrow_and_update().clone();
+                log::info!(
+                    "[client:drive][context_updated] next_turn_id={} project_id={:?} task_type={} attributes={} flags={}",
+                    self.turn_id + 1,
+                    current_ctx.project_id.as_deref(),
+                    current_ctx.task_type,
+                    current_ctx.attributes.len(),
+                    current_ctx.flags.len()
+                );
             }
 
             // 记录本轮开始时的 head 节点（用于 TurnBegin 事件）
@@ -893,53 +893,53 @@ impl LLMSession {
                     .await
                 };
 
-            if finish_reason.as_deref() == Some("tool_calls") {
-                if let Some(calls) = tool_calls {
-                    tool_rounds += 1;
-                    if tool_rounds > self.config.max_tool_rounds {
-                        let status = TurnStatus::Error(
-                            ClientError::new(
-                                ErrorCode::LlmToolCallFailed,
-                                format!(
-                                    "工具调用超过最大连续轮数限制: {}",
-                                    self.config.max_tool_rounds
-                                ),
-                            )
-                            .with_kv("max_tool_rounds", self.config.max_tool_rounds as u64)
-                            .with_kv("tool_rounds", tool_rounds as u64),
-                        );
-                        event_tx
-                            .send(SessionEvent::TurnEnd {
-                                status,
-                                node_id: asst_node_id,
-                                usage: accumulated_usage.take(),
-                            })
-                            .await?;
-                        continue;
-                    }
-                    if self
-                        .execute_tool_calls(
-                            calls,
-                            &enabled_tools,
-                            read_only,
-                            auto_confirm_writes,
-                            &mut turn_cancel,
-                            &event_tx,
+            if finish_reason.as_deref() == Some("tool_calls")
+                && let Some(calls) = tool_calls
+            {
+                tool_rounds += 1;
+                if tool_rounds > self.config.max_tool_rounds {
+                    let status = TurnStatus::Error(
+                        ClientError::new(
+                            ErrorCode::LlmToolCallFailed,
+                            format!(
+                                "工具调用超过最大连续轮数限制: {}",
+                                self.config.max_tool_rounds
+                            ),
                         )
-                        .await?
-                    {
-                        force_wait_for_user = true;
-                        event_tx
-                            .send(SessionEvent::TurnEnd {
-                                status: TurnStatus::Cancelled,
-                                node_id: asst_node_id,
-                                usage: accumulated_usage.take(),
-                            })
-                            .await?;
-                        continue;
-                    }
+                        .with_kv("max_tool_rounds", self.config.max_tool_rounds as u64)
+                        .with_kv("tool_rounds", tool_rounds as u64),
+                    );
+                    event_tx
+                        .send(SessionEvent::TurnEnd {
+                            status,
+                            node_id: asst_node_id,
+                            usage: accumulated_usage.take(),
+                        })
+                        .await?;
                     continue;
                 }
+                if self
+                    .execute_tool_calls(
+                        calls,
+                        &enabled_tools,
+                        read_only,
+                        auto_confirm_writes,
+                        &mut turn_cancel,
+                        &event_tx,
+                    )
+                    .await?
+                {
+                    force_wait_for_user = true;
+                    event_tx
+                        .send(SessionEvent::TurnEnd {
+                            status: TurnStatus::Cancelled,
+                            node_id: asst_node_id,
+                            usage: accumulated_usage.take(),
+                        })
+                        .await?;
+                    continue;
+                }
+                continue;
             }
 
             event_tx
@@ -957,7 +957,7 @@ impl LLMSession {
             .read()
             .await
             .head_role()
-            .map_or(true, |r| r == "assistant")
+            .is_none_or(|r| r == "assistant")
     }
 
     async fn head_is_user(&self) -> bool {
@@ -1282,7 +1282,7 @@ impl LLMSession {
                 break 'outer;
             }
             line_count += 1;
-            if line_count == 1 || line_count % 50 == 0 {
+            if line_count == 1 || line_count.is_multiple_of(50) {
                 log::info!(
                     "[client:llm][stream_line_received] turn_id={} line_count={} bytes={}",
                     self.turn_id,
@@ -1713,9 +1713,11 @@ mod tests {
     fn new_test_session() -> LLMSession {
         let registry = Arc::new(PluginRegistry::empty().unwrap());
         let pipeline = ApiPipeline::try_new(registry, None).unwrap();
-        let mut config = SessionConfig::default();
-        config.base_url = "https://example.test".to_string();
-        config.api_key = "test-key".into();
+        let config = SessionConfig {
+            base_url: "https://example.test".to_string(),
+            api_key: "test-key".into(),
+            ..SessionConfig::default()
+        };
         LLMSession::new(config, pipeline, Arc::new(ToolRegistry::new())).unwrap()
     }
 
@@ -1747,11 +1749,13 @@ mod tests {
     ) -> LLMSession {
         let registry = Arc::new(PluginRegistry::empty().unwrap());
         let pipeline = ApiPipeline::try_new(registry, None).unwrap();
-        let mut config = SessionConfig::default();
-        config.base_url = base_url;
-        config.api_key = "test-key".into();
-        config.event_buffer = 64;
-        config.max_tool_rounds = 4;
+        let config = SessionConfig {
+            base_url,
+            api_key: "test-key".into(),
+            event_buffer: 64,
+            max_tool_rounds: 4,
+            ..SessionConfig::default()
+        };
 
         let mut session = LLMSession::new(config, pipeline, tool_registry).unwrap();
         session.set_model("mock-model").await;

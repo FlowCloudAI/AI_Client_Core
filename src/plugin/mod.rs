@@ -1,14 +1,12 @@
-pub mod engine;
-pub mod mapper;
-pub mod pool;
-pub mod registry;
+pub(crate) mod engine;
+pub(crate) mod mapper;
+pub(crate) mod pool;
+pub(crate) mod registry;
 pub mod types;
 
-// 以下模块保留原有实现，按你的项目实际路径调整
-pub mod bindings; // wasm 绑定（wit-bindgen 生成）
-pub mod host; // HostState 定义
-pub mod manager;
-pub mod scanner;
+pub(crate) mod bindings;
+pub(crate) mod host;
+pub(crate) mod manager;
+pub(crate) mod scanner;
 
-pub mod loaded;
-pub mod pipeline;
+pub(crate) mod pipeline;

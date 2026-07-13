@@ -167,19 +167,18 @@ impl ConversationTree {
             while let Some(id) = cur {
                 if let Some(cycle_start) = visited.get(&id).copied() {
                     let cycle_nodes = &path[cycle_start..];
-                    if let Some(break_node_id) = cycle_nodes.iter().min().copied() {
-                        if let Some(node) = self.nodes.get_mut(&break_node_id) {
-                            if let Some(old_parent) = node.parent.take() {
-                                repaired += 1;
-                                log::warn!(
-                                    "[client:tree][parent_cycle_repaired] start={} break_node={} old_parent={} cycle_len={}",
-                                    start,
-                                    break_node_id,
-                                    old_parent,
-                                    cycle_nodes.len()
-                                );
-                            }
-                        }
+                    if let Some(break_node_id) = cycle_nodes.iter().min().copied()
+                        && let Some(node) = self.nodes.get_mut(&break_node_id)
+                        && let Some(old_parent) = node.parent.take()
+                    {
+                        repaired += 1;
+                        log::warn!(
+                            "[client:tree][parent_cycle_repaired] start={} break_node={} old_parent={} cycle_len={}",
+                            start,
+                            break_node_id,
+                            old_parent,
+                            cycle_nodes.len()
+                        );
                     }
                     break;
                 }

@@ -511,15 +511,15 @@ impl TTSInfo {
             }
         }
 
-        if let Some(default_voice) = &self.default_voice {
-            if !self.voices.iter().any(|voice| voice.id == *default_voice) {
-                return Err(ClientError::new(
-                    ErrorCode::PluginManifestInvalid,
-                    "default-voice 必须匹配某个已声明的 voice id",
-                )
-                .with_kv("default_voice", default_voice.clone())
-                .into());
-            }
+        if let Some(default_voice) = &self.default_voice
+            && !self.voices.iter().any(|voice| voice.id == *default_voice)
+        {
+            return Err(ClientError::new(
+                ErrorCode::PluginManifestInvalid,
+                "default-voice 必须匹配某个已声明的 voice id",
+            )
+            .with_kv("default_voice", default_voice.clone())
+            .into());
         }
 
         validate_positive("max-characters", self.max_characters)?;
@@ -646,10 +646,10 @@ fn validate_url_policy(raw: &str) -> Result<()> {
             if host.eq_ignore_ascii_case("localhost") {
                 return Ok(());
             }
-            if let Ok(ip) = host.parse::<IpAddr>() {
-                if ip.is_loopback() {
-                    return Ok(());
-                }
+            if let Ok(ip) = host.parse::<IpAddr>()
+                && ip.is_loopback()
+            {
+                return Ok(());
             }
             Err(manifest_invalid("HTTP 仅允许指向 localhost / loopback 端点").into())
         }
@@ -678,14 +678,14 @@ fn validate_models(models: &[ModelInfo]) -> Result<()> {
 }
 
 fn validate_default_model(default_model: Option<&str>, models: &[ModelInfo]) -> Result<()> {
-    if let Some(default_model) = default_model {
-        if !models.iter().any(|model| model.id == default_model) {
-            return Err(
-                manifest_invalid("default-model 必须匹配某个已声明的 model id")
-                    .with_kv("default_model", default_model.to_string())
-                    .into(),
-            );
-        }
+    if let Some(default_model) = default_model
+        && !models.iter().any(|model| model.id == default_model)
+    {
+        return Err(
+            manifest_invalid("default-model 必须匹配某个已声明的 model id")
+                .with_kv("default_model", default_model.to_string())
+                .into(),
+        );
     }
     Ok(())
 }

@@ -1,7 +1,3 @@
-#[cfg(feature = "local-apis")]
-#[path = "apis/mod.rs"]
-mod apis;
-#[cfg(not(feature = "local-apis"))]
 #[path = "support/apis.rs"]
 mod apis;
 mod senses;
@@ -155,10 +151,10 @@ async fn handle_event(
 ) -> Result<()> {
     match ev {
         SessionEvent::NeedInput => {
-            if let Some(msg) = me_state.pending_input.take() {
-                if me_tx.send(msg).await.is_err() {
-                    return Ok(());
-                }
+            if let Some(msg) = me_state.pending_input.take()
+                && me_tx.send(msg).await.is_err()
+            {
+                return Ok(());
             }
         }
 

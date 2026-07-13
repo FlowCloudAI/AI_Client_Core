@@ -1,7 +1,7 @@
 /// 插件管理功能测试示例
 ///
 /// 演示如何使用 FlowCloudAIClient 的插件管理 API：
-/// - list_all_plugins: 列出所有已识别插件
+/// - list_plugins: 列出所有已识别插件
 /// - install_plugin_from_path: 从外部路径安装插件
 /// - uninstall_plugin: 卸载插件（含引用计数检查）
 use anyhow::Result;
@@ -14,14 +14,14 @@ fn main() -> Result<()> {
     let client = FlowCloudAIClient::new(plugins_dir.clone())?;
 
     println!("=== 1. 列出所有已识别插件 ===");
-    let plugins = client.list_all_plugins();
+    let plugins = client.list_plugins();
     println!("找到 {} 个插件:", plugins.len());
     for plugin in &plugins {
         println!(
-            "  - {} (v{}) [{}]\n    作者: {}\n    描述: {}\n    路径: {:?}",
+            "  - {} (v{}) [{:?}]\n    作者: {}\n    描述: {}\n    路径: {:?}",
             plugin.name,
             plugin.version,
-            format!("{:?}", plugin.kind),
+            plugin.kind,
             plugin.author,
             plugin.description,
             plugin.fcplug_path

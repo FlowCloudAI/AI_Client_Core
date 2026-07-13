@@ -3,10 +3,6 @@ use flowcloudai_client::FlowCloudAIClient;
 use flowcloudai_client::image::ImageRequest;
 use std::path::PathBuf;
 
-#[cfg(feature = "local-apis")]
-#[path = "apis/mod.rs"]
-mod apis;
-#[cfg(not(feature = "local-apis"))]
 #[path = "support/apis.rs"]
 mod apis;
 

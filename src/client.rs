@@ -1,4 +1,3 @@
-use crate::PluginScanner;
 use crate::error::{ClientError, ErrorCode};
 use crate::image::ImageSession;
 use crate::llm::config::{SecretString, SessionConfig};
@@ -7,6 +6,7 @@ use crate::orchestrator::Orchestrate;
 use crate::plugin::manager::{PluginLoadError, PluginLoadReport, PluginManager};
 use crate::plugin::pipeline::ApiPipeline;
 use crate::plugin::registry::PluginRegistry;
+use crate::plugin::scanner::PluginScanner;
 use crate::plugin::types::{PluginKind, PluginMeta};
 use crate::sense::Sense;
 use crate::tool::registry::ToolRegistry;
@@ -115,13 +115,6 @@ impl FlowCloudAIClient {
         &self.plugin_load_report
     }
 
-    /// 返回所有已识别插件的完整元数据列表。
-    ///
-    /// 包括 id, name, version, description, author, kind, fcplug_path 等字段。
-    pub fn list_all_plugins(&self) -> Vec<PluginMeta> {
-        self.list_plugins()
-    }
-
     /// 获取插件的引用计数（用于诊断）。
     pub fn get_plugin_ref_count(&self, plugin_id: &str) -> usize {
         match self.plugin_registry.try_get_ref_count(plugin_id) {
@@ -131,11 +124,6 @@ impl FlowCloudAIClient {
                 usize::MAX
             }
         }
-    }
-
-    /// 严格获取插件的引用计数。
-    pub fn try_get_plugin_ref_count(&self, plugin_id: &str) -> Result<usize> {
-        self.plugin_registry.try_get_ref_count(plugin_id)
     }
 
     /// 卸载插件：从运行时移除并删除 .fcplug 文件。
@@ -247,7 +235,7 @@ impl FlowCloudAIClient {
         }
 
         // 3. 构建 PluginMeta
-        let meta = PluginScanner::build_plugin_meta(manifest.clone(), &dest_path)?;
+        let meta = PluginMeta::from_manifest(manifest.clone(), dest_path.clone())?;
 
         // 4. 读取 wasm bytes 并添加到 registry
         let wasm_bytes = {

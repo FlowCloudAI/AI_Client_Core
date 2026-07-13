@@ -13,96 +13,28 @@ use crate::plugin::types::{PluginKind, ThinkingEffort};
 pub struct ApiPipeline {
     registry: Arc<PluginRegistry>,
     plugin_id: Option<String>,
-    mode: PipelineMode,
-}
-
-/// 插件管道模式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PipelineMode {
-    /// 严格模式：指定插件但未加载时返回错误。
-    Strict,
-    /// 兼容模式：指定插件不可用时允许直通。
-    AllowPassthrough,
 }
 
 impl ApiPipeline {
-    /// 创建严格管道。
-    ///
-    /// 兼容旧 API：引用计数锁异常时不会 panic。新代码应优先使用 `try_new`。
-    pub fn new(registry: Arc<PluginRegistry>, plugin_id: Option<String>) -> Self {
-        Self::with_mode(registry, plugin_id, PipelineMode::Strict)
-    }
-
-    /// 创建指定模式的管道。
-    ///
-    /// 兼容旧 API：引用计数锁异常时不会 panic。新代码应优先使用 `try_with_mode`。
-    pub fn with_mode(
-        registry: Arc<PluginRegistry>,
-        plugin_id: Option<String>,
-        mode: PipelineMode,
-    ) -> Self {
-        match Self::try_with_mode(Arc::clone(&registry), plugin_id.clone(), mode) {
-            Ok(pipeline) => pipeline,
-            Err(error) => {
-                log::error!(
-                    "[plugin] legacy ApiPipeline::with_mode failed to update ref-count: {error:#}"
-                );
-                Self {
-                    registry,
-                    plugin_id,
-                    mode,
-                }
-            }
-        }
-    }
-
-    /// 创建严格管道，失败时返回错误。
+    /// 创建插件管道，指定插件时要求插件已经加载。
     pub fn try_new(registry: Arc<PluginRegistry>, plugin_id: Option<String>) -> Result<Self> {
-        Self::try_with_mode(registry, plugin_id, PipelineMode::Strict)
-    }
-
-    /// 创建指定模式的管道，失败时返回错误。
-    pub fn try_with_mode(
-        registry: Arc<PluginRegistry>,
-        plugin_id: Option<String>,
-        mode: PipelineMode,
-    ) -> Result<Self> {
         if let Some(id) = &plugin_id {
-            if mode == PipelineMode::Strict {
-                registry.try_increment_loaded_ref(id)?;
-            } else {
-                registry.try_increment_ref(id)?;
-            }
+            registry.try_increment_loaded_ref(id)?;
         }
         Ok(Self {
             registry,
             plugin_id,
-            mode,
         })
     }
 
     /// 切换到另一个插件（正确维护引用计数）。
-    ///
-    /// 兼容旧 API：切换失败时保留原插件配置。新代码应优先使用 `try_set_plugin`。
-    pub fn set_plugin(&mut self, new_plugin_id: Option<String>) {
-        if let Err(error) = self.try_set_plugin(new_plugin_id) {
-            log::error!(
-                "[plugin] legacy ApiPipeline::set_plugin failed to update ref-count: {error:#}"
-            );
-        }
-    }
-
-    /// 切换到另一个插件，失败时返回错误并尽量保留原插件配置。
     pub fn try_set_plugin(&mut self, new_plugin_id: Option<String>) -> Result<()> {
         if self.plugin_id == new_plugin_id {
             return Ok(());
         }
 
-        self.registry.try_switch_ref(
-            self.plugin_id.as_deref(),
-            new_plugin_id.as_deref(),
-            self.mode == PipelineMode::Strict,
-        )?;
+        self.registry
+            .try_switch_ref(self.plugin_id.as_deref(), new_plugin_id.as_deref(), true)?;
         self.plugin_id = new_plugin_id;
         Ok(())
     }
@@ -160,9 +92,6 @@ impl ApiPipeline {
                 let pooled = self.registry.acquire(id)?;
                 Ok(Box::new(pooled))
             }
-            Some(_) if self.mode == PipelineMode::AllowPassthrough => {
-                Ok(Box::new(PassthroughMapper))
-            }
             Some(id) => Err(ClientError::new(
                 ErrorCode::PluginNotLoaded,
                 format!("已选择插件 '{}' 但未加载", id),
@@ -208,10 +137,10 @@ impl ApiPipeline {
 impl Drop for ApiPipeline {
     fn drop(&mut self) {
         // Session 销毁时减少引用计数
-        if let Some(id) = &self.plugin_id {
-            if let Err(error) = self.registry.try_decrement_ref(id) {
-                log::error!("[plugin] failed to decrement ref-count for '{id}': {error:#}");
-            }
+        if let Some(id) = &self.plugin_id
+            && let Err(error) = self.registry.try_decrement_ref(id)
+        {
+            log::error!("[plugin] failed to decrement ref-count for '{id}': {error:#}");
         }
     }
 }
@@ -223,13 +152,13 @@ mod tests {
     #[test]
     fn strict_mode_rejects_selected_unloaded_plugin() {
         let registry = Arc::new(PluginRegistry::empty().unwrap());
-        let pipeline = ApiPipeline::new(Arc::clone(&registry), Some("missing".to_string()));
+        let error = ApiPipeline::try_new(Arc::clone(&registry), Some("missing".to_string()))
+            .err()
+            .expect("未加载插件应被拒绝");
         assert_eq!(registry.try_get_ref_count("missing").unwrap(), 0);
-
-        let err = pipeline.map_request("{}").unwrap_err();
         assert!(
-            err.to_string().contains("PLUGIN_NOT_LOADED"),
-            "unexpected error: {err:#}"
+            error.to_string().contains("PLUGIN_NOT_LOADED"),
+            "unexpected error: {error:#}"
         );
     }
 
@@ -240,18 +169,5 @@ mod tests {
 
         assert_eq!(pipeline.map_request("{\"a\":1}").unwrap(), "{\"a\":1}");
         assert_eq!(pipeline.map_response("{\"b\":2}").unwrap(), "{\"b\":2}");
-    }
-
-    #[test]
-    fn allow_passthrough_mode_keeps_compatibility() {
-        let registry = Arc::new(PluginRegistry::empty().unwrap());
-        let pipeline = ApiPipeline::try_with_mode(
-            registry,
-            Some("missing".to_string()),
-            PipelineMode::AllowPassthrough,
-        )
-        .unwrap();
-
-        assert_eq!(pipeline.map_stream_line("data: {}").unwrap(), "data: {}");
     }
 }

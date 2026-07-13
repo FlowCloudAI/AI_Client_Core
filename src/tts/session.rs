@@ -66,17 +66,17 @@ impl TTSSession {
         );
 
         // 检查状态
-        if let Some(ref base) = resp.base_resp {
-            if base.status_code != 0 {
-                let msg = base.status_msg.as_deref().unwrap_or("unknown error");
-                return Err(ClientError::new(
-                    ErrorCode::TtsTaskFailed,
-                    format!("TTS 错误 ({}): {}", base.status_code, msg),
-                )
-                .with_kv("status_code", base.status_code)
-                .with_kv("message", msg.to_string())
-                .into());
-            }
+        if let Some(ref base) = resp.base_resp
+            && base.status_code != 0
+        {
+            let msg = base.status_msg.as_deref().unwrap_or("unknown error");
+            return Err(ClientError::new(
+                ErrorCode::TtsTaskFailed,
+                format!("TTS 错误 ({}): {}", base.status_code, msg),
+            )
+            .with_kv("status_code", base.status_code)
+            .with_kv("message", msg.to_string())
+            .into());
         }
 
         // 提取结果
@@ -135,7 +135,7 @@ impl TTSSession {
         };
 
         // hex 为空但有 URL → 标记为 url 模式，调用方自行下载
-        if audio.is_empty() && data.url.as_ref().map_or(true, |u| u.is_empty()) {
+        if audio.is_empty() && data.url.as_ref().is_none_or(|u| u.is_empty()) {
             return Err(
                 ClientError::new(ErrorCode::TtsResponseEmpty, "音频数据为空且未提供 URL").into(),
             );
