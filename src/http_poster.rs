@@ -36,24 +36,29 @@ fn classify_reqwest_error(e: &reqwest::Error) -> ErrorCode {
 #[derive(Debug)]
 pub struct HttpPoster {
     client: Client,
+    max_line_bytes: usize,
 }
 
 impl HttpPoster {
-    pub fn new() -> Result<Self> {
-        let client = Client::builder()
+    pub fn new(request_timeout: u64, max_line_bytes: usize) -> Result<Self> {
+        let mut builder = Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(120))
             // SSE 流式传输禁用自动解压，防止 Qwen 等会返回
             // gzip 压缩响应的 API 出现 "error decoding response body"
             .no_gzip()
             .no_brotli()
-            .no_deflate()
-            .build()
-            .map_err(|e| {
-                ClientError::new(ErrorCode::CoreClientInitFailed, "构建 HTTP 客户端失败")
-                    .with_kv("source", e.to_string())
-            })?;
-        Ok(Self { client })
+            .no_deflate();
+        if request_timeout > 0 {
+            builder = builder.timeout(Duration::from_secs(request_timeout));
+        }
+        let client = builder.build().map_err(|e| {
+            ClientError::new(ErrorCode::CoreClientInitFailed, "构建 HTTP 客户端失败")
+                .with_kv("source", e.to_string())
+        })?;
+        Ok(Self {
+            client,
+            max_line_bytes,
+        })
     }
 
     pub async fn post_json(
@@ -106,13 +111,16 @@ impl HttpPoster {
         }
 
         // bytes_stream → AsyncRead
-        let byte_stream = res
-            .bytes_stream()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+        let byte_stream = res.bytes_stream().map_err(std::io::Error::other);
         let reader = StreamReader::new(byte_stream);
 
         // 按行解码（不再 join 再 split）
-        let lines = FramedRead::new(reader, LinesCodec::new()).map(|line| {
+        let codec = if self.max_line_bytes == 0 {
+            LinesCodec::new()
+        } else {
+            LinesCodec::new_with_max_length(self.max_line_bytes)
+        };
+        let lines = FramedRead::new(reader, codec).map(|line| {
             line.map_err(|e| {
                 ClientError::new(ErrorCode::LlmStreamProtocolError, "流式响应分行解析失败")
                     .with_kv("source", e.to_string())

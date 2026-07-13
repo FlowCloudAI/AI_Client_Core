@@ -23,7 +23,8 @@ pub struct ImageSession {
 
 impl ImageSession {
     pub fn new(config: SessionConfig, pipeline: ApiPipeline) -> Result<Self> {
-        let client = HttpPoster::new()?;
+        config.validate()?;
+        let client = HttpPoster::new(config.request_timeout, config.max_line_bytes)?;
         Ok(Self {
             client,
             config,
@@ -164,5 +165,107 @@ impl ImageSession {
             images,
             usage: resp.usage,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::config::SecretString;
+    use crate::plugin::registry::PluginRegistry;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::time::{Duration, sleep};
+
+    async fn spawn_server(delay: Duration, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            sleep(delay).await;
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        format!("http://{address}")
+    }
+
+    fn session(config: SessionConfig) -> ImageSession {
+        let registry = Arc::new(PluginRegistry::empty().unwrap());
+        let pipeline = ApiPipeline::try_new(registry, None).unwrap();
+        ImageSession::new(config, pipeline).unwrap()
+    }
+
+    fn config(base_url: String, request_timeout: u64, max_line_bytes: usize) -> SessionConfig {
+        SessionConfig {
+            base_url,
+            api_key: SecretString::from("test-key"),
+            event_buffer: 0,
+            request_timeout,
+            max_tool_rounds: 0,
+            max_line_bytes,
+        }
+    }
+
+    #[test]
+    fn new_rejects_invalid_config() {
+        let registry = Arc::new(PluginRegistry::empty().unwrap());
+        let pipeline = ApiPipeline::try_new(registry, None).unwrap();
+
+        let error = match ImageSession::new(SessionConfig::default(), pipeline) {
+            Ok(_) => panic!("无效配置不应创建图片会话"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            ClientError::from_anyhow(&error).map(|error| error.code),
+            Some(ErrorCode::ValidationMissingField)
+        );
+    }
+
+    #[tokio::test]
+    async fn request_timeout_is_applied() {
+        let url = spawn_server(
+            Duration::from_millis(1_500),
+            r#"{"data":[{"url":"https://example.test/image.png"}]}"#,
+        )
+        .await;
+        let session = session(config(url, 1, 1024));
+
+        let error = session
+            .text_to_image("test-model", "test-prompt")
+            .await
+            .expect_err("请求应按会话配置超时");
+        assert_eq!(
+            ClientError::from_anyhow(&error).map(|error| error.code),
+            Some(ErrorCode::HttpTimeout)
+        );
+    }
+
+    #[tokio::test]
+    async fn max_line_bytes_is_applied() {
+        let url = spawn_server(
+            Duration::ZERO,
+            r#"{"data":[{"url":"https://example.test/image.png"}]}"#,
+        )
+        .await;
+        let session = session(config(url, 5, 32));
+
+        let error = session
+            .text_to_image("test-model", "test-prompt")
+            .await
+            .expect_err("超长响应行应被拒绝");
+        assert_eq!(
+            ClientError::from_anyhow(&error).map(|error| error.code),
+            Some(ErrorCode::LlmStreamProtocolError)
+        );
     }
 }

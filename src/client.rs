@@ -367,7 +367,7 @@ impl FlowCloudAIClient {
     /// 创建 LLM 会话（简单模式）。
     ///
     /// - `config_override`: 可选的 `SessionConfig` 覆盖。传 `None` 时使用默认值：
-    ///   - `event_buffer`: 256，`request_timeout`: 60s，`max_tool_rounds`: 10，`max_line_bytes`: 1MB
+    ///   - `event_buffer`: 256，`request_timeout`: 120s，`max_tool_rounds`: 20，`max_line_bytes`: 512KB
     pub fn create_llm_session(
         &self,
         plugin_id: &str,

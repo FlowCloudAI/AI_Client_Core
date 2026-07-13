@@ -132,7 +132,8 @@ impl LLMSession {
         pipeline: ApiPipeline,
         tool_registry: Arc<ToolRegistry>,
     ) -> Result<Self> {
-        let client = HttpPoster::new()?;
+        config.validate()?;
+        let client = HttpPoster::new(config.request_timeout, config.max_line_bytes)?;
         Ok(Self {
             client,
             conversation: Arc::new(RwLock::new(ChatRequest::default())),
@@ -1712,12 +1713,10 @@ mod tests {
     fn new_test_session() -> LLMSession {
         let registry = Arc::new(PluginRegistry::empty().unwrap());
         let pipeline = ApiPipeline::try_new(registry, None).unwrap();
-        LLMSession::new(
-            SessionConfig::default(),
-            pipeline,
-            Arc::new(ToolRegistry::new()),
-        )
-        .unwrap()
+        let mut config = SessionConfig::default();
+        config.base_url = "https://example.test".to_string();
+        config.api_key = "test-key".into();
+        LLMSession::new(config, pipeline, Arc::new(ToolRegistry::new())).unwrap()
     }
 
     fn stored_message(

@@ -23,7 +23,8 @@ pub struct TTSSession {
 
 impl TTSSession {
     pub fn new(config: SessionConfig, pipeline: ApiPipeline) -> Result<Self> {
-        let client = HttpPoster::new()?;
+        config.validate()?;
+        let client = HttpPoster::new(config.request_timeout, config.max_line_bytes)?;
         Ok(Self {
             client,
             config,
