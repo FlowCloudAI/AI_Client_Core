@@ -1,6 +1,6 @@
 pub mod registry;
 
-pub use registry::{ToolRegistry, arg_i32, arg_str};
+pub use registry::{ToolAccess, ToolRegistry, arg_i32, arg_str};
 
 tokio::task_local! {
     static AUTO_CONFIRM_WRITES: bool;

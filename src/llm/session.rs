@@ -564,31 +564,6 @@ impl LLMSession {
         })
     }
 
-    fn is_write_like_tool(name: &str) -> bool {
-        let lower = name.to_ascii_lowercase();
-        [
-            "create",
-            "update",
-            "delete",
-            "remove",
-            "edit",
-            "rename",
-            "write",
-            "save",
-            "apply",
-            "confirm",
-            "install",
-            "uninstall",
-            "enable",
-            "disable",
-            "set_",
-            "set-",
-            "merge",
-        ]
-        .iter()
-        .any(|token| lower.contains(token))
-    }
-
     async fn apply_assembled(&self, base: &ChatRequest, turn: &AssembledTurn) -> ChatRequest {
         let mut req = base.clone();
         let insert_at = Self::context_insert_index_before_pending_block(&req.messages);
@@ -1004,8 +979,8 @@ impl LLMSession {
         let mut out: Vec<Message> = Vec::with_capacity(messages.len());
         let mut iter = messages.into_iter().peekable();
         while let Some(mut msg) = iter.next() {
-            let has_calls = msg.role == "assistant"
-                && msg.tool_calls.as_ref().is_some_and(|c| !c.is_empty());
+            let has_calls =
+                msg.role == "assistant" && msg.tool_calls.as_ref().is_some_and(|c| !c.is_empty());
             if !has_calls {
                 // 没有 assistant(tool_calls) 锚点的孤儿 tool 消息同样会被 API 拒绝。
                 if msg.role == "tool" {
@@ -1041,9 +1016,9 @@ impl LLMSession {
             let mut tool_matched = vec![false; tools.len()];
             let mut call_matched = vec![false; expected.len()];
             for (ci, id) in expected.iter().enumerate() {
-                if let Some(ti) = (0..tools.len()).find(|&ti| {
-                    !tool_matched[ti] && tools[ti].tool_call_id.as_deref() == Some(id)
-                }) {
+                if let Some(ti) = (0..tools.len())
+                    .find(|&ti| !tool_matched[ti] && tools[ti].tool_call_id.as_deref() == Some(id))
+                {
                     tool_matched[ti] = true;
                     call_matched[ci] = true;
                 }
@@ -1055,9 +1030,8 @@ impl LLMSession {
             let unmatched_calls: Vec<usize> = (0..expected.len())
                 .filter(|&ci| !call_matched[ci])
                 .collect();
-            let unmatched_tools: Vec<usize> = (0..tools.len())
-                .filter(|&ti| !tool_matched[ti])
-                .collect();
+            let unmatched_tools: Vec<usize> =
+                (0..tools.len()).filter(|&ti| !tool_matched[ti]).collect();
             let mut rewritten = 0usize;
             for (&ci, &ti) in unmatched_calls.iter().zip(unmatched_tools.iter()) {
                 tools[ti].tool_call_id = Some(expected[ci].clone());
@@ -1649,7 +1623,7 @@ impl LLMSession {
                     format!("工具执行失败: 本轮不允许调用工具 '{}'", func_name),
                     true,
                 )
-            } else if read_only && Self::is_write_like_tool(func_name) {
+            } else if read_only && !self.tool_registry.is_read_tool(func_name) {
                 log::warn!(
                     "[client:tools][call_blocked_read_only] turn_id={} index={} name={}",
                     self.turn_id,
@@ -1657,7 +1631,10 @@ impl LLMSession {
                     func_name
                 );
                 (
-                    format!("工具执行失败: 只读模式下禁止调用写入类工具 '{}'", func_name),
+                    format!(
+                        "工具执行失败: 只读模式下仅允许显式标注为读的工具，'{}' 未标注或为写工具",
+                        func_name
+                    ),
                     true,
                 )
             } else {

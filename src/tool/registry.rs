@@ -47,10 +47,19 @@ type Handler = Arc<
 
 // ─────────────────────── 工具规格 ──────────────────────────
 
+/// 工具读写属性（显式标注，不做名字嗅探）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolAccess {
+    Read,
+    Write,
+}
+
 pub struct ToolSpec {
     pub schema: Value,
     handler: Handler,
     enabled: AtomicBool,
+    /// None = 未标注。read_only 会话中未标注按写处理（禁止）。
+    access: Option<ToolAccess>,
 }
 
 // ─────────────────────── 工具注册中心 ───────────────────────
@@ -235,6 +244,42 @@ impl ToolRegistry {
         }
     }
 
+    // ── 读写标注 ──
+    //
+    // 三层开关优先级：disable_tool（全局禁用）> read_only 拦截 > 每轮白名单裁剪。
+    // 标注与 auto_confirm_writes（task_local，工具 handler 内部消费）互不影响。
+
+    /// 批量标注为读工具（read_only 会话放行）。名字不存在时告警，暴露拼写漂移。
+    pub fn mark_read(&mut self, names: &[&str]) {
+        self.mark_access(names, ToolAccess::Read);
+    }
+
+    /// 批量标注为写工具。与未标注行为一致（read_only 禁止），价值在于显式文档化。
+    pub fn mark_write(&mut self, names: &[&str]) {
+        self.mark_access(names, ToolAccess::Write);
+    }
+
+    fn mark_access(&mut self, names: &[&str], access: ToolAccess) {
+        for name in names {
+            match self.tools.get_mut(*name) {
+                Some(spec) => spec.access = Some(access),
+                None => log::warn!(
+                    "[tool] mark_access 目标不存在: name={} access={:?}",
+                    name,
+                    access
+                ),
+            }
+        }
+    }
+
+    /// 是否为显式标注的读工具。未标注 / Write / 不存在均返回 false——
+    /// read_only 会话据此拦截，安全边界不做名字猜测。
+    pub fn is_read_tool(&self, name: &str) -> bool {
+        self.tools
+            .get(name)
+            .is_some_and(|spec| spec.access == Some(ToolAccess::Read))
+    }
+
     /// 查询指定工具是否启用（工具不存在视为未启用）。
     pub fn is_enabled(&self, name: &str) -> bool {
         self.tools
@@ -323,6 +368,7 @@ impl ToolRegistry {
                 }),
                 handler,
                 enabled: AtomicBool::new(true),
+                access: None,
             },
         );
     }
@@ -427,5 +473,21 @@ mod tests {
         );
         assert_eq!(params["properties"]["items"]["items"]["type"], "object");
         assert_eq!(params["properties"]["callback"]["format"], "uri");
+    }
+
+    #[test]
+    fn unmarked_tool_is_not_read() {
+        let r = registry_with_tool();
+        assert!(!r.is_read_tool("alpha"));
+        assert!(!r.is_read_tool("missing"));
+    }
+
+    #[test]
+    fn mark_read_and_write() {
+        let mut r = registry_with_tool();
+        r.mark_read(&["alpha", "missing"]);
+        assert!(r.is_read_tool("alpha"));
+        r.mark_write(&["alpha"]);
+        assert!(!r.is_read_tool("alpha"));
     }
 }
