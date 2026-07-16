@@ -312,8 +312,12 @@ impl LLMSession {
 // ── 启动 ──
 
 impl LLMSession {
-    /// 全部启动变体的共享实现：组装 channel / SessionHandle，
-    /// 在独立 runtime 线程上驱动会话状态机。
+    /// 全部启动变体的共享实现：组装 channel / SessionHandle，驱动会话状态机。
+    ///
+    /// 驱动任务的落点：优先 `Handle::try_current()` spawn 到调用方现有 runtime
+    /// （Tauri 命令、既有异步上下文），避免每个 session 各起一条 OS 线程 + runtime；
+    /// 无 ambient runtime 时才退回自建 current_thread runtime 独占线程
+    /// （保留“无外层 runtime 也能启动”的语义）。
     ///
     /// `ext_ctx_rx` 为调用方自持的上下文接收端（*_with_context_channel 变体），
     /// 会被转发到内部 latest-only watch 通道，与 handle.set_task_context 合并。
@@ -360,19 +364,26 @@ impl LLMSession {
             }
         };
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| {
-                ClientError::new(
-                    ErrorCode::LlmSessionCreateFailed,
-                    "创建 session runtime 失败",
-                )
-                .with_kv("source", e.to_string())
-            })?;
-        std::thread::spawn(move || {
-            rt.block_on(main_task);
-        });
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt_handle) => {
+                rt_handle.spawn(main_task);
+            }
+            Err(_) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| {
+                        ClientError::new(
+                            ErrorCode::LlmSessionCreateFailed,
+                            "创建 session runtime 失败",
+                        )
+                        .with_kv("source", e.to_string())
+                    })?;
+                std::thread::spawn(move || {
+                    rt.block_on(main_task);
+                });
+            }
+        }
 
         Ok((ReceiverStream::new(event_rx), handle))
     }
