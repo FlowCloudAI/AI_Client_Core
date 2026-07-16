@@ -312,17 +312,21 @@ impl LLMSession {
 // ── 启动 ──
 
 impl LLMSession {
-    /// 启动会话，失败时通过 `Result` 返回。
+    /// 全部启动变体的共享实现：组装 channel / SessionHandle，
+    /// 在独立 runtime 线程上驱动会话状态机。
     ///
-    /// 推荐新代码使用此方法，避免 runtime 创建失败被隐藏。
-    pub fn try_run(
+    /// `ext_ctx_rx` 为调用方自持的上下文接收端（*_with_context_channel 变体），
+    /// 会被转发到内部 latest-only watch 通道，与 handle.set_task_context 合并。
+    fn start_inner(
         self,
         input_rx: mpsc::Receiver<String>,
+        ext_ctx_rx: Option<mpsc::Receiver<TaskContext>>,
     ) -> Result<(ReceiverStream<SessionEvent>, SessionHandle)> {
         let (event_tx, event_rx) = mpsc::channel::<SessionEvent>(self.config.event_buffer);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<CtrlMsg>(8);
         let (cancel_tx, cancel_rx) = watch::channel::<u64>(0);
         let (ctx_tx, ctx_rx) = watch::channel::<TaskContext>(TaskContext::default());
+        let ctx_forward_tx = ctx_tx.clone();
 
         let handle = SessionHandle {
             inner: Arc::clone(&self.conversation),
@@ -331,6 +335,29 @@ impl LLMSession {
             ctrl_tx,
             cancel_tx,
             ctx_tx,
+        };
+
+        let main_task = async move {
+            // 将外部 ctx_rx 转发到内部 latest-only 通道，
+            // 与 handle.set_task_context 合并为同一路输入。
+            if let Some(mut ext_ctx_rx) = ext_ctx_rx {
+                tokio::spawn(async move {
+                    while let Some(ctx) = ext_ctx_rx.recv().await {
+                        if ctx_forward_tx.send(ctx).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+
+            if let Err(e) = self
+                .drive(input_rx, ctrl_rx, Some(ctx_rx), cancel_rx, event_tx.clone())
+                .await
+            {
+                let _ = event_tx
+                    .send(SessionEvent::Error(ClientError::from_anyhow_owned(e)))
+                    .await;
+            }
         };
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -343,21 +370,47 @@ impl LLMSession {
                 )
                 .with_kv("source", e.to_string())
             })?;
-
         std::thread::spawn(move || {
-            rt.block_on(async move {
-                if let Err(e) = self
-                    .drive(input_rx, ctrl_rx, Some(ctx_rx), cancel_rx, event_tx.clone())
-                    .await
-                {
-                    let _ = event_tx
-                        .send(SessionEvent::Error(ClientError::from_anyhow_owned(e)))
-                        .await;
-                }
-            });
+            rt.block_on(main_task);
         });
 
         Ok((ReceiverStream::new(event_rx), handle))
+    }
+
+    /// `run` / `run_with_context_channel` 的兼容包装：
+    /// 启动失败时返回一个只发送 `SessionEvent::Error` 的事件流。
+    fn start_or_error_stream(
+        self,
+        input_rx: mpsc::Receiver<String>,
+        ext_ctx_rx: Option<mpsc::Receiver<TaskContext>>,
+    ) -> (ReceiverStream<SessionEvent>, SessionHandle) {
+        let event_buffer = self.config.event_buffer;
+        let fallback_handle = SessionHandle {
+            inner: Arc::clone(&self.conversation),
+            tree: Arc::clone(&self.tree),
+            system_messages: Arc::clone(&self.system_messages),
+            ctrl_tx: mpsc::channel::<CtrlMsg>(8).0,
+            cancel_tx: watch::channel::<u64>(0).0,
+            ctx_tx: watch::channel::<TaskContext>(TaskContext::default()).0,
+        };
+        match self.start_inner(input_rx, ext_ctx_rx) {
+            Ok(pair) => pair,
+            Err(e) => {
+                let (event_tx, event_rx) = mpsc::channel::<SessionEvent>(event_buffer.max(1));
+                let _ = event_tx.try_send(SessionEvent::Error(ClientError::from_anyhow_owned(e)));
+                (ReceiverStream::new(event_rx), fallback_handle)
+            }
+        }
+    }
+
+    /// 启动会话，失败时通过 `Result` 返回。
+    ///
+    /// 推荐新代码使用此方法，避免 runtime 创建失败被隐藏。
+    pub fn try_run(
+        self,
+        input_rx: mpsc::Receiver<String>,
+    ) -> Result<(ReceiverStream<SessionEvent>, SessionHandle)> {
+        self.start_inner(input_rx, None)
     }
 
     /// 启动会话。
@@ -367,50 +420,7 @@ impl LLMSession {
         self,
         input_rx: mpsc::Receiver<String>,
     ) -> (ReceiverStream<SessionEvent>, SessionHandle) {
-        let (event_tx, event_rx) = mpsc::channel::<SessionEvent>(self.config.event_buffer);
-        let (ctrl_tx, ctrl_rx) = mpsc::channel::<CtrlMsg>(8);
-        let (cancel_tx, cancel_rx) = watch::channel::<u64>(0);
-        let (ctx_tx, ctx_rx) = watch::channel::<TaskContext>(TaskContext::default());
-
-        let handle = SessionHandle {
-            inner: Arc::clone(&self.conversation),
-            tree: Arc::clone(&self.tree),
-            system_messages: Arc::clone(&self.system_messages),
-            ctrl_tx,
-            cancel_tx,
-            ctx_tx,
-        };
-
-        match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| {
-                ClientError::new(
-                    ErrorCode::LlmSessionCreateFailed,
-                    "创建 session runtime 失败",
-                )
-                .with_kv("source", e.to_string())
-            }) {
-            Ok(rt) => {
-                std::thread::spawn(move || {
-                    rt.block_on(async move {
-                        if let Err(e) = self
-                            .drive(input_rx, ctrl_rx, Some(ctx_rx), cancel_rx, event_tx.clone())
-                            .await
-                        {
-                            let _ = event_tx
-                                .send(SessionEvent::Error(ClientError::from_anyhow_owned(e)))
-                                .await;
-                        }
-                    });
-                });
-            }
-            Err(e) => {
-                let _ = event_tx.try_send(SessionEvent::Error(e));
-            }
-        }
-
-        (ReceiverStream::new(event_rx), handle)
+        self.start_or_error_stream(input_rx, None)
     }
 
     /// 底层版本：接受调用方自持的 ctx 接收端，适合将上下文流接入已有系统。
@@ -430,57 +440,9 @@ impl LLMSession {
     pub fn try_run_with_context_channel(
         self,
         input_rx: mpsc::Receiver<String>,
-        mut ext_ctx_rx: mpsc::Receiver<TaskContext>,
+        ext_ctx_rx: mpsc::Receiver<TaskContext>,
     ) -> Result<(ReceiverStream<SessionEvent>, SessionHandle)> {
-        let (event_tx, event_rx) = mpsc::channel::<SessionEvent>(self.config.event_buffer);
-        let (ctrl_tx, ctrl_rx) = mpsc::channel::<CtrlMsg>(8);
-        let (cancel_tx, cancel_rx) = watch::channel::<u64>(0);
-        let (ctx_tx, ctx_rx) = watch::channel::<TaskContext>(TaskContext::default());
-        let ctx_forward_tx = ctx_tx.clone();
-
-        let handle = SessionHandle {
-            inner: Arc::clone(&self.conversation),
-            tree: Arc::clone(&self.tree),
-            system_messages: Arc::clone(&self.system_messages),
-            ctrl_tx,
-            cancel_tx,
-            ctx_tx: ctx_tx.clone(),
-        };
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| {
-                ClientError::new(
-                    ErrorCode::LlmSessionCreateFailed,
-                    "创建 session runtime 失败",
-                )
-                .with_kv("source", e.to_string())
-            })?;
-
-        std::thread::spawn(move || {
-            rt.block_on(async move {
-                // 将外部 ctx_rx 转发到内部 latest-only 通道，与 handle.set_task_context 合并为同一路输入。
-                tokio::spawn(async move {
-                    while let Some(ctx) = ext_ctx_rx.recv().await {
-                        if ctx_forward_tx.send(ctx).is_err() {
-                            break;
-                        }
-                    }
-                });
-
-                if let Err(e) = self
-                    .drive(input_rx, ctrl_rx, Some(ctx_rx), cancel_rx, event_tx.clone())
-                    .await
-                {
-                    let _ = event_tx
-                        .send(SessionEvent::Error(ClientError::from_anyhow_owned(e)))
-                        .await;
-                }
-            });
-        });
-
-        Ok((ReceiverStream::new(event_rx), handle))
+        self.start_inner(input_rx, Some(ext_ctx_rx))
     }
 
     /// 底层版本：接受调用方自持的 ctx 接收端，适合将上下文流接入已有系统。
@@ -489,61 +451,9 @@ impl LLMSession {
     pub fn run_with_context_channel(
         self,
         input_rx: mpsc::Receiver<String>,
-        mut ext_ctx_rx: mpsc::Receiver<TaskContext>,
+        ext_ctx_rx: mpsc::Receiver<TaskContext>,
     ) -> (ReceiverStream<SessionEvent>, SessionHandle) {
-        let (event_tx, event_rx) = mpsc::channel::<SessionEvent>(self.config.event_buffer);
-        let (ctrl_tx, ctrl_rx) = mpsc::channel::<CtrlMsg>(8);
-        let (cancel_tx, cancel_rx) = watch::channel::<u64>(0);
-        let (ctx_tx, ctx_rx) = watch::channel::<TaskContext>(TaskContext::default());
-        let ctx_forward_tx = ctx_tx.clone();
-
-        let handle = SessionHandle {
-            inner: Arc::clone(&self.conversation),
-            tree: Arc::clone(&self.tree),
-            system_messages: Arc::clone(&self.system_messages),
-            ctrl_tx,
-            cancel_tx,
-            ctx_tx,
-        };
-
-        match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| {
-                ClientError::new(
-                    ErrorCode::LlmSessionCreateFailed,
-                    "创建 session runtime 失败",
-                )
-                .with_kv("source", e.to_string())
-            }) {
-            Ok(rt) => {
-                std::thread::spawn(move || {
-                    rt.block_on(async move {
-                        tokio::spawn(async move {
-                            while let Some(ctx) = ext_ctx_rx.recv().await {
-                                if ctx_forward_tx.send(ctx).is_err() {
-                                    break;
-                                }
-                            }
-                        });
-
-                        if let Err(e) = self
-                            .drive(input_rx, ctrl_rx, Some(ctx_rx), cancel_rx, event_tx.clone())
-                            .await
-                        {
-                            let _ = event_tx
-                                .send(SessionEvent::Error(ClientError::from_anyhow_owned(e)))
-                                .await;
-                        }
-                    });
-                });
-            }
-            Err(e) => {
-                let _ = event_tx.try_send(SessionEvent::Error(e));
-            }
-        }
-
-        (ReceiverStream::new(event_rx), handle)
+        self.start_or_error_stream(input_rx, Some(ext_ctx_rx))
     }
 }
 
