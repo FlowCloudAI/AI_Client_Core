@@ -120,6 +120,7 @@ define_error_codes! {
     HttpServerError          => "HTTP_SERVER_ERROR",
     HttpTimeout              => "HTTP_TIMEOUT",
     HttpEmptyResponse        => "HTTP_EMPTY_RESPONSE",
+    HttpResponseTooLarge     => "HTTP_RESPONSE_TOO_LARGE",
 
     // ── 文件系统 ──────────────────────────────────────────────
     FsOpenFailed             => "FS_OPEN_FAILED",

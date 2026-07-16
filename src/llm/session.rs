@@ -1092,8 +1092,8 @@ impl LLMSession {
             let stage_started = Instant::now();
             let post_fut =
                 self.client
-                    .post_json(&self.config.base_url, self.config.api_key.expose(), json);
-            let stream = tokio::select! {
+                    .post_collect(&self.config.base_url, self.config.api_key.expose(), json);
+            let raw_body = tokio::select! {
                 result = post_fut => result?,
                 _ = cancel.cancelled() => {
                     return Ok(cancelled_turn_output(
@@ -1109,26 +1109,10 @@ impl LLMSession {
                 self.turn_id,
                 stage_started.elapsed().as_millis()
             );
-            tokio::pin!(stream);
-            log::info!(
-                "[client:llm][non_stream_first_line_wait] turn_id={}",
-                self.turn_id
-            );
-            tokio::select! {
-                raw_line = stream.next() => {
-                    raw_line.ok_or_else(|| {
-                        ClientError::new(ErrorCode::LlmResponseEmpty, "LLM 响应为空")
-                    })??
-                }
-                _ = cancel.cancelled() => {
-                    return Ok(cancelled_turn_output(
-                        String::new(),
-                        String::new(),
-                        Vec::new(),
-                        None,
-                    ));
-                }
+            if raw_body.is_empty() {
+                return Err(ClientError::new(ErrorCode::LlmResponseEmpty, "LLM 响应为空").into());
             }
+            raw_body
         };
         log::info!(
             "[client:llm][non_stream_first_line_done] turn_id={} bytes={}",

@@ -1,5 +1,4 @@
 use anyhow::Result;
-use futures_util::StreamExt;
 
 use crate::error::{ClientError, ErrorCode};
 use crate::http_poster::HttpPoster;
@@ -44,7 +43,17 @@ impl ImageSession {
             mapped_json.to_string().len()
         );
 
-        let raw_body = self.post_and_collect(mapped_json).await?;
+        let raw_body = self
+            .client
+            .post_collect(
+                &self.config.base_url,
+                self.config.api_key.expose(),
+                mapped_json,
+            )
+            .await?;
+        if raw_body.is_empty() {
+            return Err(ClientError::new(ErrorCode::ImageTaskEmptyResponse, "图像响应为空").into());
+        }
 
         let normalized = self.pipeline.map_response(&raw_body)?;
 
@@ -95,30 +104,6 @@ impl ImageSession {
     ) -> Result<ImageResult> {
         let req = ImageRequest::images_to_image(model, prompt, image_urls);
         self.generate(&req).await
-    }
-
-    // ── 内部方法 ──
-
-    async fn post_and_collect(&self, json: serde_json::Value) -> Result<String> {
-        let stream = self
-            .client
-            .post_json(&self.config.base_url, self.config.api_key.expose(), json)
-            .await?;
-
-        tokio::pin!(stream);
-
-        let mut body = String::new();
-        while let Some(chunk) = stream.next().await {
-            body.push_str(&chunk?);
-        }
-
-        if body.is_empty() {
-            return Err(ClientError::new(ErrorCode::ImageTaskEmptyResponse, "图像响应为空").into());
-        }
-
-        log::debug!("[image] raw response bytes={}", body.len());
-
-        Ok(body)
     }
 
     fn extract_result(&self, resp: ImageResponse) -> Result<ImageResult> {
@@ -265,7 +250,7 @@ mod tests {
             .expect_err("超长响应行应被拒绝");
         assert_eq!(
             ClientError::from_anyhow(&error).map(|error| error.code),
-            Some(ErrorCode::LlmStreamProtocolError)
+            Some(ErrorCode::HttpResponseTooLarge)
         );
     }
 }

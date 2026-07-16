@@ -1,5 +1,4 @@
 use anyhow::Result;
-use futures_util::StreamExt;
 
 use crate::error::{ClientError, ErrorCode};
 use crate::http_poster::HttpPoster;
@@ -45,7 +44,17 @@ impl TTSSession {
         let mapped_json = self.pipeline.prepare_request_json(&json)?;
 
         // 发送请求，读取完整响应（非流式）
-        let raw_body = self.post_and_collect(mapped_json).await?;
+        let raw_body = self
+            .client
+            .post_collect(
+                &self.config.base_url,
+                self.config.api_key.expose(),
+                mapped_json,
+            )
+            .await?;
+        if raw_body.is_empty() {
+            return Err(ClientError::new(ErrorCode::TtsResponseEmpty, "TTS 响应为空").into());
+        }
 
         // 插件映射响应
         let normalized = self.pipeline.map_response(&raw_body)?;
@@ -87,29 +96,6 @@ impl TTSSession {
     pub async fn speak(&self, model: &str, text: &str, voice_id: &str) -> Result<TTSResult> {
         let req = TTSRequest::new(model, text, voice_id);
         self.synthesize(&req).await
-    }
-
-    // ── 内部方法 ──
-
-    /// 发送 POST 请求并收集完整响应体。
-    async fn post_and_collect(&self, json: serde_json::Value) -> Result<String> {
-        let stream = self
-            .client
-            .post_json(&self.config.base_url, self.config.api_key.expose(), json)
-            .await?;
-
-        tokio::pin!(stream);
-
-        let mut body = String::new();
-        while let Some(chunk) = stream.next().await {
-            body.push_str(&chunk?);
-        }
-
-        if body.is_empty() {
-            return Err(ClientError::new(ErrorCode::TtsResponseEmpty, "TTS 响应为空").into());
-        }
-
-        Ok(body)
     }
 
     /// 从响应中提取音频数据。
