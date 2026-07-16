@@ -33,23 +33,12 @@ impl ImageSession {
 
     /// 完整调用：发送 ImageRequest，返回解析后的结果。
     pub async fn generate(&self, req: &ImageRequest) -> Result<ImageResult> {
-        let json = serde_json::to_value(req).map_err(|e| {
-            ClientError::new(ErrorCode::ImageTaskInvalidParams, "图像请求序列化失败")
-                .with_kv("source", e.to_string())
-        })?;
-        let mapped_json = self.pipeline.prepare_request_json(&json)?;
-        log::debug!(
-            "[image] mapped request bytes={}",
-            mapped_json.to_string().len()
-        );
+        let body = self.pipeline.prepare_request_body(req)?;
+        log::debug!("[image] mapped request bytes={}", body.len());
 
         let raw_body = self
             .client
-            .post_collect(
-                &self.config.base_url,
-                self.config.api_key.expose(),
-                mapped_json,
-            )
+            .post_collect(&self.config.base_url, self.config.api_key.expose(), body)
             .await?;
         if raw_body.is_empty() {
             return Err(ClientError::new(ErrorCode::ImageTaskEmptyResponse, "图像响应为空").into());

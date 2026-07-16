@@ -485,8 +485,7 @@ impl LLMSession {
         })
     }
 
-    async fn apply_assembled(&self, base: &ChatRequest, turn: &AssembledTurn) -> ChatRequest {
-        let mut req = base.clone();
+    fn apply_assembled(&self, mut req: ChatRequest, turn: &AssembledTurn) -> ChatRequest {
         let insert_at = Self::context_insert_index_before_pending_block(&req.messages);
 
         // 注入上下文 messages。
@@ -674,29 +673,31 @@ impl LLMSession {
             let stage_started = Instant::now();
             let req = self.snapshot().await;
             let snapshot_elapsed_ms = stage_started.elapsed().as_millis();
-            let snapshot_tool_count = req.tools.as_ref().map_or(0, Vec::len);
-            let snapshot_content_chars: usize = req
-                .messages
-                .iter()
-                .filter_map(|message| message.content.as_ref())
-                .map(|content| content.chars().count())
-                .sum();
-            let snapshot_last_role = req
-                .messages
-                .last()
-                .map(|message| message.role.as_str())
-                .unwrap_or("<none>");
-            log::info!(
-                "[client:drive][snapshot_done] turn_id={} elapsed_ms={} messages={} last_role={} content_chars={} tool_count={} stream={:?} thinking_set={}",
-                self.turn_id,
-                snapshot_elapsed_ms,
-                req.messages.len(),
-                snapshot_last_role,
-                snapshot_content_chars,
-                snapshot_tool_count,
-                req.stream,
-                req.thinking.is_some()
-            );
+            if log::log_enabled!(log::Level::Info) {
+                let snapshot_tool_count = req.tools.as_ref().map_or(0, Vec::len);
+                let snapshot_content_chars: usize = req
+                    .messages
+                    .iter()
+                    .filter_map(|message| message.content.as_ref())
+                    .map(|content| content.chars().count())
+                    .sum();
+                let snapshot_last_role = req
+                    .messages
+                    .last()
+                    .map(|message| message.role.as_str())
+                    .unwrap_or("<none>");
+                log::info!(
+                    "[client:drive][snapshot_done] turn_id={} elapsed_ms={} messages={} last_role={} content_chars={} tool_count={} stream={:?} thinking_set={}",
+                    self.turn_id,
+                    snapshot_elapsed_ms,
+                    req.messages.len(),
+                    snapshot_last_role,
+                    snapshot_content_chars,
+                    snapshot_tool_count,
+                    req.stream,
+                    req.thinking.is_some()
+                );
+            }
 
             log::info!(
                 "[client:drive][assemble_start] turn_id={} has_orchestrator={}",
@@ -711,7 +712,7 @@ impl LLMSession {
             let (req, read_only) = if let Some(ref orch) = self.orchestrator {
                 let assembled = orch.assemble(&current_ctx)?;
                 let read_only = assembled.read_only;
-                let req = self.apply_assembled(&req, &assembled).await;
+                let req = self.apply_assembled(req, &assembled);
                 (req, read_only)
             } else {
                 (req, AssembledTurn::default().read_only)
@@ -1003,11 +1004,10 @@ impl LLMSession {
 
 impl LLMSession {
     /// 请求转换：acquire mapper → map → release（自动）。
-    fn prepare_request(&self, req: &ChatRequest) -> Result<Value> {
+    fn prepare_request(&self, req: &ChatRequest) -> Result<String> {
         self.pipeline
             .validate_llm_request(&req.model, req.thinking_effort)?;
-        let json = serde_json::to_value(req)?;
-        self.pipeline.prepare_request_json(&json)
+        self.pipeline.prepare_request_body(req)
     }
 
     /// 响应转换。
@@ -1067,7 +1067,7 @@ impl LLMSession {
                 None,
             ));
         }
-        let json = self.prepare_request(req)?;
+        let body = self.prepare_request(req)?;
         if cancel.is_cancelled() {
             return Ok(cancelled_turn_output(
                 String::new(),
@@ -1080,7 +1080,7 @@ impl LLMSession {
             "[client:llm][non_stream_prepare_done] turn_id={} elapsed_ms={} body_bytes={}",
             self.turn_id,
             stage_started.elapsed().as_millis(),
-            json.to_string().len()
+            body.len()
         );
 
         let raw_line = {
@@ -1092,7 +1092,7 @@ impl LLMSession {
             let stage_started = Instant::now();
             let post_fut =
                 self.client
-                    .post_collect(&self.config.base_url, self.config.api_key.expose(), json);
+                    .post_collect(&self.config.base_url, self.config.api_key.expose(), body);
             let raw_body = tokio::select! {
                 result = post_fut => result?,
                 _ = cancel.cancelled() => {
@@ -1205,7 +1205,7 @@ impl LLMSession {
                 None,
             ));
         }
-        let json = self.prepare_request(req)?;
+        let body = self.prepare_request(req)?;
         if cancel.is_cancelled() {
             return Ok(cancelled_turn_output(
                 String::new(),
@@ -1218,7 +1218,7 @@ impl LLMSession {
             "[client:llm][stream_prepare_done] turn_id={} elapsed_ms={} body_bytes={}",
             self.turn_id,
             stage_started.elapsed().as_millis(),
-            json.to_string().len()
+            body.len()
         );
 
         log::info!(
@@ -1229,7 +1229,7 @@ impl LLMSession {
         let stage_started = Instant::now();
         let post_fut =
             self.client
-                .post_json(&self.config.base_url, self.config.api_key.expose(), json);
+                .post_json(&self.config.base_url, self.config.api_key.expose(), body);
         let stream = tokio::select! {
             result = post_fut => result?,
             _ = cancel.cancelled() => {

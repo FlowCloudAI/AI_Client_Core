@@ -2,7 +2,6 @@ use anyhow::Result;
 use futures_util::{StreamExt, TryStreamExt};
 use reqwest::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
-use serde_json::Value;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio_util::codec::{FramedRead, LinesCodec};
@@ -95,14 +94,14 @@ impl HttpPoster {
         client: &Client,
         url: &str,
         key: &str,
-        body: Value,
+        body: String,
     ) -> reqwest::RequestBuilder {
         client
             .post(url)
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "application/json")
             .header(AUTHORIZATION, format!("Bearer {}", key))
-            .json(&body)
+            .body(body)
     }
 
     async fn send_ok(req: reqwest::RequestBuilder, url: &str) -> Result<reqwest::Response> {
@@ -143,12 +142,12 @@ impl HttpPoster {
         &self,
         url: &str,
         key: &str,
-        body: Value,
+        body: String,
     ) -> Result<impl futures_util::Stream<Item = Result<String>>> {
         log::info!(
             "[client:http][post_json_start] url={} body_bytes={}",
             url,
-            body.to_string().len()
+            body.len()
         );
         let client = shared_client(&STREAM_CLIENT, true)?;
         let req = self.apply_timeout(Self::build_request(&client, url, key, body));
@@ -179,11 +178,11 @@ impl HttpPoster {
     ///
     /// 边读边累积字节，`max_line_bytes > 0` 时作为**解压后**响应体总字节上限，
     /// 超限立即断开（防解压炸弹；不用 `res.bytes()` 一把读到内存）。
-    pub async fn post_collect(&self, url: &str, key: &str, body: Value) -> Result<String> {
+    pub async fn post_collect(&self, url: &str, key: &str, body: String) -> Result<String> {
         log::info!(
             "[client:http][post_collect_start] url={} body_bytes={}",
             url,
-            body.to_string().len()
+            body.len()
         );
         let client = shared_client(&COLLECT_CLIENT, false)?;
         let req = self.apply_timeout(Self::build_request(&client, url, key, body));
@@ -254,7 +253,7 @@ mod tests {
         let poster = HttpPoster::new(5, 1024).unwrap();
 
         let body = poster
-            .post_collect(&url, "test-key", serde_json::json!({}))
+            .post_collect(&url, "test-key", "{}".to_string())
             .await
             .unwrap();
 

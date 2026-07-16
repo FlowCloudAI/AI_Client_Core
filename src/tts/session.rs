@@ -36,21 +36,13 @@ impl TTSSession {
     /// 发送 TTSRequest，返回解码后的音频数据。
     /// 插件通过 pipeline 自动做请求/响应映射。
     pub async fn synthesize(&self, req: &TTSRequest) -> Result<TTSResult> {
-        // 序列化 → 插件映射 → 反序列化为 Value
-        let json = serde_json::to_value(req).map_err(|e| {
-            ClientError::new(ErrorCode::LlmRequestBadPayload, "TTS 请求序列化失败")
-                .with_kv("source", e.to_string())
-        })?;
-        let mapped_json = self.pipeline.prepare_request_json(&json)?;
+        // 序列化 → 插件映射 → 直接得到请求体字符串
+        let body = self.pipeline.prepare_request_body(req)?;
 
         // 发送请求，读取完整响应（非流式）
         let raw_body = self
             .client
-            .post_collect(
-                &self.config.base_url,
-                self.config.api_key.expose(),
-                mapped_json,
-            )
+            .post_collect(&self.config.base_url, self.config.api_key.expose(), body)
             .await?;
         if raw_body.is_empty() {
             return Err(ClientError::new(ErrorCode::TtsResponseEmpty, "TTS 响应为空").into());

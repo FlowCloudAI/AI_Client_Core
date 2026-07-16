@@ -1,6 +1,5 @@
 // plugin/pipeline.rs——API 管道
 use anyhow::Result;
-use serde_json::Value;
 use std::sync::Arc;
 
 use crate::error::{ClientError, ErrorCode};
@@ -116,21 +115,25 @@ impl ApiPipeline {
         mapper.map_stream_line(line)
     }
 
-    /// 便捷方法：序列化 → map → 反序列化
-    pub fn prepare_request_json(&self, json: &Value) -> Result<Value> {
-        let raw = serde_json::to_string(json).map_err(|e| {
+    /// 便捷方法：序列化 → map，返回可直接发送的请求体字符串。
+    ///
+    /// 无插件时 `to_string` 一次即返回；有插件时 `map_request` 后用
+    /// `IgnoredAny` 校验产物为合法 JSON（不重建 Value 树）。
+    /// 相比旧 `prepare_request_json`，省去「map 后 from_str 建树 → 上层再序列化」的往返。
+    pub fn prepare_request_body<T: serde::Serialize>(&self, req: &T) -> Result<String> {
+        let raw = serde_json::to_string(req).map_err(|e| {
             ClientError::new(ErrorCode::LlmRequestBadPayload, "请求 JSON 序列化失败")
                 .with_kv("source", e.to_string())
         })?;
+        if self.plugin_id.is_none() {
+            return Ok(raw);
+        }
         let mapped = self.map_request(&raw)?;
-        serde_json::from_str(&mapped).map_err(|e| {
-            ClientError::new(
-                ErrorCode::LlmRequestBadPayload,
-                "映射后请求 JSON 反序列化失败",
-            )
-            .with_kv("source", e.to_string())
-            .into()
-        })
+        serde_json::from_str::<serde::de::IgnoredAny>(&mapped).map_err(|e| {
+            ClientError::new(ErrorCode::LlmRequestBadPayload, "映射后请求 JSON 非法")
+                .with_kv("source", e.to_string())
+        })?;
+        Ok(mapped)
     }
 }
 
@@ -169,5 +172,11 @@ mod tests {
 
         assert_eq!(pipeline.map_request("{\"a\":1}").unwrap(), "{\"a\":1}");
         assert_eq!(pipeline.map_response("{\"b\":2}").unwrap(), "{\"b\":2}");
+        assert_eq!(
+            pipeline
+                .prepare_request_body(&serde_json::json!({ "a": 1 }))
+                .unwrap(),
+            "{\"a\":1}"
+        );
     }
 }
