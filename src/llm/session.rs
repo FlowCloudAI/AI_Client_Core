@@ -909,6 +909,17 @@ impl LLMSession {
                         .with_kv("max_tool_rounds", self.config.max_tool_rounds as u64)
                         .with_kv("tool_rounds", tool_rounds as u64),
                     );
+                    // 为每个未执行的 call 补占位 tool 消息，避免悬空 tool_calls
+                    // 被持久化后打死会话。补完后 head 是 tool 节点，
+                    // should_wait_for_user() 不再成立，必须显式强制等待，
+                    // 否则 drive 会立即重发请求形成无限工具轮循环。
+                    self.append_unexecuted_tool_placeholders(
+                        MAX_ROUNDS_PLACEHOLDER_REASON,
+                        calls,
+                        &event_tx,
+                    )
+                    .await;
+                    force_wait_for_user = true;
                     event_tx
                         .send(SessionEvent::TurnEnd {
                             status,
@@ -970,14 +981,122 @@ impl LLMSession {
 
     async fn snapshot(&self) -> ChatRequest {
         let mut req = self.conversation.read().await.clone();
-        req.messages = self
+        let messages: Vec<Message> = self
             .system_messages
             .iter()
             .cloned()
             .chain(self.tree.read().await.linearize())
             .collect();
+        req.messages = Self::sanitize_tool_call_blocks(messages);
         req.tools = self.tool_registry.schemas();
         req
+    }
+
+    /// 修复请求消息序列中的悬空/错配 tool_calls 块（只作用于请求副本，不动树）。
+    ///
+    /// 历史损坏可能已被持久化（取消/超限旧版本不补 tool 消息，且旧版非流式
+    /// 路径 assistant 侧存 provider ID、tool 侧存合成 ID），这类历史一旦原样
+    /// 发出会被 OpenAI 兼容 API 以 400 拒绝且每轮复发。处理三类损坏：
+    /// 1. assistant(tool_calls) 后缺少部分或全部 tool 结果 → 补占位消息；
+    /// 2. tool 消息数量在但 tool_call_id 与 call.id 错配 → 按位置配对重写 ID；
+    /// 3. 无法归属到任何 call 的多余 tool 消息 → 丢弃。
+    fn sanitize_tool_call_blocks(messages: Vec<Message>) -> Vec<Message> {
+        let mut out: Vec<Message> = Vec::with_capacity(messages.len());
+        let mut iter = messages.into_iter().peekable();
+        while let Some(mut msg) = iter.next() {
+            let has_calls = msg.role == "assistant"
+                && msg.tool_calls.as_ref().is_some_and(|c| !c.is_empty());
+            if !has_calls {
+                // 没有 assistant(tool_calls) 锚点的孤儿 tool 消息同样会被 API 拒绝。
+                if msg.role == "tool" {
+                    log::warn!(
+                        "[client:session][orphan_tool_message_dropped] position={}",
+                        out.len()
+                    );
+                    continue;
+                }
+                out.push(msg);
+                continue;
+            }
+
+            let mut tools: Vec<Message> = Vec::new();
+            while iter.peek().is_some_and(|m| m.role == "tool") {
+                tools.push(iter.next().expect("peek 已确认存在"));
+            }
+
+            // 空 call.id 无法与任何 tool 消息配对，先在副本上归一化补齐。
+            let anchor = out.len();
+            let calls = msg.tool_calls.as_mut().expect("has_calls 已确认非空");
+            for call in calls.iter_mut() {
+                if call.id.as_deref().is_none_or(str::is_empty) {
+                    call.id = Some(format!("sanitized:{}:{}", anchor, call.index));
+                }
+            }
+            let expected: Vec<String> = calls
+                .iter()
+                .map(|c| c.id.clone().expect("上方已归一化"))
+                .collect();
+
+            // 第一遍：按 ID 精确配对。
+            let mut tool_matched = vec![false; tools.len()];
+            let mut call_matched = vec![false; expected.len()];
+            for (ci, id) in expected.iter().enumerate() {
+                if let Some(ti) = (0..tools.len()).find(|&ti| {
+                    !tool_matched[ti] && tools[ti].tool_call_id.as_deref() == Some(id)
+                }) {
+                    tool_matched[ti] = true;
+                    call_matched[ci] = true;
+                }
+            }
+
+            // 第二遍：剩余的按位置配对并重写 tool_call_id。不能对未匹配 call
+            // 一律补占位——"数量齐但 ID 错配"的存量块会被误判为全缺失，插入
+            // 重复 tool 消息反而让请求更坏。
+            let unmatched_calls: Vec<usize> = (0..expected.len())
+                .filter(|&ci| !call_matched[ci])
+                .collect();
+            let unmatched_tools: Vec<usize> = (0..tools.len())
+                .filter(|&ti| !tool_matched[ti])
+                .collect();
+            let mut rewritten = 0usize;
+            for (&ci, &ti) in unmatched_calls.iter().zip(unmatched_tools.iter()) {
+                tools[ti].tool_call_id = Some(expected[ci].clone());
+                tool_matched[ti] = true;
+                call_matched[ci] = true;
+                rewritten += 1;
+            }
+
+            // 第三遍：仍未覆盖的 call 补占位；未归属的 tool 丢弃。
+            let missing: Vec<String> = (0..expected.len())
+                .filter(|&ci| !call_matched[ci])
+                .map(|ci| expected[ci].clone())
+                .collect();
+            let dropped = tool_matched.iter().filter(|matched| !**matched).count();
+            if rewritten > 0 || !missing.is_empty() || dropped > 0 {
+                log::warn!(
+                    "[client:session][tool_block_sanitized] anchor={} calls={} rewritten={} missing={} dropped={}",
+                    anchor,
+                    expected.len(),
+                    rewritten,
+                    missing.len(),
+                    dropped
+                );
+            }
+
+            out.push(msg);
+            for (ti, tool) in tools.into_iter().enumerate() {
+                if tool_matched[ti] {
+                    out.push(tool);
+                }
+            }
+            for id in missing {
+                out.push(Message::tool(
+                    "工具执行失败: 会话历史中缺失该工具调用的结果（已自动补齐占位）",
+                    id,
+                ));
+            }
+        }
+        out
     }
 
     async fn add_message(&self, msg: Message) -> u64 {
@@ -1453,6 +1572,12 @@ impl LLMSession {
 
 // ── 工具执行 ──
 
+/// 工具被取消/超限时补进树的占位 tool 消息文案。
+/// 前缀对齐既有 "工具执行失败: ..." 风格，便于模型理解这不是正常结果。
+const CANCEL_PLACEHOLDER_REASON: &str = "工具执行失败: 用户取消了本轮对话，该工具调用未执行";
+const MAX_ROUNDS_PLACEHOLDER_REASON: &str =
+    "工具执行失败: 已达最大连续工具调用轮数上限，该工具调用未执行";
+
 impl LLMSession {
     async fn execute_tool_calls(
         &mut self,
@@ -1476,7 +1601,8 @@ impl LLMSession {
             enabled_scope
         );
 
-        for (call_position, call) in tool_calls.into_iter().enumerate() {
+        let mut calls_iter = tool_calls.into_iter().enumerate();
+        while let Some((call_position, call)) = calls_iter.next() {
             if cancel.is_cancelled() {
                 log::warn!(
                     "[client:tools][batch_cancelled_before_call] turn_id={} next_call_position={} calls={}",
@@ -1484,6 +1610,15 @@ impl LLMSession {
                     call_position + 1,
                     total_calls
                 );
+                let pending: Vec<ToolCall> = std::iter::once(call)
+                    .chain(calls_iter.by_ref().map(|(_, c)| c))
+                    .collect();
+                self.append_unexecuted_tool_placeholders(
+                    CANCEL_PLACEHOLDER_REASON,
+                    pending,
+                    event_tx,
+                )
+                .await;
                 return Ok(true);
             }
 
@@ -1555,7 +1690,7 @@ impl LLMSession {
                                 func_name,
                                 output.chars().count()
                             );
-                            let tool_call_id = Self::synth_tool_call_id(self.turn_id, call.index);
+                            let tool_call_id = Self::tool_message_id(&call, self.turn_id);
                             let _ = self.add_message(Message::tool(output, tool_call_id)).await;
                             log::info!(
                                 "[client:tools][tool_message_added] turn_id={} index={} name={}",
@@ -1570,6 +1705,14 @@ impl LLMSession {
                                     call.index,
                                     func_name
                                 );
+                                let pending: Vec<ToolCall> =
+                                    calls_iter.by_ref().map(|(_, c)| c).collect();
+                                self.append_unexecuted_tool_placeholders(
+                                    CANCEL_PLACEHOLDER_REASON,
+                                    pending,
+                                    event_tx,
+                                )
+                                .await;
                                 return Ok(true);
                             }
                             continue;
@@ -1599,6 +1742,15 @@ impl LLMSession {
                             func_name,
                             conduct_started.elapsed().as_millis()
                         );
+                        let pending: Vec<ToolCall> = std::iter::once(call.clone())
+                            .chain(calls_iter.by_ref().map(|(_, c)| c))
+                            .collect();
+                        self.append_unexecuted_tool_placeholders(
+                            CANCEL_PLACEHOLDER_REASON,
+                            pending,
+                            event_tx,
+                        )
+                        .await;
                         return Ok(true);
                     },
                 } {
@@ -1627,7 +1779,7 @@ impl LLMSession {
                 }
             };
 
-            let tool_call_id = Self::synth_tool_call_id(self.turn_id, call.index);
+            let tool_call_id = Self::tool_message_id(&call, self.turn_id);
 
             event_tx
                 .send(SessionEvent::ToolResult {
@@ -1660,6 +1812,13 @@ impl LLMSession {
                     call.index,
                     func_name
                 );
+                let pending: Vec<ToolCall> = calls_iter.by_ref().map(|(_, c)| c).collect();
+                self.append_unexecuted_tool_placeholders(
+                    CANCEL_PLACEHOLDER_REASON,
+                    pending,
+                    event_tx,
+                )
+                .await;
                 return Ok(true);
             }
         }
@@ -1679,6 +1838,46 @@ impl LLMSession {
             format!("{}...(truncated)", preview)
         } else {
             preview
+        }
+    }
+
+    /// tool 消息的 tool_call_id：provider 给了真实 id 就用它（与 assistant 侧
+    /// tool_calls 里的 id 配对），否则退回合成 ID。
+    fn tool_message_id(call: &ToolCall, turn_id: u64) -> String {
+        call.id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| Self::synth_tool_call_id(turn_id, call.index))
+    }
+
+    /// 为未执行的 tool_calls 补占位 tool 消息。
+    ///
+    /// assistant(tool_calls) 节点已入树且会被持久化；任何提前退出若不为每个
+    /// call 留下配对的 tool 消息，该历史再发给 OpenAI 兼容 API 会被 400 拒绝
+    /// 且每轮复发。树写入优先于事件——事件发送失败只影响本次 UI 展示。
+    async fn append_unexecuted_tool_placeholders(
+        &self,
+        reason: &str,
+        calls: Vec<ToolCall>,
+        event_tx: &mpsc::Sender<SessionEvent>,
+    ) {
+        for call in calls {
+            let tool_call_id = Self::tool_message_id(&call, self.turn_id);
+            let _ = self.add_message(Message::tool(reason, tool_call_id)).await;
+            let _ = event_tx
+                .send(SessionEvent::ToolResult {
+                    index: call.index,
+                    output: reason.to_string(),
+                    is_error: true,
+                })
+                .await;
+            log::info!(
+                "[client:tools][placeholder_tool_message_added] turn_id={} index={} name={}",
+                self.turn_id,
+                call.index,
+                call.function.name
+            );
         }
     }
 
@@ -2117,6 +2316,23 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         assert!(!finished.load(Ordering::SeqCst));
+
+        // 取消后不能留下悬空 tool_calls：每个 call 必须有配对的 tool 消息
+        let snapshot = handle.get_conversation().await;
+        let call_count: usize = snapshot
+            .messages
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .filter_map(|m| m.tool_calls.as_ref())
+            .map(Vec::len)
+            .sum();
+        let tool_count = snapshot
+            .messages
+            .iter()
+            .filter(|m| m.role == "tool")
+            .count();
+        assert!(call_count > 0);
+        assert_eq!(call_count, tool_count);
     }
 
     #[test]
@@ -2198,6 +2414,63 @@ mod tests {
             LLMSession::context_insert_index_before_pending_block(&messages),
             2
         );
+    }
+
+    fn tc(id: Option<&str>, index: usize, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.map(str::to_string),
+            call_type: Some("function".to_string()),
+            function: ToolFunctionCall {
+                name: name.to_string(),
+                arguments: "{}".to_string(),
+            },
+            index,
+        }
+    }
+
+    #[test]
+    fn sanitize_fills_missing_tool_results() {
+        let messages = vec![
+            Message::user("q"),
+            Message::assistant(
+                None::<String>,
+                None::<String>,
+                Some(vec![tc(Some("a"), 0, "t1"), tc(Some("b"), 1, "t2")]),
+            ),
+            Message::tool("ok", "a"),
+        ];
+        let out = LLMSession::sanitize_tool_call_blocks(messages);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[3].role, "tool");
+        assert_eq!(out[3].tool_call_id.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn sanitize_rewrites_mismatched_ids_by_position() {
+        // 旧版非流式路径：assistant 侧 provider ID、tool 侧合成 ID
+        let messages = vec![
+            Message::assistant(
+                None::<String>,
+                None::<String>,
+                Some(vec![tc(Some("prov_1"), 0, "t1")]),
+            ),
+            Message::tool("ok", "t1:idx:0"),
+        ];
+        let out = LLMSession::sanitize_tool_call_blocks(messages);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].tool_call_id.as_deref(), Some("prov_1"));
+    }
+
+    #[test]
+    fn sanitize_drops_orphan_tool_messages() {
+        let messages = vec![
+            Message::user("q"),
+            Message::tool("orphan", "x"),
+            Message::assistant(Some("a"), None::<String>, None),
+        ];
+        let out = LLMSession::sanitize_tool_call_blocks(messages);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|m| m.role != "tool"));
     }
 
     #[test]
