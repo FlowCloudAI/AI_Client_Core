@@ -115,6 +115,8 @@ define_error_codes! {
     // ── HTTP 传输层 ───────────────────────────────────────────
     HttpBadRequest           => "HTTP_BAD_REQUEST",
     HttpUnauthorized         => "HTTP_UNAUTHORIZED",
+    HttpPaymentRequired      => "HTTP_PAYMENT_REQUIRED",
+    HttpForbidden            => "HTTP_FORBIDDEN",
     HttpNotFound             => "HTTP_NOT_FOUND",
     HttpTooManyRequests      => "HTTP_TOO_MANY_REQUESTS",
     HttpServerError          => "HTTP_SERVER_ERROR",
