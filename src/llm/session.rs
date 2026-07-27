@@ -121,6 +121,9 @@ pub struct LLMSession {
     /// 当前轮次 ID
     turn_id: u64,
 
+    /// 从持久化历史恢复时先等待显式输入或 checkout，避免自动重放末尾未完成的用户消息。
+    wait_for_input_on_start: bool,
+
     orchestrator: Option<Box<dyn Orchestrate>>,
 }
 
@@ -143,6 +146,7 @@ impl LLMSession {
             config,
             pipeline,
             turn_id: 0,
+            wait_for_input_on_start: false,
             orchestrator: None,
         })
     }
@@ -154,6 +158,7 @@ impl LLMSession {
     ///
     /// `head` 为当前活跃节点；无显式 head 时传 `None`，此时退化为以最后一条消息为 head。
     pub fn preload_history(&mut self, messages: Vec<ConversationNodeSeed>, head: Option<u64>) {
+        self.wait_for_input_on_start = true;
         // 在 run() 调用前，只有 self 持有 Arc<RwLock<ConversationTree>>，
         // 因此 Arc::get_mut 保证成功，避免引入 async。
         if let Some(tree_lock) = Arc::get_mut(&mut self.tree) {
@@ -589,7 +594,7 @@ impl LLMSession {
         let mut current_ctx = TaskContext::default();
         let mut tool_rounds = 0usize;
         let mut accumulated_usage: Option<Usage> = None;
-        let mut force_wait_for_user = false;
+        let mut force_wait_for_user = self.wait_for_input_on_start;
 
         loop {
             if force_wait_for_user || self.should_wait_for_user().await {
@@ -2364,6 +2369,32 @@ mod tests {
         drop(ctx_tx);
 
         let (_events, _handle) = session.run_with_context_channel(input_rx, ctx_rx);
+    }
+
+    #[tokio::test]
+    async fn preloaded_user_head_waits_for_explicit_input() {
+        let (url, request_count) = spawn_mock_server(vec![MockReply::StreamDone {
+            content: "回复".into(),
+        }])
+        .await;
+        let mut session = new_http_test_session(url, true, Arc::new(ToolRegistry::new())).await;
+        session.preload_history(
+            vec![stored_message(Some(1), None, "user", "上次失败的问题")],
+            Some(1),
+        );
+        let (input_tx, input_rx) = mpsc::channel(1);
+        let (mut events, _handle) = session.try_run(input_rx).unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(1), events.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, SessionEvent::NeedInput));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+
+        input_tx.send("新问题".to_string()).await.unwrap();
+        wait_for_request_count(&request_count, 1).await;
     }
 
     #[test]
