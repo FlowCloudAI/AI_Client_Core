@@ -1,5 +1,6 @@
 pub mod accumulator;
 pub mod config;
+mod context_budget;
 pub mod handle;
 pub mod session;
 pub mod stream_decoder;

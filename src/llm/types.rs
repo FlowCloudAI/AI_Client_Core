@@ -459,6 +459,15 @@ pub enum SessionEvent {
         is_error: bool,
     },
 
+    /// 发送副本因上下文预算被机械裁剪；持久化消息树保持不变。
+    ContextTrimmed {
+        dropped_rounds: usize,
+        truncated_messages: usize,
+        before: u64,
+        after: u64,
+        suggest_compaction: bool,
+    },
+
     TurnEnd {
         status: TurnStatus,
         /// 本轮助手消息节点 ID；没有产生任何助手输出时为 None。

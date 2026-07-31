@@ -92,6 +92,7 @@ define_error_codes! {
     LlmToolCallFailed        => "LLM_TOOL_CALL_FAILED",
     LlmToolCallTimeout       => "LLM_TOOL_CALL_TIMEOUT",
     LlmToolCallInvalid       => "LLM_TOOL_CALL_INVALID",
+    ContextBudgetExceeded   => "CONTEXT_BUDGET_EXCEEDED",
 
     // ── 图像 ──────────────────────────────────────────────────
     ImageTaskFailed          => "IMAGE_TASK_FAILED",

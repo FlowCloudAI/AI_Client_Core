@@ -2,6 +2,10 @@ use crate::error::{ClientError, ErrorCode};
 use crate::http_poster::HttpPoster;
 use crate::llm::accumulator::ToolCallAccumulator;
 use crate::llm::config::SessionConfig;
+use crate::llm::context_budget::{
+    ContextTrimReport, TrimOptions, context_budget, context_budget_error, message_blocks,
+    trim_request_for_window, trim_request_to_budget,
+};
 use crate::llm::handle::SessionHandle;
 use crate::llm::stream_decoder::StreamDecoder;
 use crate::llm::token_estimate::{TokenCalibrator, estimate_request_tokens};
@@ -539,24 +543,17 @@ impl LLMSession {
     /// 若检测到该片段，则返回其起始位置；
     /// 否则退化为“最新一条消息之前”，保持普通用户轮行为不变。
     fn context_insert_index_before_pending_block(messages: &[Message]) -> usize {
-        if messages.is_empty() {
+        let Some(last_block) = message_blocks(messages).last().cloned() else {
             return 0;
-        }
-
-        let mut tail_start = messages.len();
-        while tail_start > 0 && messages[tail_start - 1].role == "tool" {
-            tail_start -= 1;
-        }
-
-        if tail_start < messages.len()
-            && tail_start > 0
-            && messages[tail_start - 1].role == "assistant"
-            && messages[tail_start - 1]
+        };
+        if last_block.len() > 1
+            && messages[last_block.start].role == "assistant"
+            && messages[last_block.start]
                 .tool_calls
                 .as_ref()
                 .is_some_and(|calls| !calls.is_empty())
         {
-            return tail_start - 1;
+            return last_block.start;
         }
 
         messages.len().saturating_sub(1)
@@ -1235,8 +1232,21 @@ impl LLMSession {
             ));
         }
 
-        let base_estimate = estimate_request_tokens(req);
-        let first_result = self.send_once(req, cancel, event_tx).await;
+        let calibration_factor = self.token_calibrator.factor();
+        let mut outgoing = req.clone();
+        if let Some(context_window_tokens) = self.config.context_window_tokens
+            && let Some(report) = trim_request_for_window(
+                &mut outgoing,
+                context_window_tokens,
+                calibration_factor,
+                TrimOptions::NORMAL,
+            )?
+        {
+            Self::emit_context_trimmed(event_tx, &report).await?;
+        }
+
+        let base_estimate = estimate_request_tokens(&outgoing);
+        let first_result = self.send_once(&outgoing, cancel, event_tx).await;
         let Err(ref error) = first_result else {
             self.observe_token_usage(base_estimate, &first_result);
             return first_result;
@@ -1244,7 +1254,8 @@ impl LLMSession {
         let Some(client_error) = ClientError::from_anyhow(error) else {
             return first_result;
         };
-        let Some((repaired, rule)) = Self::repair_after_bad_request(req, client_error) else {
+        let Some((mut repaired, rule)) = Self::repair_after_bad_request(&outgoing, client_error)
+        else {
             return first_result;
         };
         if cancel.is_cancelled() {
@@ -1263,10 +1274,63 @@ impl LLMSession {
         if rule == "unsupported_reasoning_content" {
             self.strip_reasoning_content = true;
         }
+        let retry_budget = if rule == "context_length_exceeded" {
+            let budget = self.config.context_window_tokens.map_or_else(
+                || {
+                    self.token_calibrator
+                        .estimate(estimate_request_tokens(&outgoing))
+                        .saturating_mul(70)
+                        / 100
+                },
+                |window| {
+                    context_budget(&outgoing, window, TrimOptions::OVERFLOW_RETRY.budget_scale)
+                },
+            );
+            let report = trim_request_to_budget(
+                &mut repaired,
+                budget,
+                calibration_factor,
+                TrimOptions::OVERFLOW_RETRY.force_drop_oldest_round,
+            )?
+            .ok_or_else(|| context_budget_error(&repaired, budget, calibration_factor))?;
+            Self::emit_context_trimmed(event_tx, &report).await?;
+            Some(budget)
+        } else {
+            None
+        };
         let repaired_estimate = estimate_request_tokens(&repaired);
         let repaired_result = self.send_once(&repaired, cancel, event_tx).await;
         self.observe_token_usage(repaired_estimate, &repaired_result);
+        if let (Some(budget), Err(error)) = (retry_budget, &repaired_result)
+            && ClientError::from_anyhow(error).is_some_and(Self::is_context_overflow_error)
+        {
+            return Err(context_budget_error(&repaired, budget, calibration_factor).into());
+        }
         repaired_result
+    }
+
+    async fn emit_context_trimmed(
+        event_tx: &mpsc::Sender<SessionEvent>,
+        report: &ContextTrimReport,
+    ) -> Result<()> {
+        log::warn!(
+            "[client:llm][context_trimmed] dropped_rounds={} truncated_messages={} before={} after={} budget={}",
+            report.dropped_rounds,
+            report.truncated_messages,
+            report.before,
+            report.after,
+            report.budget
+        );
+        event_tx
+            .send(SessionEvent::ContextTrimmed {
+                dropped_rounds: report.dropped_rounds,
+                truncated_messages: report.truncated_messages,
+                before: report.before,
+                after: report.after,
+                suggest_compaction: report.suggest_compaction,
+            })
+            .await?;
+        Ok(())
     }
 
     fn observe_token_usage(&mut self, base_estimate: u64, result: &Result<TurnOutput>) {
@@ -1324,6 +1388,10 @@ impl LLMSession {
             .to_ascii_lowercase();
         let mut repaired = req.clone();
 
+        if Self::is_context_overflow_message(&provider_message) {
+            return Some((repaired, "context_length_exceeded"));
+        }
+
         if provider_message.contains("reasoning_content")
             && ["not allowed", "unsupported", "unknown", "extra inputs"]
                 .iter()
@@ -1356,6 +1424,30 @@ impl LLMSession {
         }
 
         None
+    }
+
+    fn is_context_overflow_error(error: &ClientError) -> bool {
+        error.code == ErrorCode::HttpBadRequest
+            && error
+                .detail
+                .get("provider_message")
+                .and_then(Value::as_str)
+                .is_some_and(Self::is_context_overflow_message)
+    }
+
+    fn is_context_overflow_message(message: &str) -> bool {
+        let message = message.to_ascii_lowercase();
+        [
+            "context_length_exceeded",
+            "maximum context length",
+            "prompt is too long",
+            "input length and max_tokens exceed context limit",
+            "exceeds the context window",
+            "too many tokens",
+            "maximum number of tokens",
+        ]
+        .iter()
+        .any(|marker| message.contains(marker))
     }
 
     async fn handle_non_stream(
@@ -2144,11 +2236,13 @@ impl LLMSession {
 
 #[cfg(test)]
 mod tests {
-    use super::LLMSession;
+    use super::{LLMSession, TurnCancel};
+    use crate::error::{ClientError, ErrorCode};
     use crate::llm::config::SessionConfig;
     use crate::llm::tree::ConversationNodeSeed;
     use crate::llm::types::{
-        Message, SessionEvent, ToolCall, ToolFunctionArg, ToolFunctionCall, TurnStatus, Usage,
+        ChatRequest, Message, SessionEvent, ToolCall, ToolFunctionArg, ToolFunctionCall,
+        TurnStatus, Usage,
     };
     use crate::orchestrator::TaskContext;
     use crate::plugin::pipeline::ApiPipeline;
@@ -2217,14 +2311,52 @@ mod tests {
         session
     }
 
+    fn overflow_request() -> ChatRequest {
+        let mut messages = Vec::new();
+        for round in 1..=4 {
+            messages.push(Message::user(format!(
+                "第{round}轮问题-{}",
+                "问".repeat(100)
+            )));
+            messages.push(Message::assistant(
+                Some(format!("第{round}轮回答-{}", "答".repeat(100))),
+                None::<String>,
+                None,
+            ));
+        }
+        ChatRequest {
+            messages,
+            model: "mock-model".to_string(),
+            stream: Some(true),
+            ..ChatRequest::default()
+        }
+    }
+
     enum MockReply {
         DelayHeaders(Duration),
-        HttpBadRequest { message: String },
-        StreamPartialThenHold { content: String, hold: Duration },
-        StreamPartialThenDisconnect { content: String },
-        StreamLength { content: String },
-        StreamDone { content: String },
-        StreamToolCall { name: String },
+        HttpBadRequest {
+            message: String,
+        },
+        ContextLimit {
+            message_counts: Arc<std::sync::Mutex<Vec<usize>>>,
+            fail: bool,
+        },
+        StreamPartialThenHold {
+            content: String,
+            hold: Duration,
+        },
+        StreamPartialThenDisconnect {
+            content: String,
+        },
+        StreamLength {
+            content: String,
+        },
+        StreamDone {
+            content: String,
+        },
+        StreamToolCall {
+            name: String,
+        },
     }
 
     async fn spawn_mock_server(replies: Vec<MockReply>) -> (String, Arc<AtomicUsize>) {
@@ -2255,20 +2387,35 @@ mod tests {
     }
 
     async fn handle_mock_connection(mut socket: TcpStream, reply: MockReply) {
-        let _ = read_request_headers(&mut socket).await;
+        let request = read_http_request(&mut socket).await.unwrap_or_default();
         match reply {
             MockReply::DelayHeaders(delay) => {
                 tokio::time::sleep(delay).await;
             }
             MockReply::HttpBadRequest { message } => {
-                let body = serde_json::json!({"error": {"message": message}}).to_string();
-                let response = format!(
-                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = socket.write_all(response.as_bytes()).await;
-                let _ = socket.flush().await;
+                write_bad_request(&mut socket, &message).await;
+            }
+            MockReply::ContextLimit {
+                message_counts,
+                fail,
+            } => {
+                message_counts
+                    .lock()
+                    .unwrap()
+                    .push(request_message_count(&request));
+                if fail {
+                    write_bad_request(
+                        &mut socket,
+                        "maximum context length exceeded: prompt is too long",
+                    )
+                    .await;
+                } else {
+                    let _ = write_stream_headers(&mut socket).await;
+                    let _ =
+                        write_sse_line(&mut socket, stream_content_chunk("恢复成功", None)).await;
+                    let _ = write_sse_line(&mut socket, "[DONE]".to_string()).await;
+                    let _ = socket.flush().await;
+                }
             }
             MockReply::StreamPartialThenHold { content, hold } => {
                 let _ = write_stream_headers(&mut socket).await;
@@ -2308,19 +2455,53 @@ mod tests {
         }
     }
 
-    async fn read_request_headers(socket: &mut TcpStream) -> std::io::Result<()> {
+    async fn read_http_request(socket: &mut TcpStream) -> std::io::Result<Vec<u8>> {
         let mut buf = [0u8; 1024];
         let mut data = Vec::new();
         loop {
             let n = socket.read(&mut buf).await?;
             if n == 0 {
-                return Ok(());
+                return Ok(data);
             }
             data.extend_from_slice(&buf[..n]);
-            if data.windows(4).any(|w| w == b"\r\n\r\n") {
-                return Ok(());
+            let Some(header_end) = data.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&data[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if data.len() >= header_end + 4 + content_length {
+                return Ok(data);
             }
         }
+    }
+
+    fn request_message_count(request: &[u8]) -> usize {
+        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return 0;
+        };
+        serde_json::from_slice::<serde_json::Value>(&request[header_end + 4..])
+            .ok()
+            .and_then(|body| body.get("messages")?.as_array().map(Vec::len))
+            .unwrap_or(0)
+    }
+
+    async fn write_bad_request(socket: &mut TcpStream, message: &str) {
+        let body = serde_json::json!({"error": {"message": message}}).to_string();
+        let response = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = socket.write_all(response.as_bytes()).await;
+        let _ = socket.flush().await;
     }
 
     async fn read_request_body(socket: &mut TcpStream) -> std::io::Result<String> {
@@ -2809,6 +2990,92 @@ mod tests {
         }
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         drop(input_tx);
+    }
+
+    #[test]
+    fn recognizes_common_context_overflow_formats() {
+        let request = overflow_request();
+        for provider_message in [
+            "context_length_exceeded",
+            "This model's maximum context length is 8192 tokens",
+            "Prompt is too long",
+            "input length and max_tokens exceed context limit",
+            "request exceeds the context window",
+            "too many tokens in the request",
+            "maximum number of tokens exceeded",
+        ] {
+            let error = ClientError::new(ErrorCode::HttpBadRequest, "请求参数错误")
+                .with_kv("provider_message", provider_message);
+            let (_, rule) = LLMSession::repair_after_bad_request(&request, &error)
+                .expect("常见上下文溢出格式应被识别");
+            assert_eq!(rule, "context_length_exceeded");
+        }
+    }
+
+    #[tokio::test]
+    async fn context_overflow_retries_once_with_fewer_messages() {
+        let message_counts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, request_count) = spawn_mock_server(vec![
+            MockReply::ContextLimit {
+                message_counts: Arc::clone(&message_counts),
+                fail: true,
+            },
+            MockReply::ContextLimit {
+                message_counts: Arc::clone(&message_counts),
+                fail: false,
+            },
+        ])
+        .await;
+        let mut session = new_http_test_session(url, true, Arc::new(ToolRegistry::new())).await;
+        session.config.context_window_tokens = Some(8192);
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
+        let mut cancel = TurnCancel::new(&cancel_rx);
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+
+        let output = session
+            .send_and_process(&overflow_request(), &mut cancel, &event_tx)
+            .await
+            .unwrap();
+        assert_eq!(output.0, "恢复成功");
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        let counts = message_counts.lock().unwrap().clone();
+        assert_eq!(counts.len(), 2);
+        assert!(counts[1] < counts[0]);
+        assert!(
+            std::iter::from_fn(|| event_rx.try_recv().ok())
+                .any(|event| matches!(event, SessionEvent::ContextTrimmed { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_context_overflow_returns_chinese_budget_error() {
+        let message_counts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, request_count) = spawn_mock_server(vec![
+            MockReply::ContextLimit {
+                message_counts: Arc::clone(&message_counts),
+                fail: true,
+            },
+            MockReply::ContextLimit {
+                message_counts,
+                fail: true,
+            },
+        ])
+        .await;
+        let mut session = new_http_test_session(url, true, Arc::new(ToolRegistry::new())).await;
+        session.config.context_window_tokens = Some(8192);
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
+        let mut cancel = TurnCancel::new(&cancel_rx);
+        let (event_tx, _event_rx) = mpsc::channel(32);
+
+        let error = session
+            .send_and_process(&overflow_request(), &mut cancel, &event_tx)
+            .await
+            .unwrap_err();
+        let client_error = ClientError::from_anyhow(&error).unwrap();
+        assert_eq!(client_error.code, ErrorCode::ContextBudgetExceeded);
+        assert!(client_error.message.contains("上下文"));
+        assert!(!client_error.message.contains("maximum context length"));
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

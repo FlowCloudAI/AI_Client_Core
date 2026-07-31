@@ -145,6 +145,17 @@ async fn run_chat_loop(
                 }
             }
 
+            SessionEvent::ContextTrimmed {
+                dropped_rounds,
+                truncated_messages,
+                before,
+                after,
+                ..
+            } => println!(
+                "\n{}[系统] 上下文已裁剪：省略 {} 轮、截断 {} 条消息，{} → {} tokens{}",
+                SYSTEM_COLOR, dropped_rounds, truncated_messages, before, after, COLOR_RESET
+            ),
+
             SessionEvent::TurnEnd { status, .. } => {
                 println!(
                     "\n{}--- TurnEnd: {:?} ---{}",
