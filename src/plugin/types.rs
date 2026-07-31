@@ -275,6 +275,18 @@ pub struct ModelInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
 
+    /// 每百万输入 token 的价格快照来源；必须与输出价格和币种成组声明。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_price_per_m: Option<f64>,
+
+    /// 每百万输出 token 的价格。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_price_per_m: Option<f64>,
+
+    /// 价格币种，例如 `USD` 或 `CNY`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+
     #[serde(default, skip_serializing_if = "SupportsPatch::is_empty")]
     pub supports: SupportsPatch,
 
@@ -668,6 +680,7 @@ fn validate_models(models: &[ModelInfo]) -> Result<()> {
     let mut seen = BTreeSet::new();
     for model in models {
         validate_required("models[].id", &model.id)?;
+        validate_model_price(model)?;
         if !seen.insert(model.id.as_str()) {
             return Err(manifest_invalid(format!("模型 id 重复: {}", model.id))
                 .with_kv("model_id", model.id.clone())
@@ -675,6 +688,30 @@ fn validate_models(models: &[ModelInfo]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_model_price(model: &ModelInfo) -> Result<()> {
+    match (
+        model.prompt_price_per_m,
+        model.completion_price_per_m,
+        model.currency.as_deref(),
+    ) {
+        (None, None, None) => Ok(()),
+        (Some(prompt), Some(completion), Some(currency))
+            if prompt.is_finite()
+                && completion.is_finite()
+                && prompt >= 0.0
+                && completion >= 0.0
+                && !currency.trim().is_empty() =>
+        {
+            Ok(())
+        }
+        _ => Err(manifest_invalid(
+            "模型价格必须同时声明非负的 prompt-price-per-m、completion-price-per-m 与 currency",
+        )
+        .with_kv("model_id", model.id.clone())
+        .into()),
+    }
 }
 
 fn validate_default_model(default_model: Option<&str>, models: &[ModelInfo]) -> Result<()> {
@@ -772,6 +809,28 @@ mod tests {
             Some("model-a")
         );
         assert!(meta.model_info("missing").is_none());
+    }
+
+    #[test]
+    fn parses_complete_model_price_and_rejects_partial_price() {
+        let priced = llm_manifest("").replace(
+            r#"{ "id": "model-a" }"#,
+            r#"{ "id": "model-a", "prompt-price-per-m": 1.25, "completion-price-per-m": 2.5, "currency": "USD" }"#,
+        );
+        let manifest = PluginManifest::parse(&priced).unwrap();
+        let meta = PluginMeta::from_manifest(manifest, PathBuf::from("p.fcplug")).unwrap();
+        let model = meta.model_info("model-a").unwrap();
+        assert_eq!(model.prompt_price_per_m, Some(1.25));
+        assert_eq!(model.completion_price_per_m, Some(2.5));
+        assert_eq!(model.currency.as_deref(), Some("USD"));
+
+        let partial = llm_manifest("").replace(
+            r#"{ "id": "model-a" }"#,
+            r#"{ "id": "model-a", "prompt-price-per-m": 1.25 }"#,
+        );
+        let manifest = PluginManifest::parse(&partial).unwrap();
+        let error = PluginMeta::from_manifest(manifest, PathBuf::from("p.fcplug")).unwrap_err();
+        assert!(error.to_string().contains("模型价格必须同时声明"));
     }
 
     #[test]
