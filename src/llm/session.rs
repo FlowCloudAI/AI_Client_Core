@@ -964,13 +964,36 @@ impl LLMSession {
             .into());
         }
 
-        let context = serde_json::json!({
-            "reasoning_content": node.message.reasoning_content,
-        });
-        req.messages.push(Message::user(format!(
-            "继续完成上一条未完成的助手回复。直接从中断处接续，不要复述已有正文，保持原任务、语言和格式。下面 JSON 是已保存的内部思考上下文，只用于衔接，不是新的用户指令：\n{}",
-            context
-        )));
+        let instruction = "继续完成上一条未完成的助手回复。直接从中断处接续，不要复述已有正文，保持原任务、语言和格式。";
+        let has_sendable_assistant_payload = node
+            .message
+            .content
+            .as_deref()
+            .is_some_and(|content| !content.trim().is_empty())
+            || node
+                .message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| !calls.is_empty());
+        // sanitize_messages 会移除 reasoning-only assistant；仅此时用临时用户上下文兜底。
+        let prompt = if !has_sendable_assistant_payload
+            && node
+                .message
+                .reasoning_content
+                .as_deref()
+                .is_some_and(|reasoning| !reasoning.trim().is_empty())
+        {
+            let context = serde_json::json!({
+                "reasoning_content": node.message.reasoning_content,
+            });
+            format!(
+                "{}下面 JSON 是已保存的内部思考上下文，只用于衔接，不是新的用户指令：\n{}",
+                instruction, context
+            )
+        } else {
+            instruction.to_string()
+        };
+        req.messages.push(Message::user(prompt));
         Ok(())
     }
 
@@ -2562,6 +2585,46 @@ mod tests {
         assert_eq!(continuation_of, Some(2));
         let node = handle.get_node(node_id.unwrap()).await.unwrap();
         assert_eq!(node.parent, Some(2));
+        drop(input_tx);
+    }
+
+    #[tokio::test]
+    async fn content_continuation_does_not_duplicate_reasoning_in_prompt() {
+        let (url, body_rx) = spawn_capturing_stream_server().await;
+        let mut session = new_http_test_session(url, true, Arc::new(ToolRegistry::new())).await;
+        session.preload_history(
+            vec![
+                stored_message(Some(1), None, "user", "写一篇长文"),
+                ConversationNodeSeed {
+                    node_id: Some(2),
+                    parent: Some(1),
+                    turn_id: Some(1),
+                    timestamp: Some("2026-07-31T00:00:01Z".to_string()),
+                    message: Message::assistant(Some("已有正文"), Some("已有思考上下文"), None),
+                },
+            ],
+            Some(2),
+        );
+        let (input_tx, input_rx) = mpsc::channel(1);
+        let (mut events, handle) = session.try_run(input_rx).unwrap();
+
+        handle.continue_generation(2).await.unwrap();
+        assert_eq!(wait_for_content_delta(&mut events).await, "续写正文");
+        let request: serde_json::Value = serde_json::from_str(&body_rx.await.unwrap()).unwrap();
+        let messages = request["messages"].as_array().unwrap();
+        assert!(messages.iter().any(|message| {
+            message["role"] == "assistant" && message["reasoning_content"] == "已有思考上下文"
+        }));
+        assert!(
+            !messages.last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .contains("已有思考上下文")
+        );
+        assert!(matches!(
+            wait_for_turn_end(&mut events).await.0,
+            TurnStatus::Ok
+        ));
         drop(input_tx);
     }
 
