@@ -694,7 +694,18 @@ impl LLMSession {
             let stage_started = Instant::now();
             let mut req = self.snapshot().await;
             if let Some(node_id) = pending_continuation_context.take() {
-                self.append_continuation_context(&mut req, node_id).await?;
+                if let Err(error) = self.append_continuation_context(&mut req, node_id).await {
+                    event_tx
+                        .send(SessionEvent::TurnEnd {
+                            status: TurnStatus::Error(ClientError::from_anyhow_owned(error)),
+                            node_id: None,
+                            finish_reason: None,
+                            continuation_of,
+                            usage: accumulated_usage.take(),
+                        })
+                        .await?;
+                    continue;
+                }
             }
             let snapshot_elapsed_ms = stage_started.elapsed().as_millis();
             if log::log_enabled!(log::Level::Info) {
@@ -2551,6 +2562,49 @@ mod tests {
         assert_eq!(continuation_of, Some(2));
         let node = handle.get_node(node_id.unwrap()).await.unwrap();
         assert_eq!(node.parent, Some(2));
+        drop(input_tx);
+    }
+
+    #[tokio::test]
+    async fn stale_queued_continuation_does_not_stop_session() {
+        let (url, _) = spawn_mock_server(vec![
+            MockReply::StreamPartialThenHold {
+                content: "第一段续写".to_string(),
+                hold: Duration::from_millis(50),
+            },
+            MockReply::StreamDone {
+                content: "会话仍可用".to_string(),
+            },
+        ])
+        .await;
+        let mut session = new_http_test_session(url, true, Arc::new(ToolRegistry::new())).await;
+        session.preload_history(
+            vec![
+                stored_message(Some(1), None, "user", "写一篇长文"),
+                stored_message(Some(2), Some(1), "assistant", "已有正文"),
+            ],
+            Some(2),
+        );
+        let (input_tx, input_rx) = mpsc::channel(1);
+        let (mut events, handle) = session.try_run(input_rx).unwrap();
+
+        handle.continue_generation(2).await.unwrap();
+        handle.continue_generation(2).await.unwrap();
+        assert_eq!(wait_for_content_delta(&mut events).await, "第一段续写");
+        let (_, first_node_id, _, _) = wait_for_turn_end(&mut events).await;
+        assert!(first_node_id.is_some());
+
+        let (status, node_id, _, continuation_of) = wait_for_turn_end(&mut events).await;
+        assert!(matches!(status, TurnStatus::Error(_)));
+        assert_eq!(node_id, None);
+        assert_eq!(continuation_of, Some(2));
+
+        input_tx.send("继续对话".to_string()).await.unwrap();
+        assert_eq!(wait_for_content_delta(&mut events).await, "会话仍可用");
+        assert!(matches!(
+            wait_for_turn_end(&mut events).await.0,
+            TurnStatus::Ok
+        ));
         drop(input_tx);
     }
 
