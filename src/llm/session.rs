@@ -124,6 +124,9 @@ pub struct LLMSession {
     /// 从持久化历史恢复时先等待显式输入或 checkout，避免自动重放末尾未完成的用户消息。
     wait_for_input_on_start: bool,
 
+    /// 当前供应商已明确拒绝 reasoning_content，后续请求直接移除该历史字段。
+    strip_reasoning_content: bool,
+
     orchestrator: Option<Box<dyn Orchestrate>>,
 }
 
@@ -147,6 +150,7 @@ impl LLMSession {
             pipeline,
             turn_id: 0,
             wait_for_input_on_start: false,
+            strip_reasoning_content: false,
             orchestrator: None,
         })
     }
@@ -934,6 +938,9 @@ impl LLMSession {
             .chain(self.tree.read().await.linearize())
             .collect();
         req.messages = Self::sanitize_messages(messages);
+        if self.strip_reasoning_content {
+            Self::strip_reasoning_content(&mut req.messages);
+        }
         req.tools = self.tool_registry.schemas();
         req
     }
@@ -1168,6 +1175,14 @@ impl LLMSession {
         out
     }
 
+    fn strip_reasoning_content(messages: &mut [Message]) -> bool {
+        let mut changed = false;
+        for message in messages {
+            changed |= message.reasoning_content.take().is_some();
+        }
+        changed
+    }
+
     async fn add_message(&self, msg: Message) -> u64 {
         self.tree.write().await.append(msg, self.turn_id)
     }
@@ -1235,6 +1250,9 @@ impl LLMSession {
             self.turn_id,
             rule
         );
+        if rule == "unsupported_reasoning_content" {
+            self.strip_reasoning_content = true;
+        }
         self.send_once(&repaired, cancel, event_tx).await
     }
 
@@ -1280,11 +1298,7 @@ impl LLMSession {
                 .iter()
                 .any(|marker| provider_message.contains(marker))
         {
-            let mut changed = false;
-            for message in &mut repaired.messages {
-                changed |= message.reasoning_content.take().is_some();
-            }
-            if changed {
+            if Self::strip_reasoning_content(&mut repaired.messages) {
                 return Some((repaired, "unsupported_reasoning_content"));
             }
         }
@@ -2330,6 +2344,44 @@ mod tests {
         (format!("http://{}", addr), body_rx)
     }
 
+    async fn spawn_reasoning_rejecting_server(
+        expected_requests: usize,
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let count_for_task = Arc::clone(&request_count);
+        tokio::spawn(async move {
+            for _ in 0..expected_requests {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let body = read_request_body(&mut socket).await.unwrap_or_default();
+                count_for_task.fetch_add(1, Ordering::SeqCst);
+                if body.contains("\"reasoning_content\"") {
+                    let body = serde_json::json!({
+                        "error": {"message": "reasoning_content is not allowed"}
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                } else {
+                    let _ = write_stream_headers(&mut socket).await;
+                    let _ =
+                        write_sse_line(&mut socket, stream_content_chunk("修复成功", Some("stop")))
+                            .await;
+                    let _ = write_sse_line(&mut socket, "[DONE]".to_string()).await;
+                }
+                let _ = socket.flush().await;
+            }
+        });
+        (format!("http://{}", addr), request_count)
+    }
+
     async fn write_stream_headers(socket: &mut TcpStream) -> std::io::Result<()> {
         socket
             .write_all(
@@ -2673,15 +2725,7 @@ mod tests {
 
     #[tokio::test]
     async fn recognized_bad_request_is_repaired_once() {
-        let (url, request_count) = spawn_mock_server(vec![
-            MockReply::HttpBadRequest {
-                message: "reasoning_content is not allowed".to_string(),
-            },
-            MockReply::StreamDone {
-                content: "修复成功".to_string(),
-            },
-        ])
-        .await;
+        let (url, request_count) = spawn_reasoning_rejecting_server(3).await;
         let mut session = new_http_test_session(url, true, Arc::new(ToolRegistry::new())).await;
         session.preload_history(
             vec![
@@ -2703,7 +2747,14 @@ mod tests {
         assert_eq!(wait_for_content_delta(&mut events).await, "修复成功");
         let (status, _, _, _) = wait_for_turn_end(&mut events).await;
         assert!(matches!(status, TurnStatus::Ok));
-        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+
+        input_tx.send("再问一次".to_string()).await.unwrap();
+        assert_eq!(wait_for_content_delta(&mut events).await, "修复成功");
+        assert!(matches!(
+            wait_for_turn_end(&mut events).await.0,
+            TurnStatus::Ok
+        ));
+        assert_eq!(request_count.load(Ordering::SeqCst), 3);
         drop(input_tx);
     }
 
