@@ -945,6 +945,16 @@ impl LLMSession {
         req
     }
 
+    /// 判断助手消息是否会被兼容接口拒绝并由请求清洗阶段移除。
+    fn is_droppable_assistant(message: &Message) -> bool {
+        message.role == "assistant"
+            && message
+                .content
+                .as_deref()
+                .is_none_or(|content| content.trim().is_empty())
+            && message.tool_calls.as_ref().is_none_or(Vec::is_empty)
+    }
+
     /// 为显式续写添加只存在于本次请求中的上下文，不污染持久化消息树。
     async fn append_continuation_context(&self, req: &mut ChatRequest, node_id: u64) -> Result<()> {
         let tree = self.tree.read().await;
@@ -972,18 +982,8 @@ impl LLMSession {
         }
 
         let instruction = "继续完成上一条未完成的助手回复。直接从中断处接续，不要复述已有正文，保持原任务、语言和格式。";
-        let has_sendable_assistant_payload = node
-            .message
-            .content
-            .as_deref()
-            .is_some_and(|content| !content.trim().is_empty())
-            || node
-                .message
-                .tool_calls
-                .as_ref()
-                .is_some_and(|calls| !calls.is_empty());
         // sanitize_messages 会移除 reasoning-only assistant；仅此时用临时用户上下文兜底。
-        let prompt = if !has_sendable_assistant_payload
+        let prompt = if Self::is_droppable_assistant(&node.message)
             && node
                 .message
                 .reasoning_content
@@ -1051,9 +1051,7 @@ impl LLMSession {
 
         let mut dropped = 0usize;
         coalesced.retain(|message| {
-            let invalid_assistant = message.role == "assistant"
-                && message.content.is_none()
-                && message.tool_calls.is_none();
+            let invalid_assistant = Self::is_droppable_assistant(message);
             if invalid_assistant {
                 dropped += 1;
             }
