@@ -186,6 +186,8 @@ mod tests {
             event_buffer: 0,
             request_timeout,
             max_tool_rounds: 0,
+            context_window_tokens: None,
+            calibration_factor: None,
             max_line_bytes,
         }
     }

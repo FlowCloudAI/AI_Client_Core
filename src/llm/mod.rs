@@ -3,5 +3,6 @@ pub mod config;
 pub mod handle;
 pub mod session;
 pub mod stream_decoder;
+pub mod token_estimate;
 pub mod tree;
 pub mod types;

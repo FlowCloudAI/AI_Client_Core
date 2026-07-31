@@ -469,6 +469,8 @@ pub enum SessionEvent {
         continuation_of: Option<u64>,
         /// API 用量统计（通常在流式最后一个 chunk 或非流式响应中返回）
         usage: Option<Usage>,
+        /// 用本轮真实 prompt usage 更新后的 token 估算校准系数。
+        calibration_factor: Option<f64>,
     },
     /// 分支切换完成（checkout 成功）。
     BranchChanged {

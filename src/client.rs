@@ -500,6 +500,8 @@ impl FlowCloudAIClient {
             event_buffer: 0,      // TTS 不用事件流
             request_timeout: 120, // TTS 合成可能较慢
             max_tool_rounds: 0,
+            context_window_tokens: None,
+            calibration_factor: None,
             max_line_bytes: 0,
         });
         // 如果调用方传入了自定义 config，仍需覆盖 url 和 api_key
@@ -542,6 +544,8 @@ impl FlowCloudAIClient {
             event_buffer: 0,
             request_timeout: 180, // 图像生成较慢
             max_tool_rounds: 0,
+            context_window_tokens: None,
+            calibration_factor: None,
             max_line_bytes: 0,
         });
         // 如果调用方传入了自定义 config，仍需覆盖 url 和 api_key

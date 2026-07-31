@@ -4,6 +4,7 @@ use crate::llm::accumulator::ToolCallAccumulator;
 use crate::llm::config::SessionConfig;
 use crate::llm::handle::SessionHandle;
 use crate::llm::stream_decoder::StreamDecoder;
+use crate::llm::token_estimate::{TokenCalibrator, estimate_request_tokens};
 use crate::llm::tree::{ConversationNodeSeed, ConversationTree};
 use crate::llm::types::{
     ChatRequest, ChatResponse, CtrlMsg, DecoderEventPayload, Message, SessionEvent, ThinkingType,
@@ -115,6 +116,9 @@ pub struct LLMSession {
     /// 连接配置
     config: SessionConfig,
 
+    /// 当前会话的 token 估算校准器。
+    token_calibrator: TokenCalibrator,
+
     /// 插件注册中心（共享，只读，通过 acquire 借出 mapper）
     pipeline: ApiPipeline,
 
@@ -140,6 +144,7 @@ impl LLMSession {
     ) -> Result<Self> {
         config.validate()?;
         let client = HttpPoster::new(config.request_timeout, config.max_line_bytes)?;
+        let token_calibrator = TokenCalibrator::new(config.calibration_factor);
         Ok(Self {
             client,
             conversation: Arc::new(RwLock::new(ChatRequest::default())),
@@ -147,6 +152,7 @@ impl LLMSession {
             system_messages: Arc::new(Vec::new()),
             tool_registry,
             config,
+            token_calibrator,
             pipeline,
             turn_id: 0,
             wait_for_input_on_start: false,
@@ -706,6 +712,7 @@ impl LLMSession {
                             finish_reason: None,
                             continuation_of,
                             usage: accumulated_usage.take(),
+                            calibration_factor: Some(self.token_calibrator.factor()),
                         })
                         .await?;
                     continue;
@@ -871,6 +878,7 @@ impl LLMSession {
                             finish_reason: finish_reason.clone(),
                             continuation_of,
                             usage: accumulated_usage.take(),
+                            calibration_factor: Some(self.token_calibrator.factor()),
                         })
                         .await?;
                     continue;
@@ -894,6 +902,7 @@ impl LLMSession {
                             finish_reason: Some("cancelled".to_string()),
                             continuation_of,
                             usage: accumulated_usage.take(),
+                            calibration_factor: Some(self.token_calibrator.factor()),
                         })
                         .await?;
                     continue;
@@ -908,6 +917,7 @@ impl LLMSession {
                     finish_reason,
                     continuation_of,
                     usage: accumulated_usage.take(),
+                    calibration_factor: Some(self.token_calibrator.factor()),
                 })
                 .await?;
         }
@@ -1225,8 +1235,10 @@ impl LLMSession {
             ));
         }
 
+        let base_estimate = estimate_request_tokens(req);
         let first_result = self.send_once(req, cancel, event_tx).await;
         let Err(ref error) = first_result else {
+            self.observe_token_usage(base_estimate, &first_result);
             return first_result;
         };
         let Some(client_error) = ClientError::from_anyhow(error) else {
@@ -1251,7 +1263,28 @@ impl LLMSession {
         if rule == "unsupported_reasoning_content" {
             self.strip_reasoning_content = true;
         }
-        self.send_once(&repaired, cancel, event_tx).await
+        let repaired_estimate = estimate_request_tokens(&repaired);
+        let repaired_result = self.send_once(&repaired, cancel, event_tx).await;
+        self.observe_token_usage(repaired_estimate, &repaired_result);
+        repaired_result
+    }
+
+    fn observe_token_usage(&mut self, base_estimate: u64, result: &Result<TurnOutput>) {
+        let Ok((_, _, _, _, _, Some(usage))) = result else {
+            return;
+        };
+        if let Some(factor) = self
+            .token_calibrator
+            .observe(usage.prompt_tokens, base_estimate)
+        {
+            log::info!(
+                "[client:llm][token_calibrated] turn_id={} prompt_tokens={} base_estimate={} factor={:.4}",
+                self.turn_id,
+                usage.prompt_tokens,
+                base_estimate,
+                factor
+            );
+        }
     }
 
     async fn send_once(
