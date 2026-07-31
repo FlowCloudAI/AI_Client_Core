@@ -776,24 +776,32 @@ impl LLMSession {
                 }
             }
 
-            let asst_node_id =
-                if matches!(turn_status, TurnStatus::Cancelled | TurnStatus::Interrupted) {
-                    // 将已生成的部分内容保存为 assistant 节点，使 head 推进到 "assistant"，
-                    // 确保 should_wait_for_user() 返回 true，避免 drive 循环立即重试。
-                    self.add_message(Message::assistant(
-                        Some(content).filter(|s: &String| !s.is_empty()),
-                        Some(reasoning).filter(|s: &String| !s.is_empty()),
-                        None,
-                    ))
-                    .await
+            let has_assistant_output = !content.is_empty()
+                || !reasoning.is_empty()
+                || tool_calls.as_ref().is_some_and(|calls| !calls.is_empty());
+            let asst_node_id = if has_assistant_output {
+                let safe_tool_calls = if matches!(
+                    turn_status,
+                    TurnStatus::Cancelled | TurnStatus::Interrupted | TurnStatus::Error(_)
+                ) {
+                    None
                 } else {
-                    self.add_message(Message::assistant(
-                        Some(content).filter(|s: &String| !s.is_empty()),
-                        Some(reasoning).filter(|s: &String| !s.is_empty()),
-                        tool_calls.clone(),
-                    ))
-                    .await
+                    tool_calls.clone()
                 };
+                Some(
+                    self.add_message(Message::assistant(
+                        Some(content).filter(|value: &String| !value.is_empty()),
+                        Some(reasoning).filter(|value: &String| !value.is_empty()),
+                        safe_tool_calls,
+                    ))
+                    .await,
+                )
+            } else {
+                // 请求在首个有效输出前结束时保持 user head，并显式等待下一次输入，
+                // 避免为了停止 drive 而写入无法发送给供应商的空 assistant 节点。
+                force_wait_for_user = true;
+                None
+            };
 
             if finish_reason.as_deref() == Some("tool_calls")
                 && let Some(calls) = tool_calls
@@ -826,6 +834,7 @@ impl LLMSession {
                         .send(SessionEvent::TurnEnd {
                             status,
                             node_id: asst_node_id,
+                            finish_reason: finish_reason.clone(),
                             usage: accumulated_usage.take(),
                         })
                         .await?;
@@ -847,6 +856,7 @@ impl LLMSession {
                         .send(SessionEvent::TurnEnd {
                             status: TurnStatus::Cancelled,
                             node_id: asst_node_id,
+                            finish_reason: Some("cancelled".to_string()),
                             usage: accumulated_usage.take(),
                         })
                         .await?;
@@ -859,6 +869,7 @@ impl LLMSession {
                 .send(SessionEvent::TurnEnd {
                     status: turn_status,
                     node_id: asst_node_id,
+                    finish_reason,
                     usage: accumulated_usage.take(),
                 })
                 .await?;
@@ -1277,7 +1288,24 @@ impl LLMSession {
                     }
                 }
             };
-            let line = raw_line?;
+            let line = match raw_line {
+                Ok(line) => line,
+                Err(error) if !full_content.is_empty() || !full_reasoning.is_empty() => {
+                    let error = ClientError::from_anyhow_owned(error);
+                    log::warn!(
+                        "[client:llm][stream_read_interrupted] turn_id={} content_chars={} reasoning_chars={} error={}",
+                        self.turn_id,
+                        full_content.chars().count(),
+                        full_reasoning.chars().count(),
+                        error
+                    );
+                    turn_status = TurnStatus::Error(error);
+                    finish_reason = Some("interrupted".to_string());
+                    usage = decoder.take_pending_usage();
+                    break 'outer;
+                }
+                Err(error) => return Err(error),
+            };
             if cancel.is_cancelled() {
                 turn_status = TurnStatus::Cancelled;
                 finish_reason = Some("cancelled".to_string());
@@ -1298,12 +1326,46 @@ impl LLMSession {
             }
 
             // acquire → map → release，每行独立借出，不跨 await
-            let normalized = self.normalize_stream_line(&line)?;
+            let normalized = match self.normalize_stream_line(&line) {
+                Ok(normalized) => normalized,
+                Err(error) if !full_content.is_empty() || !full_reasoning.is_empty() => {
+                    let error = ClientError::from_anyhow_owned(error);
+                    log::warn!(
+                        "[client:llm][stream_map_interrupted] turn_id={} content_chars={} reasoning_chars={} error={}",
+                        self.turn_id,
+                        full_content.chars().count(),
+                        full_reasoning.chars().count(),
+                        error
+                    );
+                    turn_status = TurnStatus::Error(error);
+                    finish_reason = Some("interrupted".to_string());
+                    usage = decoder.take_pending_usage();
+                    break 'outer;
+                }
+                Err(error) => return Err(error),
+            };
 
             let events = decoder.decode(&normalized);
 
             for ev in events {
-                let ev = ev?;
+                let ev = match ev {
+                    Ok(event) => event,
+                    Err(error) if !full_content.is_empty() || !full_reasoning.is_empty() => {
+                        let error = ClientError::from_anyhow_owned(error);
+                        log::warn!(
+                            "[client:llm][stream_decode_interrupted] turn_id={} content_chars={} reasoning_chars={} error={}",
+                            self.turn_id,
+                            full_content.chars().count(),
+                            full_reasoning.chars().count(),
+                            error
+                        );
+                        turn_status = TurnStatus::Error(error);
+                        finish_reason = Some("interrupted".to_string());
+                        usage = decoder.take_pending_usage();
+                        break 'outer;
+                    }
+                    Err(error) => return Err(error),
+                };
 
                 match ev.payload {
                     DecoderEventPayload::AssistantReasoningDelta { delta } => {
@@ -1368,9 +1430,19 @@ impl LLMSession {
                                 .unwrap_or_else(|| "stop".to_string()),
                             TurnStatus::Cancelled => "cancelled".to_string(),
                             TurnStatus::Interrupted => "interrupted".to_string(),
-                            TurnStatus::Error(e) => return Err(e.clone().into()),
+                            TurnStatus::Error(error)
+                                if !full_content.is_empty() || !full_reasoning.is_empty() =>
+                            {
+                                turn_status = TurnStatus::Error(error.clone());
+                                finish_reason = Some("interrupted".to_string());
+                                break 'outer;
+                            }
+                            TurnStatus::Error(error) => return Err(error.clone().into()),
                         };
-                        finish_reason = Some(normalized_finish_reason.clone());
+                        // [DONE] 常被解码为 stop；不能覆盖此前明确的 length 等结束原因。
+                        if finish_reason.is_none() || normalized_finish_reason != "stop" {
+                            finish_reason = Some(normalized_finish_reason.clone());
+                        }
                         log::info!(
                             "[client:llm][stream_turn_end_event] turn_id={} status={} finish_reason={} saw_tool_call_start={} content_chars={} reasoning_chars={}",
                             self.turn_id,
@@ -1852,6 +1924,8 @@ mod tests {
     enum MockReply {
         DelayHeaders(Duration),
         StreamPartialThenHold { content: String, hold: Duration },
+        StreamPartialThenDisconnect { content: String },
+        StreamLength { content: String },
         StreamDone { content: String },
         StreamToolCall { name: String },
     }
@@ -1894,6 +1968,23 @@ mod tests {
                 let _ = write_sse_line(&mut socket, stream_content_chunk(&content, None)).await;
                 let _ = socket.flush().await;
                 tokio::time::sleep(hold).await;
+            }
+            MockReply::StreamPartialThenDisconnect { content } => {
+                let body = format!("data: {}\n\n", stream_content_chunk(&content, None));
+                let declared_length = body.len() + 128;
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {declared_length}\r\nConnection: close\r\n\r\n"
+                );
+                let _ = socket.write_all(headers.as_bytes()).await;
+                let _ = socket.write_all(body.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+            MockReply::StreamLength { content } => {
+                let _ = write_stream_headers(&mut socket).await;
+                let _ = write_sse_line(&mut socket, stream_content_chunk(&content, None)).await;
+                let _ = write_sse_line(&mut socket, stream_content_chunk("", Some("length"))).await;
+                let _ = write_sse_line(&mut socket, "[DONE]".to_string()).await;
+                let _ = socket.flush().await;
             }
             MockReply::StreamDone { content } => {
                 let _ = write_stream_headers(&mut socket).await;
@@ -2034,12 +2125,17 @@ mod tests {
         }
     }
 
-    async fn wait_for_turn_end(events: &mut ReceiverStream<SessionEvent>) -> (TurnStatus, u64) {
+    async fn wait_for_turn_end(
+        events: &mut ReceiverStream<SessionEvent>,
+    ) -> (TurnStatus, Option<u64>, Option<String>) {
         loop {
             match events.next().await {
                 Some(SessionEvent::TurnEnd {
-                    status, node_id, ..
-                }) => return (status, node_id),
+                    status,
+                    node_id,
+                    finish_reason,
+                    ..
+                }) => return (status, node_id, finish_reason),
                 Some(SessionEvent::Error(e)) => panic!("收到错误事件: {}", e),
                 Some(_) => {}
                 None => panic!("事件流提前结束"),
@@ -2061,8 +2157,69 @@ mod tests {
         handle.cancel();
         drop(input_tx);
 
-        let (status, _) = wait_for_turn_end(&mut events).await;
+        let (status, node_id, _) = wait_for_turn_end(&mut events).await;
         assert!(matches!(status, TurnStatus::Cancelled));
+        assert_eq!(node_id, None);
+        assert!(
+            handle
+                .get_conversation()
+                .await
+                .messages
+                .iter()
+                .all(|message| message.role != "assistant")
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_disconnect_after_partial_preserves_partial() {
+        let (url, request_count) =
+            spawn_mock_server(vec![MockReply::StreamPartialThenDisconnect {
+                content: "已生成部分".to_string(),
+            }])
+            .await;
+        let session = new_http_test_session(url, true, Arc::new(ToolRegistry::new())).await;
+        let (input_tx, input_rx) = mpsc::channel(1);
+        let (mut events, handle) = session.try_run(input_rx).unwrap();
+
+        input_tx.send("开始生成".to_string()).await.unwrap();
+        wait_for_turn_begin(&mut events).await;
+        wait_for_request_count(&request_count, 1).await;
+        assert_eq!(wait_for_content_delta(&mut events).await, "已生成部分");
+
+        let (status, node_id, finish_reason) = wait_for_turn_end(&mut events).await;
+        assert!(matches!(status, TurnStatus::Error(_)));
+        assert!(node_id.is_some());
+        assert_eq!(finish_reason.as_deref(), Some("interrupted"));
+        assert!(
+            handle
+                .get_conversation()
+                .await
+                .messages
+                .iter()
+                .any(|message| {
+                    message.role == "assistant" && message.content.as_deref() == Some("已生成部分")
+                })
+        );
+        drop(input_tx);
+    }
+
+    #[tokio::test]
+    async fn stream_length_preserves_finish_reason() {
+        let (url, _) = spawn_mock_server(vec![MockReply::StreamLength {
+            content: "达到上限".to_string(),
+        }])
+        .await;
+        let session = new_http_test_session(url, true, Arc::new(ToolRegistry::new())).await;
+        let (input_tx, input_rx) = mpsc::channel(1);
+        let (mut events, _handle) = session.try_run(input_rx).unwrap();
+
+        input_tx.send("生成长文".to_string()).await.unwrap();
+        assert_eq!(wait_for_content_delta(&mut events).await, "达到上限");
+        let (status, node_id, finish_reason) = wait_for_turn_end(&mut events).await;
+        assert!(matches!(status, TurnStatus::Ok));
+        assert!(node_id.is_some());
+        assert_eq!(finish_reason.as_deref(), Some("length"));
+        drop(input_tx);
     }
 
     #[tokio::test]
@@ -2087,7 +2244,7 @@ mod tests {
         assert_eq!(wait_for_content_delta(&mut events).await, "半句");
         handle.cancel();
 
-        let (status, _) = wait_for_turn_end(&mut events).await;
+        let (status, _, _) = wait_for_turn_end(&mut events).await;
         assert!(matches!(status, TurnStatus::Cancelled));
         let snapshot = handle.get_conversation().await;
         assert!(
@@ -2101,7 +2258,7 @@ mod tests {
         wait_for_turn_begin(&mut events).await;
         wait_for_request_count(&request_count, 2).await;
         assert_eq!(wait_for_content_delta(&mut events).await, "完成");
-        let (status, _) = wait_for_turn_end(&mut events).await;
+        let (status, _, _) = wait_for_turn_end(&mut events).await;
         assert!(matches!(status, TurnStatus::Ok));
         drop(input_tx);
     }
@@ -2120,7 +2277,7 @@ mod tests {
         handle.cancel();
         drop(input_tx);
 
-        let (status, _) = wait_for_turn_end(&mut events).await;
+        let (status, _, _) = wait_for_turn_end(&mut events).await;
         assert!(matches!(status, TurnStatus::Cancelled));
     }
 
@@ -2198,7 +2355,7 @@ mod tests {
 
         handle.cancel();
         drop(input_tx);
-        let (status, _) = wait_for_turn_end(&mut events).await;
+        let (status, _, _) = wait_for_turn_end(&mut events).await;
         assert!(matches!(status, TurnStatus::Cancelled));
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(request_count.load(Ordering::SeqCst), 1);

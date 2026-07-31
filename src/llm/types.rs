@@ -459,8 +459,10 @@ pub enum SessionEvent {
 
     TurnEnd {
         status: TurnStatus,
-        /// 本轮助手消息节点 ID（供前端做历史导航 / 分支 / 重说）
-        node_id: u64,
+        /// 本轮助手消息节点 ID；没有产生任何助手输出时为 None。
+        node_id: Option<u64>,
+        /// 供应商返回的结束原因，例如 stop / length / tool_calls。
+        finish_reason: Option<String>,
         /// API 用量统计（通常在流式最后一个 chunk 或非流式响应中返回）
         usage: Option<Usage>,
     },
