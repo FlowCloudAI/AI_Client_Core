@@ -432,6 +432,8 @@ pub(crate) enum CtrlMsg {
     },
     /// 将消息树 head 移动到指定节点（重说 / 分支 / 历史回退）
     Checkout { node_id: u64 },
+    /// 从当前未完成的 assistant head 继续生成，不写入伪造的用户节点。
+    Continue { node_id: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -463,6 +465,8 @@ pub enum SessionEvent {
         node_id: Option<u64>,
         /// 供应商返回的结束原因，例如 stop / length / tool_calls。
         finish_reason: Option<String>,
+        /// 本轮若由续写触发，记录被续写的助手节点 ID。
+        continuation_of: Option<u64>,
         /// API 用量统计（通常在流式最后一个 chunk 或非流式响应中返回）
         usage: Option<Usage>,
     },

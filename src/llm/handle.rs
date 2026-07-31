@@ -157,6 +157,29 @@ impl SessionHandle {
             .map_err(|_| "会话已关闭".to_string())
     }
 
+    /// 从当前未完成的助手节点继续生成。
+    ///
+    /// 续写不会向消息树写入伪造的用户消息；目标必须是当前 assistant head。
+    pub async fn continue_generation(&self, node_id: u64) -> Result<(), String> {
+        {
+            let tree = self.tree.read().await;
+            if tree.head() != Some(node_id) {
+                return Err("续写目标不是当前会话 head".to_string());
+            }
+            let node = tree
+                .get_node(node_id)
+                .ok_or_else(|| format!("续写节点 {} 不存在", node_id))?;
+            if node.message.role != "assistant" {
+                return Err("续写目标必须是助手消息".to_string());
+            }
+        }
+
+        self.ctrl_tx
+            .send(CtrlMsg::Continue { node_id })
+            .await
+            .map_err(|_| "会话已关闭".to_string())
+    }
+
     /// 获取树中所有节点（含所有分支，不限于当前路径）。
     pub async fn get_all_nodes(&self) -> Vec<ConversationNode> {
         self.tree

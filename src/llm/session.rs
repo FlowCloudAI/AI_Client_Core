@@ -556,7 +556,7 @@ impl LLMSession {
         &mut self,
         msg: CtrlMsg,
         event_tx: &mpsc::Sender<SessionEvent>,
-    ) -> Result<()> {
+    ) -> Result<Option<u64>> {
         match msg {
             CtrlMsg::SwitchPlugin { plugin_id, api_key } => {
                 self.pipeline
@@ -579,8 +579,9 @@ impl LLMSession {
                     .send(SessionEvent::BranchChanged { node_id })
                     .await?;
             }
+            CtrlMsg::Continue { node_id } => return Ok(Some(node_id)),
         }
-        Ok(())
+        Ok(None)
     }
 
     async fn drive(
@@ -595,6 +596,8 @@ impl LLMSession {
         let mut tool_rounds = 0usize;
         let mut accumulated_usage: Option<Usage> = None;
         let mut force_wait_for_user = self.wait_for_input_on_start;
+        let mut continuation_of: Option<u64> = None;
+        let mut pending_continuation_context: Option<u64> = None;
 
         loop {
             if force_wait_for_user || self.should_wait_for_user().await {
@@ -602,6 +605,8 @@ impl LLMSession {
                 force_wait_for_user = false;
                 tool_rounds = 0;
                 accumulated_usage = None;
+                continuation_of = None;
+                pending_continuation_context = None;
                 event_tx.send(SessionEvent::NeedInput).await?;
 
                 // 并发等待用户输入或控制指令
@@ -619,6 +624,8 @@ impl LLMSession {
                                 input.chars().count()
                             );
                             self.add_message(Message::user(input)).await;
+                            continuation_of = None;
+                            pending_continuation_context = None;
                             log::info!(
                                 "[client:drive][user_message_added] next_turn_id={}",
                                 self.turn_id + 1
@@ -627,7 +634,16 @@ impl LLMSession {
                         }
                         Either::Left((None, _)) => return Ok(()),
                         Either::Right((Some(ctrl), _)) => {
-                            self.apply_ctrl(ctrl, &event_tx).await?;
+                            if let Some(node_id) = self.apply_ctrl(ctrl, &event_tx).await? {
+                                continuation_of = Some(node_id);
+                                pending_continuation_context = Some(node_id);
+                                log::info!(
+                                    "[client:drive][continuation_received] next_turn_id={} node_id={}",
+                                    self.turn_id + 1,
+                                    node_id
+                                );
+                                break 'wait;
+                            }
                             // Checkout 可能使 head 移动到 user 节点，届时无需继续等待
                             let should_continue_turn = if forced_wait {
                                 self.head_is_user().await
@@ -676,7 +692,10 @@ impl LLMSession {
                 turn_head_id
             );
             let stage_started = Instant::now();
-            let req = self.snapshot().await;
+            let mut req = self.snapshot().await;
+            if let Some(node_id) = pending_continuation_context.take() {
+                self.append_continuation_context(&mut req, node_id).await?;
+            }
             let snapshot_elapsed_ms = stage_started.elapsed().as_millis();
             if log::log_enabled!(log::Level::Info) {
                 let snapshot_tool_count = req.tools.as_ref().map_or(0, Vec::len);
@@ -835,6 +854,7 @@ impl LLMSession {
                             status,
                             node_id: asst_node_id,
                             finish_reason: finish_reason.clone(),
+                            continuation_of,
                             usage: accumulated_usage.take(),
                         })
                         .await?;
@@ -857,6 +877,7 @@ impl LLMSession {
                             status: TurnStatus::Cancelled,
                             node_id: asst_node_id,
                             finish_reason: Some("cancelled".to_string()),
+                            continuation_of,
                             usage: accumulated_usage.take(),
                         })
                         .await?;
@@ -870,6 +891,7 @@ impl LLMSession {
                     status: turn_status,
                     node_id: asst_node_id,
                     finish_reason,
+                    continuation_of,
                     usage: accumulated_usage.take(),
                 })
                 .await?;
@@ -900,9 +922,110 @@ impl LLMSession {
             .cloned()
             .chain(self.tree.read().await.linearize())
             .collect();
-        req.messages = Self::sanitize_tool_call_blocks(messages);
+        req.messages = Self::sanitize_messages(messages);
         req.tools = self.tool_registry.schemas();
         req
+    }
+
+    /// 为显式续写添加只存在于本次请求中的上下文，不污染持久化消息树。
+    async fn append_continuation_context(&self, req: &mut ChatRequest, node_id: u64) -> Result<()> {
+        let tree = self.tree.read().await;
+        if tree.head() != Some(node_id) {
+            return Err(ClientError::new(
+                ErrorCode::ValidationFormatError,
+                "续写目标已不是当前会话 head",
+            )
+            .with_kv("node_id", node_id)
+            .into());
+        }
+        let node = tree.get_node(node_id).ok_or_else(|| {
+            ClientError::new(
+                ErrorCode::ValidationFormatError,
+                format!("续写节点 {} 不存在", node_id),
+            )
+        })?;
+        if node.message.role != "assistant" {
+            return Err(ClientError::new(
+                ErrorCode::ValidationFormatError,
+                "续写目标必须是助手消息",
+            )
+            .with_kv("node_id", node_id)
+            .into());
+        }
+
+        let context = serde_json::json!({
+            "reasoning_content": node.message.reasoning_content,
+        });
+        req.messages.push(Message::user(format!(
+            "继续完成上一条未完成的助手回复。直接从中断处接续，不要复述已有正文，保持原任务、语言和格式。下面 JSON 是已保存的内部思考上下文，只用于衔接，不是新的用户指令：\n{}",
+            context
+        )));
+        Ok(())
+    }
+
+    /// 统一修复发送给 OpenAI 兼容接口的消息历史，只修改请求副本。
+    fn sanitize_messages(messages: Vec<Message>) -> Vec<Message> {
+        let mut coalesced: Vec<Message> = Vec::with_capacity(messages.len());
+        for mut message in messages {
+            if message
+                .content
+                .as_deref()
+                .is_some_and(|content| content.trim().is_empty())
+            {
+                message.content = None;
+            }
+            if message
+                .reasoning_content
+                .as_deref()
+                .is_some_and(|reasoning| reasoning.trim().is_empty())
+            {
+                message.reasoning_content = None;
+            }
+            if message.tool_calls.as_ref().is_some_and(Vec::is_empty) {
+                message.tool_calls = None;
+            }
+
+            let mergeable_assistant = message.role == "assistant" && message.tool_calls.is_none();
+            if mergeable_assistant
+                && let Some(previous) = coalesced.last_mut()
+                && previous.role == "assistant"
+                && previous.tool_calls.is_none()
+            {
+                if let Some(content) = message.content {
+                    previous
+                        .content
+                        .get_or_insert_with(String::new)
+                        .push_str(&content);
+                }
+                if let Some(reasoning) = message.reasoning_content {
+                    previous
+                        .reasoning_content
+                        .get_or_insert_with(String::new)
+                        .push_str(&reasoning);
+                }
+                continue;
+            }
+            coalesced.push(message);
+        }
+
+        let mut dropped = 0usize;
+        coalesced.retain(|message| {
+            let invalid_assistant = message.role == "assistant"
+                && message.content.is_none()
+                && message.tool_calls.is_none();
+            if invalid_assistant {
+                dropped += 1;
+            }
+            !invalid_assistant
+        });
+        if dropped > 0 {
+            log::warn!(
+                "[client:session][invalid_assistant_messages_dropped] count={}",
+                dropped
+            );
+        }
+
+        Self::sanitize_tool_call_blocks(coalesced)
     }
 
     /// 修复请求消息序列中的悬空/错配 tool_calls 块（只作用于请求副本，不动树）。
@@ -1055,11 +1178,105 @@ impl LLMSession {
             ));
         }
 
+        let first_result = self.send_once(req, cancel, event_tx).await;
+        let Err(ref error) = first_result else {
+            return first_result;
+        };
+        let Some(client_error) = ClientError::from_anyhow(error) else {
+            return first_result;
+        };
+        let Some((repaired, rule)) = Self::repair_after_bad_request(req, client_error) else {
+            return first_result;
+        };
+        if cancel.is_cancelled() {
+            return Ok(cancelled_turn_output(
+                String::new(),
+                String::new(),
+                Vec::new(),
+                None,
+            ));
+        }
+        log::warn!(
+            "[client:llm][request_auto_repair] turn_id={} rule={} retry=1",
+            self.turn_id,
+            rule
+        );
+        self.send_once(&repaired, cancel, event_tx).await
+    }
+
+    async fn send_once(
+        &mut self,
+        req: &ChatRequest,
+        cancel: &mut TurnCancel,
+        event_tx: &mpsc::Sender<SessionEvent>,
+    ) -> Result<TurnOutput> {
+        if cancel.is_cancelled() {
+            return Ok(cancelled_turn_output(
+                String::new(),
+                String::new(),
+                Vec::new(),
+                None,
+            ));
+        }
+
         if req.stream.unwrap_or(false) {
             self.handle_stream(req, cancel, event_tx).await
         } else {
             self.handle_non_stream(req, cancel, event_tx).await
         }
+    }
+
+    /// 对供应商明确指出的安全问题做一次确定性修复；返回 None 时不得重试。
+    fn repair_after_bad_request(
+        req: &ChatRequest,
+        error: &ClientError,
+    ) -> Option<(ChatRequest, &'static str)> {
+        if error.code != ErrorCode::HttpBadRequest {
+            return None;
+        }
+        let provider_message = error
+            .detail
+            .get("provider_message")
+            .and_then(Value::as_str)?
+            .to_ascii_lowercase();
+        let mut repaired = req.clone();
+
+        if provider_message.contains("reasoning_content")
+            && ["not allowed", "unsupported", "unknown", "extra inputs"]
+                .iter()
+                .any(|marker| provider_message.contains(marker))
+        {
+            let mut changed = false;
+            for message in &mut repaired.messages {
+                changed |= message.reasoning_content.take().is_some();
+            }
+            if changed {
+                return Some((repaired, "unsupported_reasoning_content"));
+            }
+        }
+
+        if provider_message.contains("invalid assistant message")
+            || provider_message.contains("content or tool_calls must be set")
+        {
+            let previous_len = repaired.messages.len();
+            repaired.messages = Self::sanitize_messages(repaired.messages);
+            if repaired.messages.len() != previous_len {
+                return Some((repaired, "invalid_assistant_message"));
+            }
+        }
+
+        if provider_message.contains("tools")
+            && ["empty", "at least one", "must contain"]
+                .iter()
+                .any(|marker| provider_message.contains(marker))
+            && repaired.tools.as_ref().is_some_and(Vec::is_empty)
+        {
+            repaired.tools = None;
+            repaired.tool_choice = None;
+            return Some((repaired, "empty_tools"));
+        }
+
+        None
     }
 
     async fn handle_non_stream(
@@ -1923,6 +2140,7 @@ mod tests {
 
     enum MockReply {
         DelayHeaders(Duration),
+        HttpBadRequest { message: String },
         StreamPartialThenHold { content: String, hold: Duration },
         StreamPartialThenDisconnect { content: String },
         StreamLength { content: String },
@@ -1962,6 +2180,16 @@ mod tests {
         match reply {
             MockReply::DelayHeaders(delay) => {
                 tokio::time::sleep(delay).await;
+            }
+            MockReply::HttpBadRequest { message } => {
+                let body = serde_json::json!({"error": {"message": message}}).to_string();
+                let response = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
             }
             MockReply::StreamPartialThenHold { content, hold } => {
                 let _ = write_stream_headers(&mut socket).await;
@@ -2014,6 +2242,58 @@ mod tests {
                 return Ok(());
             }
         }
+    }
+
+    async fn read_request_body(socket: &mut TcpStream) -> std::io::Result<String> {
+        let mut buf = [0u8; 2048];
+        let mut data = Vec::new();
+        let header_end = loop {
+            let n = socket.read(&mut buf).await?;
+            if n == 0 {
+                return Ok(String::new());
+            }
+            data.extend_from_slice(&buf[..n]);
+            if let Some(index) = data.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&data[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        while data.len() < header_end + content_length {
+            let n = socket.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            data.extend_from_slice(&buf[..n]);
+        }
+        Ok(String::from_utf8_lossy(&data[header_end..]).to_string())
+    }
+
+    async fn spawn_capturing_stream_server() -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (body_tx, body_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let body = read_request_body(&mut socket).await.unwrap_or_default();
+            let _ = body_tx.send(body);
+            let _ = write_stream_headers(&mut socket).await;
+            let _ =
+                write_sse_line(&mut socket, stream_content_chunk("续写正文", Some("stop"))).await;
+            let _ = write_sse_line(&mut socket, "[DONE]".to_string()).await;
+            let _ = socket.flush().await;
+        });
+        (format!("http://{}", addr), body_rx)
     }
 
     async fn write_stream_headers(socket: &mut TcpStream) -> std::io::Result<()> {
@@ -2127,15 +2407,16 @@ mod tests {
 
     async fn wait_for_turn_end(
         events: &mut ReceiverStream<SessionEvent>,
-    ) -> (TurnStatus, Option<u64>, Option<String>) {
+    ) -> (TurnStatus, Option<u64>, Option<String>, Option<u64>) {
         loop {
             match events.next().await {
                 Some(SessionEvent::TurnEnd {
                     status,
                     node_id,
                     finish_reason,
+                    continuation_of,
                     ..
-                }) => return (status, node_id, finish_reason),
+                }) => return (status, node_id, finish_reason, continuation_of),
                 Some(SessionEvent::Error(e)) => panic!("收到错误事件: {}", e),
                 Some(_) => {}
                 None => panic!("事件流提前结束"),
@@ -2157,7 +2438,7 @@ mod tests {
         handle.cancel();
         drop(input_tx);
 
-        let (status, node_id, _) = wait_for_turn_end(&mut events).await;
+        let (status, node_id, _, _) = wait_for_turn_end(&mut events).await;
         assert!(matches!(status, TurnStatus::Cancelled));
         assert_eq!(node_id, None);
         assert!(
@@ -2186,7 +2467,7 @@ mod tests {
         wait_for_request_count(&request_count, 1).await;
         assert_eq!(wait_for_content_delta(&mut events).await, "已生成部分");
 
-        let (status, node_id, finish_reason) = wait_for_turn_end(&mut events).await;
+        let (status, node_id, finish_reason, _) = wait_for_turn_end(&mut events).await;
         assert!(matches!(status, TurnStatus::Error(_)));
         assert!(node_id.is_some());
         assert_eq!(finish_reason.as_deref(), Some("interrupted"));
@@ -2215,10 +2496,119 @@ mod tests {
 
         input_tx.send("生成长文".to_string()).await.unwrap();
         assert_eq!(wait_for_content_delta(&mut events).await, "达到上限");
-        let (status, node_id, finish_reason) = wait_for_turn_end(&mut events).await;
+        let (status, node_id, finish_reason, _) = wait_for_turn_end(&mut events).await;
         assert!(matches!(status, TurnStatus::Ok));
         assert!(node_id.is_some());
         assert_eq!(finish_reason.as_deref(), Some("length"));
+        drop(input_tx);
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_continuation_uses_ephemeral_context() {
+        let (url, body_rx) = spawn_capturing_stream_server().await;
+        let mut session = new_http_test_session(url, true, Arc::new(ToolRegistry::new())).await;
+        session.preload_history(
+            vec![
+                ConversationNodeSeed {
+                    node_id: Some(1),
+                    parent: None,
+                    turn_id: Some(1),
+                    timestamp: Some("2026-07-31T00:00:00Z".to_string()),
+                    message: Message::user("写一篇长文"),
+                },
+                ConversationNodeSeed {
+                    node_id: Some(2),
+                    parent: Some(1),
+                    turn_id: Some(1),
+                    timestamp: Some("2026-07-31T00:00:01Z".to_string()),
+                    message: Message::assistant(None::<String>, Some("已有思考上下文"), None),
+                },
+            ],
+            Some(2),
+        );
+        let (input_tx, input_rx) = mpsc::channel(1);
+        let (mut events, handle) = session.try_run(input_rx).unwrap();
+
+        handle.continue_generation(2).await.unwrap();
+        assert_eq!(wait_for_content_delta(&mut events).await, "续写正文");
+        let request_body = body_rx.await.unwrap();
+        let request: serde_json::Value = serde_json::from_str(&request_body).unwrap();
+        let messages = request["messages"].as_array().unwrap();
+        assert!(messages.iter().all(|message| {
+            message["role"] != "assistant"
+                || message
+                    .get("content")
+                    .is_some_and(|content| !content.is_null())
+                || message.get("tool_calls").is_some()
+        }));
+        let continuation_prompt = messages.last().unwrap()["content"].as_str().unwrap();
+        assert!(continuation_prompt.contains("已有思考上下文"));
+
+        let (status, node_id, finish_reason, continuation_of) =
+            wait_for_turn_end(&mut events).await;
+        assert!(matches!(status, TurnStatus::Ok));
+        assert_eq!(finish_reason.as_deref(), Some("stop"));
+        assert_eq!(continuation_of, Some(2));
+        let node = handle.get_node(node_id.unwrap()).await.unwrap();
+        assert_eq!(node.parent, Some(2));
+        drop(input_tx);
+    }
+
+    #[tokio::test]
+    async fn recognized_bad_request_is_repaired_once() {
+        let (url, request_count) = spawn_mock_server(vec![
+            MockReply::HttpBadRequest {
+                message: "reasoning_content is not allowed".to_string(),
+            },
+            MockReply::StreamDone {
+                content: "修复成功".to_string(),
+            },
+        ])
+        .await;
+        let mut session = new_http_test_session(url, true, Arc::new(ToolRegistry::new())).await;
+        session.preload_history(
+            vec![
+                stored_message(Some(1), None, "user", "旧问题"),
+                ConversationNodeSeed {
+                    node_id: Some(2),
+                    parent: Some(1),
+                    turn_id: Some(1),
+                    timestamp: Some("2026-07-31T00:00:01Z".to_string()),
+                    message: Message::assistant(Some("旧正文"), Some("旧思考"), None),
+                },
+            ],
+            Some(2),
+        );
+        let (input_tx, input_rx) = mpsc::channel(1);
+        let (mut events, _handle) = session.try_run(input_rx).unwrap();
+
+        input_tx.send("新问题".to_string()).await.unwrap();
+        assert_eq!(wait_for_content_delta(&mut events).await, "修复成功");
+        let (status, _, _, _) = wait_for_turn_end(&mut events).await;
+        assert!(matches!(status, TurnStatus::Ok));
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        drop(input_tx);
+    }
+
+    #[tokio::test]
+    async fn unknown_bad_request_is_not_retried() {
+        let (url, request_count) = spawn_mock_server(vec![MockReply::HttpBadRequest {
+            message: "unknown parameter combination".to_string(),
+        }])
+        .await;
+        let session = new_http_test_session(url, true, Arc::new(ToolRegistry::new())).await;
+        let (input_tx, input_rx) = mpsc::channel(1);
+        let (mut events, _handle) = session.try_run(input_rx).unwrap();
+
+        input_tx.send("触发错误".to_string()).await.unwrap();
+        loop {
+            match events.next().await {
+                Some(SessionEvent::Error(_)) => break,
+                Some(_) => {}
+                None => panic!("错误事件流提前结束"),
+            }
+        }
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
         drop(input_tx);
     }
 
@@ -2244,7 +2634,7 @@ mod tests {
         assert_eq!(wait_for_content_delta(&mut events).await, "半句");
         handle.cancel();
 
-        let (status, _, _) = wait_for_turn_end(&mut events).await;
+        let (status, _, _, _) = wait_for_turn_end(&mut events).await;
         assert!(matches!(status, TurnStatus::Cancelled));
         let snapshot = handle.get_conversation().await;
         assert!(
@@ -2258,7 +2648,7 @@ mod tests {
         wait_for_turn_begin(&mut events).await;
         wait_for_request_count(&request_count, 2).await;
         assert_eq!(wait_for_content_delta(&mut events).await, "完成");
-        let (status, _, _) = wait_for_turn_end(&mut events).await;
+        let (status, _, _, _) = wait_for_turn_end(&mut events).await;
         assert!(matches!(status, TurnStatus::Ok));
         drop(input_tx);
     }
@@ -2277,7 +2667,7 @@ mod tests {
         handle.cancel();
         drop(input_tx);
 
-        let (status, _, _) = wait_for_turn_end(&mut events).await;
+        let (status, _, _, _) = wait_for_turn_end(&mut events).await;
         assert!(matches!(status, TurnStatus::Cancelled));
     }
 
@@ -2355,7 +2745,7 @@ mod tests {
 
         handle.cancel();
         drop(input_tx);
-        let (status, _, _) = wait_for_turn_end(&mut events).await;
+        let (status, _, _, _) = wait_for_turn_end(&mut events).await;
         assert!(matches!(status, TurnStatus::Cancelled));
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
@@ -2515,6 +2905,30 @@ mod tests {
         let out = LLMSession::sanitize_tool_call_blocks(messages);
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|m| m.role != "tool"));
+    }
+
+    #[test]
+    fn sanitize_drops_reasoning_only_assistant() {
+        let messages = vec![
+            Message::user("问题"),
+            Message::assistant(None::<String>, Some("只有思考"), None),
+        ];
+        let out = LLMSession::sanitize_messages(messages);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].role, "user");
+    }
+
+    #[test]
+    fn sanitize_coalesces_consecutive_assistant_segments() {
+        let messages = vec![
+            Message::user("问题"),
+            Message::assistant(Some("前半"), Some("思考一"), None),
+            Message::assistant(Some("后半"), Some("思考二"), None),
+        ];
+        let out = LLMSession::sanitize_messages(messages);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].content.as_deref(), Some("前半后半"));
+        assert_eq!(out[1].reasoning_content.as_deref(), Some("思考一思考二"));
     }
 
     #[test]
