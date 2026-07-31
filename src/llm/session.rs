@@ -17,7 +17,7 @@ use crate::llm::types::{
 use crate::orchestrator::{AssembledTurn, Orchestrate, TaskContext};
 use crate::plugin::pipeline::ApiPipeline;
 use crate::plugin::types::ThinkingEffort;
-use crate::tool::registry::ToolRegistry;
+use crate::tool::{ToolFailure, registry::ToolRegistry};
 use anyhow::Result;
 use futures_util::StreamExt;
 use futures_util::future::{self, Either};
@@ -504,6 +504,22 @@ impl LLMSession {
         })
     }
 
+    fn remove_tools_from_request(req: &mut ChatRequest, removed: &HashSet<String>) {
+        let Some(tools) = req.tools.as_mut() else {
+            return;
+        };
+        tools.retain(|tool| {
+            tool.get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .is_none_or(|name| !removed.contains(name))
+        });
+        if tools.is_empty() {
+            req.tools = None;
+            req.tool_choice = None;
+        }
+    }
+
     fn apply_assembled(&self, mut req: ChatRequest, turn: &AssembledTurn) -> ChatRequest {
         let insert_at = Self::context_insert_index_before_pending_block(&req.messages);
 
@@ -603,6 +619,8 @@ impl LLMSession {
         let mut tool_rounds = 0usize;
         let mut accumulated_usage: Option<Usage> = None;
         let mut force_wait_for_user = self.wait_for_input_on_start;
+        let mut fatal_tools = HashSet::new();
+        let mut tool_round_soft_landing = false;
         let mut continuation_of: Option<u64> = None;
         let mut pending_continuation_context: Option<u64> = None;
 
@@ -614,6 +632,8 @@ impl LLMSession {
                 accumulated_usage = None;
                 continuation_of = None;
                 pending_continuation_context = None;
+                fatal_tools.clear();
+                tool_round_soft_landing = false;
                 event_tx.send(SessionEvent::NeedInput).await?;
 
                 // 并发等待用户输入或控制指令
@@ -752,7 +772,7 @@ impl LLMSession {
             // Orchestrator 装配（如果有）
             // Session 永远只读 AssembledTurn::read_only，不感知 TaskContext 业务字段。
             // 无编排器时使用 AssembledTurn::default()，read_only = false。
-            let (req, read_only) = if let Some(ref orch) = self.orchestrator {
+            let (mut req, read_only) = if let Some(ref orch) = self.orchestrator {
                 let assembled = orch.assemble(&current_ctx)?;
                 let read_only = assembled.read_only;
                 let req = self.apply_assembled(req, &assembled);
@@ -760,6 +780,14 @@ impl LLMSession {
             } else {
                 (req, AssembledTurn::default().read_only)
             };
+            let soft_landing_this_round = std::mem::take(&mut tool_round_soft_landing);
+            if soft_landing_this_round {
+                req.tool_choice = Some("none".to_string());
+                req.messages.push(Message::system(
+                    "已达到本轮工具调用上限。禁止继续调用工具；请仅使用已有结果给出简洁总结，明确说明尚未完成的步骤。",
+                ));
+            }
+            Self::remove_tools_from_request(&mut req, &fatal_tools);
             let auto_confirm_writes = current_ctx
                 .flags
                 .get("auto_confirm_writes")
@@ -841,43 +869,41 @@ impl LLMSession {
                 None
             };
 
-            if finish_reason.as_deref() == Some("tool_calls")
-                && let Some(calls) = tool_calls
-            {
-                tool_rounds += 1;
-                if tool_rounds > self.config.max_tool_rounds {
-                    let status = TurnStatus::Error(
-                        ClientError::new(
-                            ErrorCode::LlmToolCallFailed,
-                            format!(
-                                "工具调用超过最大连续轮数限制: {}",
-                                self.config.max_tool_rounds
-                            ),
-                        )
-                        .with_kv("max_tool_rounds", self.config.max_tool_rounds as u64)
-                        .with_kv("tool_rounds", tool_rounds as u64),
-                    );
-                    // 为每个未执行的 call 补占位 tool 消息，避免悬空 tool_calls
-                    // 被持久化后打死会话。补完后 head 是 tool 节点，
-                    // should_wait_for_user() 不再成立，必须显式强制等待，
-                    // 否则 drive 会立即重发请求形成无限工具轮循环。
+            if soft_landing_this_round {
+                if let Some(calls) = tool_calls {
                     self.append_unexecuted_tool_placeholders(
                         MAX_ROUNDS_PLACEHOLDER_REASON,
                         calls,
                         &event_tx,
                     )
                     .await;
-                    force_wait_for_user = true;
-                    event_tx
-                        .send(SessionEvent::TurnEnd {
-                            status,
-                            node_id: asst_node_id,
-                            finish_reason: finish_reason.clone(),
-                            continuation_of,
-                            usage: accumulated_usage.take(),
-                            calibration_factor: Some(self.token_calibrator.factor()),
-                        })
-                        .await?;
+                }
+                force_wait_for_user = true;
+                event_tx
+                    .send(SessionEvent::TurnEnd {
+                        status: turn_status,
+                        node_id: asst_node_id,
+                        finish_reason: Some("tool_rounds_exhausted".to_string()),
+                        continuation_of,
+                        usage: accumulated_usage.take(),
+                        calibration_factor: Some(self.token_calibrator.factor()),
+                    })
+                    .await?;
+                continue;
+            }
+
+            if finish_reason.as_deref() == Some("tool_calls")
+                && let Some(calls) = tool_calls
+            {
+                tool_rounds += 1;
+                if tool_rounds > self.config.max_tool_rounds {
+                    self.append_unexecuted_tool_placeholders(
+                        MAX_ROUNDS_PLACEHOLDER_REASON,
+                        calls,
+                        &event_tx,
+                    )
+                    .await;
+                    tool_round_soft_landing = true;
                     continue;
                 }
                 if self
@@ -886,6 +912,7 @@ impl LLMSession {
                         &enabled_tools,
                         read_only,
                         auto_confirm_writes,
+                        &mut fatal_tools,
                         &mut turn_cancel,
                         &event_tx,
                     )
@@ -1921,6 +1948,7 @@ impl LLMSession {
 const CANCEL_PLACEHOLDER_REASON: &str = "工具执行失败: 用户取消了本轮对话，该工具调用未执行";
 const MAX_ROUNDS_PLACEHOLDER_REASON: &str =
     "工具执行失败: 已达最大连续工具调用轮数上限，该工具调用未执行";
+const TOOL_RETRY_DELAYS_MS: [u64; 2] = [200, 800];
 
 impl LLMSession {
     async fn execute_tool_calls(
@@ -1929,6 +1957,7 @@ impl LLMSession {
         enabled_tools: &Option<HashSet<String>>,
         read_only: bool,
         auto_confirm_writes: bool,
+        fatal_tools: &mut HashSet<String>,
         cancel: &mut TurnCancel,
         event_tx: &mpsc::Sender<SessionEvent>,
     ) -> Result<bool> {
@@ -1989,10 +2018,10 @@ impl LLMSession {
                     call.index,
                     func_name
                 );
-                (
-                    format!("工具执行失败: 本轮不允许调用工具 '{}'", func_name),
-                    true,
-                )
+                let failure = ToolFailure::Denied {
+                    reason: format!("本轮不允许调用工具 '{func_name}'"),
+                };
+                (failure.model_message(), true)
             } else if read_only && !self.tool_registry.is_read_tool(func_name) {
                 log::warn!(
                     "[client:tools][call_blocked_read_only] turn_id={} index={} name={}",
@@ -2000,13 +2029,12 @@ impl LLMSession {
                     call.index,
                     func_name
                 );
-                (
-                    format!(
-                        "工具执行失败: 只读模式下仅允许显式标注为读的工具，'{}' 未标注或为写工具",
-                        func_name
+                let failure = ToolFailure::Denied {
+                    reason: format!(
+                        "只读模式下仅允许显式标注为读的工具，'{func_name}' 未标注或为写工具"
                     ),
-                    true,
-                )
+                };
+                (failure.model_message(), true)
             } else {
                 let args_v: Value = if args_str.is_empty() {
                     Value::Object(Default::default())
@@ -2067,61 +2095,114 @@ impl LLMSession {
                     }
                 };
 
-                log::info!(
-                    "[client:tools][conduct_start] turn_id={} index={} name={}",
-                    self.turn_id,
-                    call.index,
-                    func_name
-                );
-                let conduct_started = Instant::now();
-                let conduct_fut = crate::tool::with_auto_confirm_writes(
-                    auto_confirm_writes,
-                    self.tool_registry
-                        .conduct(func_name, Some(&args_v), Duration::from_secs(600)),
-                );
-                match tokio::select! {
-                    result = conduct_fut => result,
-                    _ = cancel.cancelled() => {
-                        log::warn!(
-                            "[client:tools][conduct_cancelled] turn_id={} index={} name={} elapsed_ms={}",
-                            self.turn_id,
-                            call.index,
+                let mut retry_count = 0;
+                let result = loop {
+                    log::info!(
+                        "[client:tools][conduct_start] turn_id={} index={} name={} attempt={}",
+                        self.turn_id,
+                        call.index,
+                        func_name,
+                        retry_count + 1
+                    );
+                    let conduct_started = Instant::now();
+                    let conduct_fut = crate::tool::with_auto_confirm_writes(
+                        auto_confirm_writes,
+                        self.tool_registry.conduct(
                             func_name,
-                            conduct_started.elapsed().as_millis()
-                        );
-                        let pending: Vec<ToolCall> = std::iter::once(call.clone())
-                            .chain(calls_iter.by_ref().map(|(_, c)| c))
-                            .collect();
-                        self.append_unexecuted_tool_placeholders(
-                            CANCEL_PLACEHOLDER_REASON,
-                            pending,
-                            event_tx,
-                        )
-                        .await;
-                        return Ok(true);
-                    },
-                } {
-                    Ok(o) => {
-                        log::info!(
-                            "[client:tools][conduct_done] turn_id={} index={} name={} elapsed_ms={} output_chars={}",
-                            self.turn_id,
-                            call.index,
-                            func_name,
-                            conduct_started.elapsed().as_millis(),
-                            o.chars().count()
-                        );
-                        (o, false)
+                            Some(&args_v),
+                            Duration::from_secs(600),
+                        ),
+                    );
+                    let attempt = tokio::select! {
+                        result = conduct_fut => result,
+                        _ = cancel.cancelled() => {
+                            log::warn!(
+                                "[client:tools][conduct_cancelled] turn_id={} index={} name={} elapsed_ms={}",
+                                self.turn_id,
+                                call.index,
+                                func_name,
+                                conduct_started.elapsed().as_millis()
+                            );
+                            let pending: Vec<ToolCall> = std::iter::once(call.clone())
+                                .chain(calls_iter.by_ref().map(|(_, c)| c))
+                                .collect();
+                            self.append_unexecuted_tool_placeholders(
+                                CANCEL_PLACEHOLDER_REASON,
+                                pending,
+                                event_tx,
+                            )
+                            .await;
+                            return Ok(true);
+                        },
+                    };
+                    match attempt {
+                        Ok(output) => {
+                            log::info!(
+                                "[client:tools][conduct_done] turn_id={} index={} name={} attempt={} elapsed_ms={} output_chars={}",
+                                self.turn_id,
+                                call.index,
+                                func_name,
+                                retry_count + 1,
+                                conduct_started.elapsed().as_millis(),
+                                output.chars().count()
+                            );
+                            break Ok(output);
+                        }
+                        Err(error) => {
+                            let failure = ToolFailure::classify(&error);
+                            log::warn!(
+                                "[client:tools][conduct_failed] turn_id={} index={} name={} attempt={} elapsed_ms={} class={:?} error={}",
+                                self.turn_id,
+                                call.index,
+                                func_name,
+                                retry_count + 1,
+                                conduct_started.elapsed().as_millis(),
+                                failure,
+                                error
+                            );
+                            if let ToolFailure::Transient { retry_after_ms } = &failure
+                                && retry_count < TOOL_RETRY_DELAYS_MS.len()
+                            {
+                                let delay_ms =
+                                    retry_after_ms.unwrap_or(TOOL_RETRY_DELAYS_MS[retry_count]);
+                                retry_count += 1;
+                                event_tx
+                                    .send(SessionEvent::ToolRetrying {
+                                        index: call.index,
+                                        name: func_name.clone(),
+                                        attempt: retry_count,
+                                        max_retries: TOOL_RETRY_DELAYS_MS.len(),
+                                        delay_ms,
+                                    })
+                                    .await?;
+                                tokio::select! {
+                                    _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {},
+                                    _ = cancel.cancelled() => {
+                                        let pending: Vec<ToolCall> = std::iter::once(call.clone())
+                                            .chain(calls_iter.by_ref().map(|(_, c)| c))
+                                            .collect();
+                                        self.append_unexecuted_tool_placeholders(
+                                            CANCEL_PLACEHOLDER_REASON,
+                                            pending,
+                                            event_tx,
+                                        )
+                                        .await;
+                                        return Ok(true);
+                                    },
+                                }
+                                continue;
+                            }
+                            break Err(failure);
+                        }
                     }
-                    Err(e) => {
-                        log::warn!(
-                            "[client:tools][conduct_failed] turn_id={} index={} name={} elapsed_ms={} error={}",
-                            self.turn_id,
-                            call.index,
-                            func_name,
-                            conduct_started.elapsed().as_millis(),
-                            e
-                        );
-                        (format!("工具执行失败: {}", e), true)
+                };
+                match result {
+                    Ok(output) => (output, false),
+                    Err(failure) => {
+                        if failure == ToolFailure::Fatal {
+                            fatal_tools.insert(func_name.clone());
+                        }
+                        (failure.model_message(), true)
                     }
                 }
             };
@@ -2247,9 +2328,10 @@ mod tests {
     use crate::orchestrator::TaskContext;
     use crate::plugin::pipeline::ApiPipeline;
     use crate::plugin::registry::PluginRegistry;
+    use crate::tool::ToolFailure;
     use crate::tool::registry::ToolRegistry;
     use futures_util::StreamExt;
-    use std::collections::VecDeque;
+    use std::collections::{HashSet, VecDeque};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
@@ -2259,6 +2341,10 @@ mod tests {
     use tokio_stream::wrappers::ReceiverStream;
 
     fn new_test_session() -> LLMSession {
+        new_test_session_with_registry(ToolRegistry::new())
+    }
+
+    fn new_test_session_with_registry(tool_registry: ToolRegistry) -> LLMSession {
         let registry = Arc::new(PluginRegistry::empty().unwrap());
         let pipeline = ApiPipeline::try_new(registry, None).unwrap();
         let config = SessionConfig {
@@ -2266,7 +2352,7 @@ mod tests {
             api_key: "test-key".into(),
             ..SessionConfig::default()
         };
-        LLMSession::new(config, pipeline, Arc::new(ToolRegistry::new())).unwrap()
+        LLMSession::new(config, pipeline, Arc::new(tool_registry)).unwrap()
     }
 
     fn stored_message(
@@ -2332,6 +2418,47 @@ mod tests {
         }
     }
 
+    fn test_tool_call(name: &str) -> ToolCall {
+        ToolCall {
+            id: Some("call_1".to_string()),
+            call_type: Some("function".to_string()),
+            function: ToolFunctionCall {
+                name: name.to_string(),
+                arguments: "{}".to_string(),
+            },
+            index: 0,
+        }
+    }
+
+    #[derive(Clone)]
+    struct CountingFailureState {
+        calls: Arc<AtomicUsize>,
+        failure: ToolFailure,
+    }
+
+    fn registry_with_failure(
+        name: &str,
+        calls: Arc<AtomicUsize>,
+        failure: ToolFailure,
+    ) -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.put_state::<crate::sense::SenseState<CountingFailureState>>(Arc::new(
+            tokio::sync::Mutex::new(CountingFailureState { calls, failure }),
+        ));
+        registry.register_async::<CountingFailureState, _>(
+            name,
+            "失败分类测试工具",
+            None::<Vec<ToolFunctionArg>>,
+            |state, _args| {
+                Box::pin(async move {
+                    state.calls.fetch_add(1, Ordering::SeqCst);
+                    Err(state.failure.clone().into())
+                })
+            },
+        );
+        registry
+    }
+
     enum MockReply {
         DelayHeaders(Duration),
         HttpBadRequest {
@@ -2353,6 +2480,10 @@ mod tests {
         },
         StreamDone {
             content: String,
+        },
+        StreamDoneRecording {
+            content: String,
+            requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         },
         StreamToolCall {
             name: String,
@@ -2446,6 +2577,15 @@ mod tests {
                 let _ = write_sse_line(&mut socket, "[DONE]".to_string()).await;
                 let _ = socket.flush().await;
             }
+            MockReply::StreamDoneRecording { content, requests } => {
+                if let Some(request) = request_json(&request) {
+                    requests.lock().unwrap().push(request);
+                }
+                let _ = write_stream_headers(&mut socket).await;
+                let _ = write_sse_line(&mut socket, stream_content_chunk(&content, None)).await;
+                let _ = write_sse_line(&mut socket, "[DONE]".to_string()).await;
+                let _ = socket.flush().await;
+            }
             MockReply::StreamToolCall { name } => {
                 let _ = write_stream_headers(&mut socket).await;
                 let _ = write_sse_line(&mut socket, stream_tool_call_chunk(&name)).await;
@@ -2484,13 +2624,16 @@ mod tests {
     }
 
     fn request_message_count(request: &[u8]) -> usize {
-        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
-            return 0;
-        };
-        serde_json::from_slice::<serde_json::Value>(&request[header_end + 4..])
-            .ok()
+        request_json(request)
             .and_then(|body| body.get("messages")?.as_array().map(Vec::len))
             .unwrap_or(0)
+    }
+
+    fn request_json(request: &[u8]) -> Option<serde_json::Value> {
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")?;
+        serde_json::from_slice(&request[header_end + 4..]).ok()
     }
 
     async fn write_bad_request(socket: &mut TcpStream, message: &str) {
@@ -3076,6 +3219,166 @@ mod tests {
         assert!(client_error.message.contains("上下文"));
         assert!(!client_error.message.contains("maximum context length"));
         assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn transient_tool_failure_retries_exactly_twice() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registry = registry_with_failure(
+            "transient_tool",
+            Arc::clone(&calls),
+            ToolFailure::Transient {
+                retry_after_ms: Some(0),
+            },
+        );
+        let mut session = new_test_session_with_registry(registry);
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
+        let mut cancel = TurnCancel::new(&cancel_rx);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut fatal_tools = HashSet::new();
+
+        assert!(
+            !session
+                .execute_tool_calls(
+                    vec![test_tool_call("transient_tool")],
+                    &None,
+                    false,
+                    false,
+                    &mut fatal_tools,
+                    &mut cancel,
+                    &event_tx,
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, SessionEvent::ToolRetrying { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_tool_failure_never_retries_and_forbids_model_retry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registry = registry_with_failure(
+            "denied_tool",
+            Arc::clone(&calls),
+            ToolFailure::Denied {
+                reason: "用户取消确认".to_string(),
+            },
+        );
+        let mut session = new_test_session_with_registry(registry);
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
+        let mut cancel = TurnCancel::new(&cancel_rx);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut fatal_tools = HashSet::new();
+
+        session
+            .execute_tool_calls(
+                vec![test_tool_call("denied_tool")],
+                &None,
+                false,
+                false,
+                &mut fatal_tools,
+                &mut cancel,
+                &event_tx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::ToolRetrying { .. }))
+        );
+        let output = events
+            .iter()
+            .find_map(|event| match event {
+                SessionEvent::ToolResult { output, .. } => Some(output),
+                _ => None,
+            })
+            .unwrap();
+        assert!(output.contains("不要重试"));
+    }
+
+    #[tokio::test]
+    async fn fatal_tool_is_removed_from_followup_request() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registry = registry_with_failure("fatal_tool", Arc::clone(&calls), ToolFailure::Fatal);
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, request_count) = spawn_mock_server(vec![
+            MockReply::StreamToolCall {
+                name: "fatal_tool".to_string(),
+            },
+            MockReply::StreamDoneRecording {
+                content: "已使用现有信息收尾".to_string(),
+                requests: Arc::clone(&requests),
+            },
+        ])
+        .await;
+        let session = new_http_test_session(url, true, Arc::new(registry)).await;
+        let (input_tx, input_rx) = mpsc::channel(1);
+        let (mut events, _handle) = session.try_run(input_rx).unwrap();
+
+        input_tx.send("调用故障工具".to_string()).await.unwrap();
+        let (status, _, _, _) = wait_for_turn_end(&mut events).await;
+        assert!(matches!(status, TurnStatus::Ok));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        let requests = requests.lock().unwrap();
+        let tools = requests[0]["tools"].as_array();
+        assert!(tools.is_none_or(|tools| {
+            tools
+                .iter()
+                .all(|tool| tool["function"]["name"].as_str() != Some("fatal_tool"))
+        }));
+        drop(input_tx);
+    }
+
+    #[tokio::test]
+    async fn tool_round_limit_finishes_with_text_instead_of_error() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, request_count) = spawn_mock_server(vec![
+            MockReply::StreamToolCall {
+                name: "unused_tool".to_string(),
+            },
+            MockReply::StreamDoneRecording {
+                content: "已根据现有结果总结".to_string(),
+                requests: Arc::clone(&requests),
+            },
+        ])
+        .await;
+        let mut session = new_http_test_session(url, true, Arc::new(ToolRegistry::new())).await;
+        session.config.max_tool_rounds = 0;
+        let (input_tx, input_rx) = mpsc::channel(1);
+        let (mut events, _handle) = session.try_run(input_rx).unwrap();
+
+        input_tx.send("执行复杂任务".to_string()).await.unwrap();
+        let (status, _, finish_reason, _) = wait_for_turn_end(&mut events).await;
+        assert!(matches!(status, TurnStatus::Ok));
+        assert_eq!(finish_reason.as_deref(), Some("tool_rounds_exhausted"));
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0]["tool_choice"], "none");
+        assert!(
+            requests[0]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| {
+                    message["role"] == "system"
+                        && message["content"]
+                            .as_str()
+                            .is_some_and(|content| content.contains("工具调用上限"))
+                })
+        );
+        drop(input_tx);
     }
 
     #[tokio::test]

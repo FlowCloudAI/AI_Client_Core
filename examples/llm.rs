@@ -115,6 +115,17 @@ async fn run_chat_loop(
                 );
             }
 
+            SessionEvent::ToolRetrying {
+                name,
+                attempt,
+                max_retries,
+                delay_ms,
+                ..
+            } => println!(
+                "\n{}[系统] 工具 {} 重试中（{}/{}, 等待 {} ms）{}",
+                SYSTEM_COLOR, name, attempt, max_retries, delay_ms, COLOR_RESET
+            ),
+
             SessionEvent::ToolResult {
                 index,
                 output,

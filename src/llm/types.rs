@@ -453,6 +453,13 @@ pub enum SessionEvent {
         name: String,
         arguments: String,
     },
+    ToolRetrying {
+        index: usize,
+        name: String,
+        attempt: usize,
+        max_retries: usize,
+        delay_ms: u64,
+    },
     ToolResult {
         index: usize,
         output: String,

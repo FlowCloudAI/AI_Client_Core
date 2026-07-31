@@ -1,5 +1,7 @@
+mod failure;
 pub mod registry;
 
+pub use failure::ToolFailure;
 pub use registry::{ToolAccess, ToolRegistry, arg_i32, arg_str};
 
 tokio::task_local! {

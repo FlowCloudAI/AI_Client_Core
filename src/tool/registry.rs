@@ -1,6 +1,6 @@
 use crate::error::{ClientError, ErrorCode};
 use crate::llm::types::ToolFunctionArg;
-use futures_util::future::BoxFuture;
+use futures_util::{FutureExt, future::BoxFuture};
 use serde_json::Value;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
@@ -325,8 +325,15 @@ impl ToolRegistry {
             }
         };
 
-        match tokio::time::timeout(timeout, handler(self, args)).await {
-            Ok(res) => res,
+        let guarded = std::panic::AssertUnwindSafe(handler(self, args)).catch_unwind();
+        match tokio::time::timeout(timeout, guarded).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(ClientError::new(
+                ErrorCode::CoreClientInternalError,
+                format!("工具内部异常: {}", func_name),
+            )
+            .with_kv("tool_id", func_name.to_string())
+            .into()),
             Err(_) => Err(ClientError::new(
                 ErrorCode::LlmToolCallTimeout,
                 format!("工具执行超时: {}", func_name),
@@ -489,5 +496,24 @@ mod tests {
         assert!(r.is_read_tool("alpha"));
         r.mark_write(&["alpha"]);
         assert!(!r.is_read_tool("alpha"));
+    }
+
+    #[tokio::test]
+    async fn handler_panic_is_converted_to_fatal_client_error() {
+        let mut registry = ToolRegistry::new();
+        registry.put_state(sense_state_new::<()>());
+        registry.register::<(), _>(
+            "panic_tool",
+            "panic 测试工具",
+            None::<Vec<ToolFunctionArg>>,
+            |_state, _args| panic!("测试 panic"),
+        );
+
+        let error = registry
+            .conduct("panic_tool", None, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        let client_error = ClientError::from_anyhow(&error).unwrap();
+        assert_eq!(client_error.code, ErrorCode::CoreClientInternalError);
     }
 }
