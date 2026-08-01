@@ -251,6 +251,26 @@ mod tests {
     }
 
     #[test]
+    fn tool_schemas_increase_request_estimate() {
+        let without_tools = ChatRequest {
+            messages: vec![Message::user("测试消息")],
+            model: "test-model".to_string(),
+            ..ChatRequest::default()
+        };
+        let mut with_tools = without_tools.clone();
+        with_tools.tools = Some(vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "search_entries",
+                "description": "搜索词条",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}
+            }
+        })]);
+
+        assert!(estimate_request_tokens(&with_tools) > estimate_request_tokens(&without_tools));
+    }
+
+    #[test]
     fn unusual_text_inputs_do_not_panic() {
         assert_eq!(estimate_text_tokens(""), 0);
         assert_eq!(estimate_text_tokens("   "), 0);
