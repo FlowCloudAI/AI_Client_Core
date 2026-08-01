@@ -60,6 +60,8 @@ pub struct ToolSpec {
     enabled: AtomicBool,
     /// None = 未标注。read_only 会话中未标注按写处理（禁止）。
     access: Option<ToolAccess>,
+    /// 等待用户主动操作的工具不受统一执行时限约束。
+    interactive: bool,
 }
 
 // ─────────────────────── 工具注册中心 ───────────────────────
@@ -259,6 +261,16 @@ impl ToolRegistry {
         self.mark_access(names, ToolAccess::Write);
     }
 
+    /// 标记会等待用户主动操作的工具；调用方负责在取消会话时结束其 future。
+    pub fn mark_interactive(&mut self, names: &[&str]) {
+        for name in names {
+            match self.tools.get_mut(*name) {
+                Some(spec) => spec.interactive = true,
+                None => log::warn!("[tool] mark_interactive 目标不存在: name={}", name),
+            }
+        }
+    }
+
     fn mark_access(&mut self, names: &[&str], access: ToolAccess) {
         for name in names {
             match self.tools.get_mut(*name) {
@@ -303,7 +315,7 @@ impl ToolRegistry {
         let empty = serde_json::json!({});
         let args = args.unwrap_or(&empty);
 
-        let handler = match self.tools.get(func_name) {
+        let (handler, interactive) = match self.tools.get(func_name) {
             Some(spec) => {
                 if !spec.enabled.load(Ordering::SeqCst) {
                     return Err(ClientError::new(
@@ -313,7 +325,7 @@ impl ToolRegistry {
                     .with_kv("tool_id", func_name.to_string())
                     .into());
                 }
-                Arc::clone(&spec.handler)
+                (Arc::clone(&spec.handler), spec.interactive)
             }
             None => {
                 return Err(ClientError::new(
@@ -326,20 +338,29 @@ impl ToolRegistry {
         };
 
         let guarded = std::panic::AssertUnwindSafe(handler(self, args)).catch_unwind();
-        match tokio::time::timeout(timeout, guarded).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(ClientError::new(
+        let execution = if interactive {
+            guarded.await
+        } else {
+            match tokio::time::timeout(timeout, guarded).await {
+                Ok(result) => result,
+                Err(_) => {
+                    return Err(ClientError::new(
+                        ErrorCode::LlmToolCallTimeout,
+                        format!("工具执行超时: {}", func_name),
+                    )
+                    .with_kv("tool_id", func_name.to_string())
+                    .with_kv("timeout_ms", timeout.as_millis() as u64)
+                    .into());
+                }
+            }
+        };
+        match execution {
+            Ok(result) => result,
+            Err(_) => Err(ClientError::new(
                 ErrorCode::CoreClientInternalError,
                 format!("工具内部异常: {}", func_name),
             )
             .with_kv("tool_id", func_name.to_string())
-            .into()),
-            Err(_) => Err(ClientError::new(
-                ErrorCode::LlmToolCallTimeout,
-                format!("工具执行超时: {}", func_name),
-            )
-            .with_kv("tool_id", func_name.to_string())
-            .with_kv("timeout_ms", timeout.as_millis() as u64)
             .into()),
         }
     }
@@ -376,6 +397,7 @@ impl ToolRegistry {
                 handler,
                 enabled: AtomicBool::new(true),
                 access: None,
+                interactive: false,
             },
         );
     }
@@ -515,5 +537,29 @@ mod tests {
             .unwrap_err();
         let client_error = ClientError::from_anyhow(&error).unwrap();
         assert_eq!(client_error.code, ErrorCode::CoreClientInternalError);
+    }
+
+    #[tokio::test]
+    async fn interactive_tool_is_not_cut_off_by_default_timeout() {
+        let mut registry = ToolRegistry::new();
+        registry.put_state(sense_state_new::<()>());
+        registry.register_async::<(), _>(
+            "review_tool",
+            "等待用户审阅",
+            None::<Vec<ToolFunctionArg>>,
+            |_state, _args| {
+                Box::pin(async {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Ok("confirmed".to_string())
+                })
+            },
+        );
+        registry.mark_interactive(&["review_tool"]);
+
+        let result = registry
+            .conduct("review_tool", None, Duration::from_millis(1))
+            .await
+            .unwrap();
+        assert_eq!(result, "confirmed");
     }
 }

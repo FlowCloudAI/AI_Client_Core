@@ -815,7 +815,10 @@ mod tests {
         assert!(next.messages.iter().any(|message| {
             message.role == "system" && message.content.as_deref() == Some("系统提示")
         }));
-        assert_eq!(next.messages.last().unwrap().content.as_deref(), Some("继续"));
+        assert_eq!(
+            next.messages.last().unwrap().content.as_deref(),
+            Some("继续")
+        );
         let tool_block_parts = next
             .messages
             .iter()
