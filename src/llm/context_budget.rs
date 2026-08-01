@@ -5,7 +5,7 @@
 
 use crate::error::{ClientError, ErrorCode};
 use crate::llm::token_estimate::{
-    estimate_messages_tokens, estimate_request_tokens, estimate_with_factor,
+    estimate_messages_tokens, estimate_request_tokens, estimate_text_tokens, estimate_with_factor,
 };
 use crate::llm::types::{ChatRequest, Message};
 use serde_json::json;
@@ -16,8 +16,11 @@ const DEFAULT_OUTPUT_RESERVE_PERCENT: u64 = 15;
 const SAFETY_RESERVE_PERCENT: u64 = 3;
 const MIN_SAFETY_RESERVE: u64 = 1024;
 const MIN_TRUNCATE_CHARS: usize = 512;
+const MIN_KEEP_CHARS: usize = 256;
+const TRUNCATION_SAFETY_FACTOR: f64 = 1.2;
 const RECENT_ROUNDS_TO_KEEP: usize = 3;
 const TRUNCATED_MARKER_PREFIX: &str = "…[已截断 ";
+const TRUNCATED_MARKER_SUFFIX: &str = " 字符]…";
 const OMITTED_ROUNDS_PREFIX: &str = "[早期 ";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -130,24 +133,58 @@ pub(crate) fn trim_request_to_budget(
     let mut actual = before;
 
     if actual > budget {
-        let mut candidates = truncation_candidates(&candidate.messages, last_user);
-        candidates.sort_by_key(|(priority, chars, index, field)| {
-            (*priority, std::cmp::Reverse(*chars), *index, *field)
-        });
-        for (_, _, index, field) in candidates {
-            if actual <= budget {
+        loop {
+            let mut candidates = truncation_candidates(&candidate.messages, last_user);
+            candidates.sort_by_key(|(priority, chars, index, field)| {
+                (*priority, std::cmp::Reverse(*chars), *index, *field)
+            });
+            let mut made_progress = false;
+
+            for (_, _, index, field) in candidates {
+                if actual <= budget {
+                    break;
+                }
+                let original = match field {
+                    TextField::Content => candidate.messages[index].content.clone(),
+                    TextField::Reasoning => candidate.messages[index].reasoning_content.clone(),
+                };
+                let Some(text) = original.as_deref() else {
+                    continue;
+                };
+                let target_chars = truncation_target_chars(
+                    text,
+                    actual.saturating_sub(budget),
+                    calibration_factor,
+                );
+                let Some(truncated) = truncate_text_to(text, target_chars) else {
+                    continue;
+                };
+
+                match field {
+                    TextField::Content => candidate.messages[index].content = Some(truncated),
+                    TextField::Reasoning => {
+                        candidate.messages[index].reasoning_content = Some(truncated)
+                    }
+                }
+                let next_actual = calibrated_request_tokens(&candidate, calibration_factor);
+                if next_actual >= actual {
+                    match field {
+                        TextField::Content => candidate.messages[index].content = original,
+                        TextField::Reasoning => {
+                            candidate.messages[index].reasoning_content = original
+                        }
+                    }
+                    continue;
+                }
+
+                truncated_indices.insert(index);
+                actual = next_actual;
+                made_progress = true;
+            }
+
+            if actual <= budget || !made_progress {
                 break;
             }
-            let slot = match field {
-                TextField::Content => &mut candidate.messages[index].content,
-                TextField::Reasoning => &mut candidate.messages[index].reasoning_content,
-            };
-            let Some(truncated) = slot.as_deref().and_then(truncate_text) else {
-                continue;
-            };
-            *slot = Some(truncated);
-            truncated_indices.insert(index);
-            actual = calibrated_request_tokens(&candidate, calibration_factor);
         }
     }
 
@@ -280,8 +317,8 @@ fn truncation_candidates(
             (TextField::Reasoning, message.reasoning_content.as_deref()),
         ] {
             let Some(text) = text else { continue };
-            let chars = text.chars().count();
-            if chars >= MIN_TRUNCATE_CHARS && !text.contains(TRUNCATED_MARKER_PREFIX) {
+            let chars = visible_text_chars(text);
+            if chars.saturating_sub(MIN_KEEP_CHARS) >= MIN_TRUNCATE_CHARS {
                 candidates.push((priority, chars, index, field));
             }
         }
@@ -289,22 +326,71 @@ fn truncation_candidates(
     candidates
 }
 
-fn truncate_text(text: &str) -> Option<String> {
-    if text.contains(TRUNCATED_MARKER_PREFIX) {
+fn truncation_target_chars(text: &str, excess_tokens: u64, calibration_factor: f64) -> usize {
+    let visible = visible_text(text);
+    let chars = visible.chars().count();
+    if chars <= MIN_KEEP_CHARS {
+        return chars;
+    }
+    let estimated_tokens = estimate_text_tokens(&visible);
+    if estimated_tokens == 0 {
+        return MIN_KEEP_CHARS;
+    }
+
+    let factor = if calibration_factor.is_finite() {
+        calibration_factor.clamp(0.5, 2.0)
+    } else {
+        1.0
+    };
+    let tokens_per_char = estimated_tokens as f64 / chars as f64;
+    let chars_to_remove = ((excess_tokens as f64 / factor) * TRUNCATION_SAFETY_FACTOR
+        / tokens_per_char)
+        .ceil() as usize;
+    chars.saturating_sub(chars_to_remove).max(MIN_KEEP_CHARS)
+}
+
+fn truncate_text_to(text: &str, target_chars: usize) -> Option<String> {
+    let (visible, prior_removed) = match parse_truncated_marker(text) {
+        Some((prefix, removed, suffix)) => (format!("{prefix}{suffix}"), removed),
+        None => (text.to_string(), 0),
+    };
+    let chars: Vec<_> = visible.chars().collect();
+    let target_chars = target_chars.max(MIN_KEEP_CHARS).min(chars.len());
+    if target_chars >= chars.len() {
         return None;
     }
-    let chars: Vec<_> = text.chars().collect();
-    if chars.len() < MIN_TRUNCATE_CHARS {
-        return None;
-    }
-    let head = chars.len() * 60 / 100;
-    let tail = chars.len() * 20 / 100;
-    let removed = chars.len().saturating_sub(head + tail);
+
+    let head = target_chars * 75 / 100;
+    let tail = target_chars - head;
+    let removed = prior_removed.saturating_add(chars.len() - target_chars);
     Some(format!(
-        "{}…[已截断 {removed} 字符]…{}",
+        "{}{}{}{}{}",
         chars[..head].iter().collect::<String>(),
+        TRUNCATED_MARKER_PREFIX,
+        removed,
+        TRUNCATED_MARKER_SUFFIX,
         chars[chars.len() - tail..].iter().collect::<String>()
     ))
+}
+
+fn parse_truncated_marker(text: &str) -> Option<(&str, usize, &str)> {
+    let (prefix, rest) = text.split_once(TRUNCATED_MARKER_PREFIX)?;
+    let (removed, suffix) = rest.split_once(TRUNCATED_MARKER_SUFFIX)?;
+    Some((prefix, removed.parse().ok()?, suffix))
+}
+
+fn visible_text(text: &str) -> String {
+    match parse_truncated_marker(text) {
+        Some((prefix, _, suffix)) => format!("{prefix}{suffix}"),
+        None => text.to_string(),
+    }
+}
+
+fn visible_text_chars(text: &str) -> usize {
+    match parse_truncated_marker(text) {
+        Some((prefix, _, suffix)) => prefix.chars().count() + suffix.chars().count(),
+        None => text.chars().count(),
+    }
 }
 
 fn conversation_rounds(messages: &[Message]) -> Vec<Vec<usize>> {
@@ -499,6 +585,75 @@ mod tests {
                 .arguments,
             "{\"safe\":true}"
         );
+    }
+
+    #[test]
+    fn 单条超大工具结果可裁剪到预算内() {
+        let mut req = request(vec![
+            Message::system("系统提示"),
+            Message::user("调用工具"),
+            Message::assistant(
+                None::<String>,
+                None::<String>,
+                Some(vec![ToolCall {
+                    id: Some("call_1".to_string()),
+                    call_type: Some("function".to_string()),
+                    function: ToolFunctionCall {
+                        name: "large_result".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                    index: 0,
+                }]),
+            ),
+            Message::tool("世".repeat(60_000), "call_1"),
+        ]);
+
+        let report = trim_request_to_budget(&mut req, 8_000, 1.0, false)
+            .unwrap()
+            .unwrap();
+        assert!(report.after <= report.budget);
+        assert_eq!(report.truncated_messages, 1);
+        assert!(
+            req.messages[3]
+                .content
+                .as_deref()
+                .is_some_and(|text| text.contains(TRUNCATED_MARKER_PREFIX))
+        );
+    }
+
+    #[test]
+    fn 重复截断累加已截字符计数() {
+        let first = truncate_text_to(&"x".repeat(4_000), 2_500).unwrap();
+        let second = truncate_text_to(&first, 1_000).unwrap();
+        let (_, removed, _) = parse_truncated_marker(&second).unwrap();
+
+        assert_eq!(removed, 3_000);
+        assert_eq!(visible_text_chars(&second), 1_000);
+    }
+
+    #[test]
+    fn 截断不会削破最小保留下限() {
+        let truncated = truncate_text_to(&"x".repeat(1_000), 1).unwrap();
+        assert_eq!(visible_text_chars(&truncated), MIN_KEEP_CHARS);
+
+        let mut req = request(vec![
+            Message::system("系统提示"),
+            Message::user("调用工具"),
+            Message::tool("x".repeat(1_000), "call_1"),
+        ]);
+        assert!(trim_request_to_budget(&mut req, 1, 1.0, false).is_err());
+    }
+
+    #[test]
+    fn 截断循环在无法继续削减时终止() {
+        let at_limit = truncate_text_to(&"x".repeat(1_000), MIN_KEEP_CHARS).unwrap();
+        let mut req = request(vec![
+            Message::system("系统提示"),
+            Message::user("调用工具"),
+            Message::tool(at_limit, "call_1"),
+        ]);
+
+        assert!(trim_request_to_budget(&mut req, 1, 1.0, false).is_err());
     }
 
     #[test]
