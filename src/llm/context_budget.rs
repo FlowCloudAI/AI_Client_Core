@@ -272,7 +272,6 @@ pub(crate) fn trim_request_to_budget_with_baseline(
             break;
         }
 
-        // ponytail: 对话轮数通常很小；若超长会话成为热点，再改为单次索引重建。
         let removed: HashSet<_> = rounds[0].iter().copied().collect();
         candidate.messages = candidate
             .messages
@@ -285,7 +284,7 @@ pub(crate) fn trim_request_to_budget_with_baseline(
         actual = calibrated_request_tokens(&candidate, calibration_factor, baseline);
     }
 
-    if dropped_rounds > 0 {
+    if dropped_rounds > 0 || prior_dropped_rounds > 0 {
         let total = prior_dropped_rounds + dropped_rounds;
         let insert_at = candidate
             .messages
@@ -745,6 +744,25 @@ mod tests {
         let full = context_budget(&req, 128_000, 1.0, EstimateSource::Full);
         let baseline = context_budget(&req, 128_000, 1.0, EstimateSource::Baseline);
         assert!(baseline > full);
+    }
+
+    #[test]
+    fn 已省略轮数标记在仅截断时也保留() {
+        let mut req = request(vec![
+            Message::system("系统提示"),
+            Message::system("[早期 4 轮对话因超出上下文已省略]"),
+            Message::user("调用工具"),
+            Message::tool("x".repeat(10_000), "call_1"),
+        ]);
+        let before = calibrated_request_tokens(&req, 1.0, None);
+        let report = trim_request_to_budget(&mut req, before - 100, 1.0, true)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(report.dropped_rounds, 0);
+        assert!(req.messages.iter().any(|message| {
+            message.content.as_deref() == Some("[早期 4 轮对话因超出上下文已省略]")
+        }));
     }
 
     #[test]

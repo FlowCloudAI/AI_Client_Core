@@ -2008,6 +2008,13 @@ const CANCEL_PLACEHOLDER_REASON: &str = "工具执行失败: 用户取消了本�
 const MAX_ROUNDS_PLACEHOLDER_REASON: &str =
     "工具执行失败: 已达最大连续工具调用轮数上限，该工具调用未执行";
 const TOOL_RETRY_DELAYS_MS: [u64; 2] = [200, 800];
+const MAX_TOOL_RETRY_DELAY_MS: u64 = 5_000;
+
+fn tool_retry_delay_ms(retry_after_ms: Option<u64>, retry_count: usize) -> u64 {
+    retry_after_ms
+        .unwrap_or(TOOL_RETRY_DELAYS_MS[retry_count])
+        .min(MAX_TOOL_RETRY_DELAY_MS)
+}
 
 impl LLMSession {
     async fn execute_tool_calls(
@@ -2222,8 +2229,7 @@ impl LLMSession {
                             if let ToolFailure::Transient { retry_after_ms } = &failure
                                 && retry_count < TOOL_RETRY_DELAYS_MS.len()
                             {
-                                let delay_ms =
-                                    retry_after_ms.unwrap_or(TOOL_RETRY_DELAYS_MS[retry_count]);
+                                let delay_ms = tool_retry_delay_ms(*retry_after_ms, retry_count);
                                 retry_count += 1;
                                 event_tx
                                     .send(SessionEvent::ToolRetrying {
@@ -2376,7 +2382,7 @@ impl LLMSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{LLMSession, TurnCancel};
+    use super::{LLMSession, TurnCancel, tool_retry_delay_ms};
     use crate::error::{ClientError, ErrorCode};
     use crate::llm::config::SessionConfig;
     use crate::llm::token_estimate::RequestBaseline;
@@ -3320,6 +3326,12 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn 外部_retry_after_不会超过上限() {
+        assert_eq!(tool_retry_delay_ms(Some(3_600_000), 0), 5_000);
+        assert_eq!(tool_retry_delay_ms(None, 1), 800);
     }
 
     #[tokio::test]
