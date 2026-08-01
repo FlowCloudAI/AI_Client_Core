@@ -75,7 +75,7 @@ impl ToolFailure {
     pub fn model_message(&self) -> String {
         match self {
             Self::Transient { .. } => {
-                "工具暂时不可用（已重试 2 次）。请向用户说明当前故障，不要假装工具已经成功。"
+                "工具因超时或暂时性故障未完成（已重试 2 次）。请向用户说明当前故障，不要假装工具已经成功。"
                     .to_string()
             }
             Self::Denied { reason } => format!(
@@ -112,6 +112,11 @@ mod tests {
             ToolFailure::Transient {
                 retry_after_ms: Some(250)
             }
+        );
+        assert!(
+            ToolFailure::classify(&error)
+                .model_message()
+                .contains("超时")
         );
     }
 

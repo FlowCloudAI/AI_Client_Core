@@ -3333,6 +3333,19 @@ mod tests {
                 .count(),
             2
         );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::Error(_)))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ToolResult {
+                output,
+                is_error: true,
+                ..
+            } if output.contains("超时")
+        )));
     }
 
     #[test]
