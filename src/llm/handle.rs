@@ -191,6 +191,12 @@ impl SessionHandle {
             .collect()
     }
 
+    /// 在同一次读锁内取出全部节点与 head，避免快照出现 nodes/head 不一致。
+    pub async fn tree_snapshot(&self) -> (Vec<ConversationNode>, Option<u64>) {
+        let tree = self.tree.read().await;
+        (tree.all_nodes().into_iter().cloned().collect(), tree.head())
+    }
+
     /// 获取指定节点详情。
     pub async fn get_node(&self, id: u64) -> Option<ConversationNode> {
         self.tree.read().await.get_node(id).cloned()

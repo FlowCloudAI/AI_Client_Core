@@ -211,7 +211,14 @@ impl LLMSession {
                 );
             }
             // 设置 head：优先使用显式 head，其次退化为最后一条消息
-            let effective_head = head.or(last_id);
+            let persisted_head_valid = head.is_some_and(|h| tree.get_node(h).is_some());
+            if head.is_some() && !persisted_head_valid {
+                log::warn!(
+                    "[client:session][preload_history_invalid_head] head={:?} 已退回最后一条消息",
+                    head
+                );
+            }
+            let effective_head = head.filter(|_| persisted_head_valid).or(last_id);
             if let Some(h) = effective_head {
                 let _ = tree.set_head(h);
             }
@@ -3841,6 +3848,72 @@ mod tests {
         let tree = session.tree.blocking_read();
         assert_eq!(tree.get_node(1).unwrap().parent, None);
         assert_eq!(tree.path_to_head(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn 无效持久化_head_退回最后一条消息() {
+        let mut session = new_test_session();
+        session.preload_history(
+            vec![
+                stored_message(Some(1), None, "user", "问题"),
+                stored_message(Some(2), Some(1), "assistant", "回复"),
+            ],
+            Some(999),
+        );
+
+        let tree = session.tree.blocking_read();
+        assert_eq!(tree.head(), Some(2));
+        assert_eq!(tree.linearize().len(), 2);
+    }
+
+    #[test]
+    fn 有效持久化_head_被采用() {
+        let mut session = new_test_session();
+        session.preload_history(
+            vec![
+                stored_message(Some(1), None, "user", "问题"),
+                stored_message(Some(2), Some(1), "assistant", "回复"),
+            ],
+            Some(1),
+        );
+
+        let tree = session.tree.blocking_read();
+        assert_eq!(tree.head(), Some(1));
+        assert_eq!(tree.linearize().len(), 1);
+    }
+
+    #[test]
+    fn 无_head_时退回最后一条消息() {
+        let mut session = new_test_session();
+        session.preload_history(
+            vec![
+                stored_message(Some(1), None, "user", "问题"),
+                stored_message(Some(2), Some(1), "assistant", "回复"),
+            ],
+            None,
+        );
+
+        let tree = session.tree.blocking_read();
+        assert_eq!(tree.head(), Some(2));
+        assert_eq!(tree.linearize().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn 树快照的_head_必在节点集合内() {
+        let mut session = new_test_session();
+        session.preload_history(
+            vec![
+                stored_message(Some(1), None, "user", "问题"),
+                stored_message(Some(2), Some(1), "assistant", "回复"),
+            ],
+            Some(2),
+        );
+        let (input_tx, input_rx) = mpsc::channel(1);
+        let (_events, handle) = session.try_run(input_rx).unwrap();
+
+        let (nodes, head) = handle.tree_snapshot().await;
+        assert!(head.is_none_or(|head| nodes.iter().any(|node| node.id == head)));
+        drop(input_tx);
     }
 
     #[test]
