@@ -5,7 +5,8 @@
 
 use crate::error::{ClientError, ErrorCode};
 use crate::llm::token_estimate::{
-    estimate_messages_tokens, estimate_request_tokens, estimate_text_tokens, estimate_with_factor,
+    RequestBaseline, estimate_messages_tokens, estimate_request_tokens, estimate_text_tokens,
+    estimate_with_factor,
 };
 use crate::llm::types::{ChatRequest, Message};
 use serde_json::json;
@@ -15,6 +16,8 @@ use std::ops::Range;
 const DEFAULT_OUTPUT_RESERVE_PERCENT: u64 = 15;
 const SAFETY_RESERVE_PERCENT: u64 = 3;
 const MIN_SAFETY_RESERVE: u64 = 1024;
+const BASELINE_SAFETY_RESERVE_PERCENT: u64 = 1;
+const MIN_BASELINE_SAFETY_RESERVE: u64 = 512;
 const MIN_TRUNCATE_CHARS: usize = 512;
 const MIN_KEEP_CHARS: usize = 256;
 const TRUNCATION_SAFETY_FACTOR: f64 = 1.2;
@@ -31,6 +34,23 @@ pub(crate) struct ContextTrimReport {
     pub after: u64,
     pub budget: u64,
     pub suggest_compaction: bool,
+    pub estimate_source: EstimateSource,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum EstimateSource {
+    Baseline,
+    #[default]
+    Full,
+}
+
+impl EstimateSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Full => "full",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -79,14 +99,26 @@ pub(crate) fn message_blocks(messages: &[Message]) -> Vec<Range<usize>> {
     blocks
 }
 
-pub(crate) fn context_budget(request: &ChatRequest, context_window_tokens: u64, scale: f64) -> u64 {
+pub(crate) fn context_budget(
+    request: &ChatRequest,
+    context_window_tokens: u64,
+    scale: f64,
+    estimate_source: EstimateSource,
+) -> u64 {
     let output_reserve = request
         .max_tokens
         .filter(|tokens| *tokens > 0)
         .map(|tokens| tokens as u64)
         .unwrap_or_else(|| percent_ceil(context_window_tokens, DEFAULT_OUTPUT_RESERVE_PERCENT));
-    let safety_reserve =
-        percent_ceil(context_window_tokens, SAFETY_RESERVE_PERCENT).max(MIN_SAFETY_RESERVE);
+    let safety_reserve = match estimate_source {
+        EstimateSource::Baseline => {
+            percent_ceil(context_window_tokens, BASELINE_SAFETY_RESERVE_PERCENT)
+                .max(MIN_BASELINE_SAFETY_RESERVE)
+        }
+        EstimateSource::Full => {
+            percent_ceil(context_window_tokens, SAFETY_RESERVE_PERCENT).max(MIN_SAFETY_RESERVE)
+        }
+    };
     let available = context_window_tokens
         .saturating_sub(output_reserve)
         .saturating_sub(safety_reserve);
@@ -102,24 +134,50 @@ pub(crate) fn trim_request_for_window(
     request: &mut ChatRequest,
     context_window_tokens: u64,
     calibration_factor: f64,
+    baseline: Option<&RequestBaseline>,
     options: TrimOptions,
 ) -> Result<Option<ContextTrimReport>, ClientError> {
-    let budget = context_budget(request, context_window_tokens, options.budget_scale);
-    trim_request_to_budget(
+    let estimate_source = estimate_source(baseline);
+    let budget = context_budget(
+        request,
+        context_window_tokens,
+        options.budget_scale,
+        estimate_source,
+    );
+    trim_request_to_budget_with_baseline(
         request,
         budget,
         calibration_factor,
         options.force_drop_oldest_round,
+        baseline,
     )
 }
 
+#[cfg(test)]
 pub(crate) fn trim_request_to_budget(
     request: &mut ChatRequest,
     budget: u64,
     calibration_factor: f64,
     force_drop_oldest_round: bool,
 ) -> Result<Option<ContextTrimReport>, ClientError> {
-    let before = calibrated_request_tokens(request, calibration_factor);
+    trim_request_to_budget_with_baseline(
+        request,
+        budget,
+        calibration_factor,
+        force_drop_oldest_round,
+        None,
+    )
+}
+
+pub(crate) fn trim_request_to_budget_with_baseline(
+    request: &mut ChatRequest,
+    budget: u64,
+    calibration_factor: f64,
+    force_drop_oldest_round: bool,
+    baseline: Option<&RequestBaseline>,
+) -> Result<Option<ContextTrimReport>, ClientError> {
+    let estimate_source = estimate_source(baseline);
+    let before = calibrated_request_tokens(request, calibration_factor, baseline);
     if before <= budget && !force_drop_oldest_round {
         return Ok(None);
     }
@@ -166,7 +224,8 @@ pub(crate) fn trim_request_to_budget(
                         candidate.messages[index].reasoning_content = Some(truncated)
                     }
                 }
-                let next_actual = calibrated_request_tokens(&candidate, calibration_factor);
+                let next_actual =
+                    calibrated_request_tokens(&candidate, calibration_factor, baseline);
                 if next_actual >= actual {
                     match field {
                         TextField::Content => candidate.messages[index].content = original,
@@ -197,7 +256,7 @@ pub(crate) fn trim_request_to_budget(
             prior_dropped_rounds += count;
             false
         });
-        actual = calibrated_request_tokens(&candidate, calibration_factor);
+        actual = calibrated_request_tokens(&candidate, calibration_factor, baseline);
     }
 
     let mut dropped_rounds = 0;
@@ -223,7 +282,7 @@ pub(crate) fn trim_request_to_budget(
             .collect();
         dropped_rounds += 1;
         must_force_drop = false;
-        actual = calibrated_request_tokens(&candidate, calibration_factor);
+        actual = calibrated_request_tokens(&candidate, calibration_factor, baseline);
     }
 
     if dropped_rounds > 0 {
@@ -237,12 +296,17 @@ pub(crate) fn trim_request_to_budget(
             insert_at,
             Message::system(format!("[早期 {total} 轮对话因超出上下文已省略]")),
         );
-        actual = calibrated_request_tokens(&candidate, calibration_factor);
+        actual = calibrated_request_tokens(&candidate, calibration_factor, baseline);
     }
 
     let changed = !truncated_indices.is_empty() || dropped_rounds > 0;
     if actual > budget || (force_drop_oldest_round && !changed) {
-        return Err(context_budget_error(&candidate, budget, calibration_factor));
+        return Err(context_budget_error_with_baseline(
+            &candidate,
+            budget,
+            calibration_factor,
+            baseline,
+        ));
     }
 
     let report = ContextTrimReport {
@@ -252,17 +316,19 @@ pub(crate) fn trim_request_to_budget(
         after: actual,
         budget,
         suggest_compaction: changed,
+        estimate_source,
     };
     *request = candidate;
     Ok(changed.then_some(report))
 }
 
-pub(crate) fn context_budget_error(
+pub(crate) fn context_budget_error_with_baseline(
     request: &ChatRequest,
     budget: u64,
     calibration_factor: f64,
+    baseline: Option<&RequestBaseline>,
 ) -> ClientError {
-    let actual = calibrated_request_tokens(request, calibration_factor);
+    let actual = calibrated_request_tokens(request, calibration_factor, baseline);
     let mut largest: Vec<_> = request
         .messages
         .iter()
@@ -294,8 +360,23 @@ pub(crate) fn context_budget_error(
     .with_kv("top_3_largest_messages", json!(top_3_largest_messages))
 }
 
-fn calibrated_request_tokens(request: &ChatRequest, calibration_factor: f64) -> u64 {
-    estimate_with_factor(estimate_request_tokens(request), calibration_factor)
+pub(crate) fn calibrated_request_tokens(
+    request: &ChatRequest,
+    calibration_factor: f64,
+    baseline: Option<&RequestBaseline>,
+) -> u64 {
+    baseline.map_or_else(
+        || estimate_with_factor(estimate_request_tokens(request), calibration_factor),
+        |baseline| baseline.estimate(request, calibration_factor),
+    )
+}
+
+fn estimate_source(baseline: Option<&RequestBaseline>) -> EstimateSource {
+    if baseline.is_some() {
+        EstimateSource::Baseline
+    } else {
+        EstimateSource::Full
+    }
 }
 
 fn percent_ceil(value: u64, percent: u64) -> u64 {
@@ -560,7 +641,7 @@ mod tests {
             .iter()
             .map(|message| message.role.clone())
             .collect();
-        let before = calibrated_request_tokens(&req, 1.0);
+        let before = calibrated_request_tokens(&req, 1.0, None);
         let report = trim_request_to_budget(&mut req, before * 9 / 10, 1.0, false)
             .unwrap()
             .unwrap();
@@ -654,6 +735,63 @@ mod tests {
         ]);
 
         assert!(trim_request_to_budget(&mut req, 1, 1.0, false).is_err());
+    }
+
+    #[test]
+    fn baseline_路径使用更小安全余量() {
+        let mut req = request(vec![Message::user("问题")]);
+        req.max_tokens = Some(2_000);
+
+        let full = context_budget(&req, 128_000, 1.0, EstimateSource::Full);
+        let baseline = context_budget(&req, 128_000, 1.0, EstimateSource::Baseline);
+        assert!(baseline > full);
+    }
+
+    #[test]
+    fn 裁剪后基线仍可用于后续增量估算() {
+        let mut first = request(vec![
+            Message::system("系统提示"),
+            Message::user("调用工具"),
+            Message::assistant(
+                None::<String>,
+                None::<String>,
+                Some(vec![ToolCall {
+                    id: Some("call_1".to_string()),
+                    call_type: Some("function".to_string()),
+                    function: ToolFunctionCall {
+                        name: "large_result".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                    index: 0,
+                }]),
+            ),
+            Message::tool("世".repeat(60_000), "call_1"),
+        ]);
+        trim_request_to_budget(&mut first, 8_000, 1.0, false).unwrap();
+        let prompt_tokens = estimate_request_tokens(&first) as i64;
+        let baseline = RequestBaseline::new(prompt_tokens, &first, 1).unwrap();
+
+        let mut next = first.clone();
+        next.messages.push(Message::assistant(
+            Some("x".repeat(3_000)),
+            None::<String>,
+            None,
+        ));
+        next.messages.push(Message::user("继续"));
+        assert!(baseline.extends_request(&next, Some(2), &[1, 2]));
+
+        let before = calibrated_request_tokens(&next, 1.0, Some(&baseline));
+        let report = trim_request_to_budget_with_baseline(
+            &mut next,
+            before - 300,
+            1.0,
+            false,
+            Some(&baseline),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.estimate_source, EstimateSource::Baseline);
+        assert!(report.after <= report.budget);
     }
 
     #[test]

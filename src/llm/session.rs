@@ -3,12 +3,13 @@ use crate::http_poster::HttpPoster;
 use crate::llm::accumulator::ToolCallAccumulator;
 use crate::llm::config::SessionConfig;
 use crate::llm::context_budget::{
-    ContextTrimReport, TrimOptions, context_budget, context_budget_error, message_blocks,
-    trim_request_for_window, trim_request_to_budget,
+    ContextTrimReport, EstimateSource, TrimOptions, calibrated_request_tokens, context_budget,
+    context_budget_error_with_baseline, message_blocks, trim_request_for_window,
+    trim_request_to_budget_with_baseline,
 };
 use crate::llm::handle::SessionHandle;
 use crate::llm::stream_decoder::StreamDecoder;
-use crate::llm::token_estimate::{TokenCalibrator, estimate_request_tokens};
+use crate::llm::token_estimate::{RequestBaseline, TokenCalibrator, estimate_request_tokens};
 use crate::llm::tree::{ConversationNodeSeed, ConversationTree};
 use crate::llm::types::{
     ChatRequest, ChatResponse, CtrlMsg, DecoderEventPayload, Message, SessionEvent, ThinkingType,
@@ -123,6 +124,9 @@ pub struct LLMSession {
     /// 当前会话的 token 估算校准器。
     token_calibrator: TokenCalibrator,
 
+    /// 上一次成功请求的真实 prompt token 基线。
+    last_baseline: Option<RequestBaseline>,
+
     /// 插件注册中心（共享，只读，通过 acquire 借出 mapper）
     pipeline: ApiPipeline,
 
@@ -157,6 +161,7 @@ impl LLMSession {
             tool_registry,
             config,
             token_calibrator,
+            last_baseline: None,
             pipeline,
             turn_id: 0,
             wait_for_input_on_start: false,
@@ -241,6 +246,7 @@ impl LLMSession {
     }
 
     pub async fn set_model(&mut self, model: &str) -> &mut Self {
+        self.last_baseline = None;
         self.conversation.write().await.model = model.to_string();
         self
     }
@@ -588,6 +594,7 @@ impl LLMSession {
                 self.config.base_url = url;
                 self.config.api_key = api_key;
                 self.pipeline.try_set_plugin(Some(plugin_id))?;
+                self.last_baseline = None;
             }
             CtrlMsg::Checkout { node_id } => {
                 self.tree.write().await.checkout(node_id).map_err(|e| {
@@ -1260,12 +1267,33 @@ impl LLMSession {
         }
 
         let calibration_factor = self.token_calibrator.factor();
+        let (request_head, head_path) = {
+            let tree = self.tree.read().await;
+            (tree.head(), tree.path_to_head())
+        };
+        let baseline = self
+            .last_baseline
+            .as_ref()
+            .filter(|baseline| baseline.extends_request(req, request_head, &head_path))
+            .cloned();
+        let estimate_source = if baseline.is_some() {
+            EstimateSource::Baseline
+        } else {
+            EstimateSource::Full
+        };
+        log::info!(
+            "[client:llm][token_estimate] turn_id={} estimate_source={} messages={}",
+            self.turn_id,
+            estimate_source.as_str(),
+            req.messages.len()
+        );
         let mut outgoing = req.clone();
         if let Some(context_window_tokens) = self.config.context_window_tokens
             && let Some(report) = trim_request_for_window(
                 &mut outgoing,
                 context_window_tokens,
                 calibration_factor,
+                baseline.as_ref(),
                 TrimOptions::NORMAL,
             )?
         {
@@ -1275,7 +1303,7 @@ impl LLMSession {
         let base_estimate = estimate_request_tokens(&outgoing);
         let first_result = self.send_once(&outgoing, cancel, event_tx).await;
         let Err(ref error) = first_result else {
-            self.observe_token_usage(base_estimate, &first_result);
+            self.observe_token_usage(&outgoing, request_head, base_estimate, &first_result);
             return first_result;
         };
         let Some(client_error) = ClientError::from_anyhow(error) else {
@@ -1304,22 +1332,34 @@ impl LLMSession {
         let retry_budget = if rule == "context_length_exceeded" {
             let budget = self.config.context_window_tokens.map_or_else(
                 || {
-                    self.token_calibrator
-                        .estimate(estimate_request_tokens(&outgoing))
+                    calibrated_request_tokens(&outgoing, calibration_factor, baseline.as_ref())
                         .saturating_mul(70)
                         / 100
                 },
                 |window| {
-                    context_budget(&outgoing, window, TrimOptions::OVERFLOW_RETRY.budget_scale)
+                    context_budget(
+                        &outgoing,
+                        window,
+                        TrimOptions::OVERFLOW_RETRY.budget_scale,
+                        estimate_source,
+                    )
                 },
             );
-            let report = trim_request_to_budget(
+            let report = trim_request_to_budget_with_baseline(
                 &mut repaired,
                 budget,
                 calibration_factor,
                 TrimOptions::OVERFLOW_RETRY.force_drop_oldest_round,
+                baseline.as_ref(),
             )?
-            .ok_or_else(|| context_budget_error(&repaired, budget, calibration_factor))?;
+            .ok_or_else(|| {
+                context_budget_error_with_baseline(
+                    &repaired,
+                    budget,
+                    calibration_factor,
+                    baseline.as_ref(),
+                )
+            })?;
             Self::emit_context_trimmed(event_tx, &report).await?;
             Some(budget)
         } else {
@@ -1327,11 +1367,17 @@ impl LLMSession {
         };
         let repaired_estimate = estimate_request_tokens(&repaired);
         let repaired_result = self.send_once(&repaired, cancel, event_tx).await;
-        self.observe_token_usage(repaired_estimate, &repaired_result);
+        self.observe_token_usage(&repaired, request_head, repaired_estimate, &repaired_result);
         if let (Some(budget), Err(error)) = (retry_budget, &repaired_result)
             && ClientError::from_anyhow(error).is_some_and(Self::is_context_overflow_error)
         {
-            return Err(context_budget_error(&repaired, budget, calibration_factor).into());
+            return Err(context_budget_error_with_baseline(
+                &repaired,
+                budget,
+                calibration_factor,
+                baseline.as_ref(),
+            )
+            .into());
         }
         repaired_result
     }
@@ -1341,12 +1387,13 @@ impl LLMSession {
         report: &ContextTrimReport,
     ) -> Result<()> {
         log::warn!(
-            "[client:llm][context_trimmed] dropped_rounds={} truncated_messages={} before={} after={} budget={}",
+            "[client:llm][context_trimmed] dropped_rounds={} truncated_messages={} before={} after={} budget={} estimate_source={}",
             report.dropped_rounds,
             report.truncated_messages,
             report.before,
             report.after,
-            report.budget
+            report.budget,
+            report.estimate_source.as_str()
         );
         event_tx
             .send(SessionEvent::ContextTrimmed {
@@ -1355,12 +1402,19 @@ impl LLMSession {
                 before: report.before,
                 after: report.after,
                 suggest_compaction: report.suggest_compaction,
+                estimate_source: report.estimate_source.as_str().to_string(),
             })
             .await?;
         Ok(())
     }
 
-    fn observe_token_usage(&mut self, base_estimate: u64, result: &Result<TurnOutput>) {
+    fn observe_token_usage(
+        &mut self,
+        request: &ChatRequest,
+        request_head: Option<u64>,
+        base_estimate: u64,
+        result: &Result<TurnOutput>,
+    ) {
         let Ok((_, _, _, _, _, Some(usage))) = result else {
             return;
         };
@@ -1375,6 +1429,11 @@ impl LLMSession {
                 base_estimate,
                 factor
             );
+        }
+        if let Some(head_node_id) = request_head
+            && let Some(baseline) = RequestBaseline::new(usage.prompt_tokens, request, head_node_id)
+        {
+            self.last_baseline = Some(baseline);
         }
     }
 
@@ -2320,6 +2379,7 @@ mod tests {
     use super::{LLMSession, TurnCancel};
     use crate::error::{ClientError, ErrorCode};
     use crate::llm::config::SessionConfig;
+    use crate::llm::token_estimate::RequestBaseline;
     use crate::llm::tree::ConversationNodeSeed;
     use crate::llm::types::{
         ChatRequest, Message, SessionEvent, ToolCall, ToolFunctionArg, ToolFunctionCall,
@@ -3799,5 +3859,19 @@ mod tests {
             &TurnStatus::Cancelled,
             &None
         ));
+    }
+
+    #[tokio::test]
+    async fn 切换模型会清空真实_token_基线() {
+        let mut session = new_test_session();
+        let request = ChatRequest {
+            messages: vec![Message::user("问题")],
+            model: "old-model".to_string(),
+            ..ChatRequest::default()
+        };
+        session.last_baseline = RequestBaseline::new(100, &request, 1);
+
+        session.set_model("new-model").await;
+        assert!(session.last_baseline.is_none());
     }
 }

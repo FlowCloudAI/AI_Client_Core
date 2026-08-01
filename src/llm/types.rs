@@ -473,6 +473,7 @@ pub enum SessionEvent {
         before: u64,
         after: u64,
         suggest_compaction: bool,
+        estimate_source: String,
     },
 
     TurnEnd {

@@ -3,6 +3,8 @@
 //! 这里只做供应商无关的保守估算；真实 usage 用于按会话校准，不引入特定模型 tokenizer。
 
 use crate::llm::types::{ChatRequest, Message};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 const CJK_CHARS_PER_TOKEN: f64 = 1.5;
 const OTHER_CHARS_PER_TOKEN: f64 = 3.8;
@@ -70,6 +72,70 @@ pub fn estimate_request_tokens(request: &ChatRequest) -> u64 {
 /// 将模型校准系数应用到基础估算。
 pub fn estimate_with_factor(estimated: u64, factor: f64) -> u64 {
     (estimated as f64 * normalize_factor(factor)).ceil() as u64
+}
+
+/// 上一次成功请求的真实 prompt token 基线。
+///
+/// 仅当当前消息树仍沿着该 head 向后追加，且模型与工具集未变化时使用；
+/// `base_estimate` 用来抵消两次请求共有历史的本地估算误差。
+#[derive(Clone, Debug)]
+pub(crate) struct RequestBaseline {
+    pub prompt_tokens: u64,
+    pub base_estimate: u64,
+    pub message_count: usize,
+    pub head_node_id: u64,
+    pub tools_fingerprint: u64,
+    model: String,
+}
+
+impl RequestBaseline {
+    pub fn new(prompt_tokens: i64, request: &ChatRequest, head_node_id: u64) -> Option<Self> {
+        (prompt_tokens > 0).then(|| Self {
+            prompt_tokens: prompt_tokens as u64,
+            base_estimate: estimate_request_tokens(request),
+            message_count: request.messages.len(),
+            head_node_id,
+            tools_fingerprint: tools_fingerprint(request),
+            model: request.model.clone(),
+        })
+    }
+
+    pub fn extends_request(
+        &self,
+        request: &ChatRequest,
+        current_head: Option<u64>,
+        head_path: &[u64],
+    ) -> bool {
+        request.messages.len() > self.message_count
+            && current_head.is_some_and(|head| head != self.head_node_id)
+            && head_path.contains(&self.head_node_id)
+            && request.model == self.model
+            && tools_fingerprint(request) == self.tools_fingerprint
+    }
+
+    /// 用真实历史基线加上本次请求的估算增量，避免重复估算整段长历史。
+    pub fn estimate(&self, request: &ChatRequest, calibration_factor: f64) -> u64 {
+        let current = estimate_request_tokens(request);
+        if current >= self.base_estimate {
+            self.prompt_tokens.saturating_add(estimate_with_factor(
+                current - self.base_estimate,
+                calibration_factor,
+            ))
+        } else {
+            self.prompt_tokens.saturating_sub(estimate_with_factor(
+                self.base_estimate - current,
+                calibration_factor,
+            ))
+        }
+    }
+}
+
+fn tools_fingerprint(request: &ChatRequest) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    serde_json::to_vec(&request.tools)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    hasher.finish()
 }
 
 /// 单会话 EMA 校准器；跨会话持久化由上层按供应商与模型负责。
@@ -190,5 +256,42 @@ mod tests {
         assert_eq!(estimate_text_tokens("   "), 0);
         assert!(estimate_text_tokens("😀🚀✨") > 0);
         assert!(estimate_text_tokens(&"x".repeat(100_000)) > 0);
+    }
+
+    #[test]
+    fn 前缀成立时使用真实基线() {
+        let first = ChatRequest {
+            messages: vec![Message::system("系统"), Message::user("第一问")],
+            model: "test-model".to_string(),
+            ..ChatRequest::default()
+        };
+        let baseline = RequestBaseline::new(100, &first, 1).unwrap();
+        let mut next = first.clone();
+        next.messages
+            .push(Message::assistant(Some("第一答"), None::<String>, None));
+
+        assert!(baseline.extends_request(&next, Some(2), &[1, 2]));
+        assert_eq!(
+            baseline.estimate(&next, 1.0),
+            100 + estimate_messages_tokens(&next.messages[2..])
+        );
+    }
+
+    #[test]
+    fn checkout_和工具变化会使基线失效() {
+        let first = ChatRequest {
+            messages: vec![Message::user("第一问")],
+            model: "test-model".to_string(),
+            tools: Some(vec![serde_json::json!({"name": "search"})]),
+            ..ChatRequest::default()
+        };
+        let baseline = RequestBaseline::new(100, &first, 1).unwrap();
+        let mut next = first.clone();
+        next.messages
+            .push(Message::assistant(Some("第一答"), None::<String>, None));
+
+        assert!(!baseline.extends_request(&next, Some(3), &[2, 3]));
+        next.tools = Some(vec![serde_json::json!({"name": "write"})]);
+        assert!(!baseline.extends_request(&next, Some(2), &[1, 2]));
     }
 }
