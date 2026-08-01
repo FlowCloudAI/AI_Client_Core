@@ -89,10 +89,35 @@ pub(crate) struct RequestBaseline {
 }
 
 impl RequestBaseline {
+    /// 建立基线前先校验供应商 usage 与本地估算的口径是否一致。
+    ///
+    /// 基线会被 `estimate` 当作绝对锚点使用，且启用更小的安全余量，因此这里沿用
+    /// 与 `TokenCalibrator` 相同的 `[0.5, 2.0]` 边界：插件 mapper 由第三方实现，
+    /// 若只映射了部分输入 token（例如漏掉缓存命中部分），偏离会远超该范围，
+    /// 此时拒绝建立基线并回落到全量估算，避免上下文预算保护被静默绕过。
     pub fn new(prompt_tokens: i64, request: &ChatRequest, head_node_id: u64) -> Option<Self> {
-        (prompt_tokens > 0).then(|| Self {
+        if prompt_tokens <= 0 {
+            return None;
+        }
+        let base_estimate = estimate_request_tokens(request);
+        if base_estimate == 0 {
+            return None;
+        }
+
+        let ratio = prompt_tokens as f64 / base_estimate as f64;
+        if !(MIN_CALIBRATION_FACTOR..=MAX_CALIBRATION_FACTOR).contains(&ratio) {
+            log::warn!(
+                "[client:llm][baseline_rejected] prompt_tokens={} base_estimate={} ratio={:.3}",
+                prompt_tokens,
+                base_estimate,
+                ratio
+            );
+            return None;
+        }
+
+        Some(Self {
             prompt_tokens: prompt_tokens as u64,
-            base_estimate: estimate_request_tokens(request),
+            base_estimate,
             message_count: request.messages.len(),
             head_node_id,
             tools_fingerprint: tools_fingerprint(request),
@@ -285,7 +310,8 @@ mod tests {
             model: "test-model".to_string(),
             ..ChatRequest::default()
         };
-        let baseline = RequestBaseline::new(100, &first, 1).unwrap();
+        let prompt_tokens = estimate_request_tokens(&first) as i64;
+        let baseline = RequestBaseline::new(prompt_tokens, &first, 1).unwrap();
         let mut next = first.clone();
         next.messages
             .push(Message::assistant(Some("第一答"), None::<String>, None));
@@ -293,8 +319,28 @@ mod tests {
         assert!(baseline.extends_request(&next, Some(2), &[1, 2]));
         assert_eq!(
             baseline.estimate(&next, 1.0),
-            100 + estimate_messages_tokens(&next.messages[2..])
+            prompt_tokens as u64 + estimate_messages_tokens(&next.messages[2..])
         );
+    }
+
+    #[test]
+    fn 供应商用量偏离本地估算时拒绝建立基线() {
+        let request = ChatRequest {
+            messages: vec![Message::user("正".repeat(1_000))],
+            model: "test-model".to_string(),
+            ..ChatRequest::default()
+        };
+        let base_estimate = estimate_request_tokens(&request) as i64;
+
+        // 口径一致：正常建立（取值明确落在 [0.5, 2.0] 内，避开整数除法的边界抖动）
+        assert!(RequestBaseline::new(base_estimate, &request, 1).is_some());
+        assert!(RequestBaseline::new(base_estimate * 6 / 10, &request, 1).is_some());
+        assert!(RequestBaseline::new(base_estimate * 18 / 10, &request, 1).is_some());
+
+        // 口径不一致：拒绝，两个方向都要挡住
+        assert!(RequestBaseline::new(base_estimate / 3, &request, 1).is_none());
+        assert!(RequestBaseline::new(base_estimate * 3, &request, 1).is_none());
+        assert!(RequestBaseline::new(0, &request, 1).is_none());
     }
 
     #[test]
@@ -305,7 +351,8 @@ mod tests {
             tools: Some(vec![serde_json::json!({"name": "search"})]),
             ..ChatRequest::default()
         };
-        let baseline = RequestBaseline::new(100, &first, 1).unwrap();
+        let baseline =
+            RequestBaseline::new(estimate_request_tokens(&first) as i64, &first, 1).unwrap();
         let mut next = first.clone();
         next.messages
             .push(Message::assistant(Some("第一答"), None::<String>, None));

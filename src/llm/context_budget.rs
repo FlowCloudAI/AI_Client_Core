@@ -810,6 +810,43 @@ mod tests {
         .unwrap();
         assert_eq!(report.estimate_source, EstimateSource::Baseline);
         assert!(report.after <= report.budget);
+
+        // 基线路径与全量路径共用同一套结构变换，这里对关键不变量做一次交叉确认
+        assert!(next.messages.iter().any(|message| {
+            message.role == "system" && message.content.as_deref() == Some("系统提示")
+        }));
+        assert_eq!(next.messages.last().unwrap().content.as_deref(), Some("继续"));
+        let tool_block_parts = next
+            .messages
+            .iter()
+            .filter(|message| {
+                message.role == "tool"
+                    || message
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|calls| !calls.is_empty())
+            })
+            .count();
+        assert!(tool_block_parts == 0 || tool_block_parts == 2);
+    }
+
+    #[test]
+    fn 污染的供应商用量不会成为基线锚点() {
+        let req = request(vec![
+            Message::system("系统提示"),
+            Message::user("正".repeat(120_000)),
+        ]);
+        let full = calibrated_request_tokens(&req, 1.0, None);
+        assert!(full > 50_000);
+
+        // 插件只映射了未命中缓存的输入 token 时，usage 会远低于真实上下文
+        let baseline = RequestBaseline::new(50, &req, 1);
+        assert!(baseline.is_none(), "偏离本地估算过大的 usage 不应建立基线");
+        assert_eq!(
+            calibrated_request_tokens(&req, 1.0, baseline.as_ref()),
+            full,
+            "拒绝基线后必须回落到全量估算，而不是被污染的锚点"
+        );
     }
 
     #[test]
