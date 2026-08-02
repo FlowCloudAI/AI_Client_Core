@@ -214,7 +214,7 @@ fn shared_client(cell: &'static OnceLock<Client>, no_compression: bool) -> Resul
 
 #[derive(Debug, Clone)]
 pub struct HttpPoster {
-    /// 每请求超时秒数；0 = 不限。
+    /// 非流式请求总超时；流式请求仅限制等待响应头的时长；0 = 不限。
     request_timeout: u64,
     /// 单行 / 响应体总字节上限；0 = 不限。
     max_line_bytes: usize,
@@ -317,8 +317,29 @@ impl HttpPoster {
             body.len()
         );
         let client = shared_client(&STREAM_CLIENT, true)?;
-        let req = self.apply_timeout(Self::build_request(&client, url, key, body));
-        let res = self.send_ok(req, url).await?;
+        let req = Self::build_request(&client, url, key, body);
+        let res = if self.request_timeout > 0 {
+            match tokio::time::timeout(
+                Duration::from_secs(self.request_timeout),
+                self.send_ok(req, url),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(
+                        ClientError::new(ErrorCode::HttpTimeout, "等待流式响应开始超时")
+                            .with_kv("phase", "http_stream_start")
+                            .with_kv("url", url.to_string())
+                            .with_kv("timeout_seconds", self.request_timeout)
+                            .with_kv("retryable", true)
+                            .into(),
+                    );
+                }
+            }
+        } else {
+            self.send_ok(req, url).await?
+        };
 
         // bytes_stream → AsyncRead
         let byte_stream = res.bytes_stream().map_err(std::io::Error::other);
@@ -429,6 +450,38 @@ mod tests {
             .unwrap();
 
         assert_eq!(body, "{\n  \"ok\": true\n}");
+    }
+
+    #[tokio::test]
+    async fn stream_timeout_only_limits_response_start() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            socket.write_all(b"data: first\n").await.unwrap();
+            socket.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1_200)).await;
+            socket.write_all(b"data: second\n").await.unwrap();
+        });
+
+        let poster = HttpPoster::new(1, 1024).unwrap();
+        let url = format!("http://{address}");
+        let stream = poster
+            .post_json(&url, "test-key", "{}".to_string())
+            .await
+            .unwrap();
+        tokio::pin!(stream);
+
+        assert_eq!(stream.next().await.unwrap().unwrap(), "data: first");
+        assert_eq!(stream.next().await.unwrap().unwrap(), "data: second");
     }
 
     #[test]
