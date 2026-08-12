@@ -376,6 +376,12 @@ pub struct TTSResult {
     /// 音频格式
     pub format: String,
 
+    /// 裸 PCM 解码所需的采样率
+    pub sample_rate: Option<u32>,
+
+    /// 裸 PCM 解码所需的声道数
+    pub channels: Option<u16>,
+
     /// 音频时长（毫秒）
     pub duration_ms: Option<u64>,
 

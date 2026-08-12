@@ -125,6 +125,8 @@ impl TTSSession {
             format: extra
                 .and_then(|e| e.audio_format.clone())
                 .unwrap_or_else(|| "mp3".to_string()),
+            sample_rate: extra.and_then(|e| e.audio_sample_rate),
+            channels: extra.and_then(|e| e.audio_channel).map(u16::from),
             duration_ms: extra.and_then(|e| e.audio_length),
             size: extra.and_then(|e| e.audio_size),
             usage_characters: extra.and_then(|e| e.usage_characters),

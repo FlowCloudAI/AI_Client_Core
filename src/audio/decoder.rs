@@ -44,6 +44,13 @@ pub enum AudioSource {
 
     /// 原始字节
     Raw(Vec<u8>),
+
+    /// 无容器头的 16 位小端 PCM 字节
+    Pcm {
+        data: Vec<u8>,
+        sample_rate: u32,
+        channels: u16,
+    },
 }
 
 impl AudioSource {
@@ -107,6 +114,7 @@ impl AudioDecoder {
                 .map_err(|e| decode_err("base64 音频解码失败", e).into()),
             AudioSource::Url(url) => Self::fetch_url(url).await,
             AudioSource::Raw(bytes) => Ok(bytes.clone()),
+            AudioSource::Pcm { data, .. } => Ok(data.clone()),
         }
     }
 
@@ -227,6 +235,25 @@ impl AudioDecoder {
         })
     }
 
+    /// 将无容器头的 16 位小端 PCM 字节转换为播放采样。
+    pub fn decode_pcm_s16le(data: &[u8], sample_rate: u32, channels: u16) -> Result<DecodedAudio> {
+        if sample_rate == 0 || channels == 0 {
+            return Err(decode_err("PCM 音频参数无效", "zero_sample_rate_or_channels").into());
+        }
+        if data.is_empty() || !data.len().is_multiple_of(2 * usize::from(channels)) {
+            return Err(decode_err("PCM 音频数据不完整", format!("bytes={}", data.len())).into());
+        }
+
+        Ok(DecodedAudio {
+            samples: data
+                .chunks_exact(2)
+                .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / 32768.0)
+                .collect(),
+            sample_rate,
+            channels,
+        })
+    }
+
     // ── 一站式方法 ──
 
     /// 从 AudioSource 解析 + 解码为 PCM。
@@ -234,6 +261,14 @@ impl AudioDecoder {
         source: &AudioSource,
         format_hint: Option<&str>,
     ) -> Result<DecodedAudio> {
+        if let AudioSource::Pcm {
+            data,
+            sample_rate,
+            channels,
+        } = source
+        {
+            return Self::decode_pcm_s16le(data, *sample_rate, *channels);
+        }
         let bytes = Self::resolve(source).await?;
         Self::decode(&bytes, format_hint)
     }
@@ -357,5 +392,28 @@ impl AudioDecoder {
         tokio::task::spawn_blocking(move || Self::play_cancelable(&audio, cancelled))
             .await
             .map_err(|e| playback_err("播放任务 panic", e))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AudioDecoder, AudioSource};
+
+    #[tokio::test]
+    async fn 裸_pcm_无需探测容器格式即可解码() {
+        let audio = AudioDecoder::decode_source(
+            &AudioSource::Pcm {
+                data: vec![0, 0, 0xff, 0x7f, 0, 0x80],
+                sample_rate: 24_000,
+                channels: 1,
+            },
+            Some("pcm"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(audio.sample_rate, 24_000);
+        assert_eq!(audio.channels, 1);
+        assert_eq!(audio.samples, vec![0.0, 32767.0 / 32768.0, -1.0]);
     }
 }
