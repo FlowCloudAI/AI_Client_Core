@@ -4,13 +4,13 @@ use cpal::StreamConfig;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::io::Cursor;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
-use tokio::sync::Mutex;
 
 use crate::error::{ClientError, ErrorCode};
 
@@ -20,6 +20,12 @@ fn decode_err(message: impl Into<String>, source: impl ToString) -> ClientError 
 
 fn playback_err(message: impl Into<String>, source: impl ToString) -> ClientError {
     ClientError::new(ErrorCode::AudioPlaybackFailed, message).with_kv("source", source.to_string())
+}
+
+enum PlaybackEnd {
+    Completed,
+    Cancelled,
+    Failed(ClientError),
 }
 
 // ─────────────────────── 音频来源 ──────────────────────────
@@ -238,6 +244,14 @@ impl AudioDecoder {
     ///
     /// 阻塞直到播放完成。在 async 上下文中应 spawn_blocking。
     pub fn play(audio: &DecodedAudio) -> Result<()> {
+        Self::play_cancelable(audio, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// 播放到结束或取消；取消属于正常结束，不能恢复。
+    pub fn play_cancelable(audio: &DecodedAudio, cancelled: Arc<AtomicBool>) -> Result<()> {
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or_else(|| {
             ClientError::new(ErrorCode::AudioDeviceUnavailable, "未找到默认音频输出设备")
@@ -250,35 +264,44 @@ impl AudioDecoder {
         };
 
         let samples = Arc::new(audio.samples.clone());
-        let position = Arc::new(Mutex::new(0usize));
         let total = samples.len();
 
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-
-        let samples_clone = Arc::clone(&samples);
-        let position_clone = Arc::clone(&position);
-        let done_tx_clone = done_tx.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<PlaybackEnd>();
+        let reported = Arc::new(AtomicBool::new(false));
+        let cancelled_callback = Arc::clone(&cancelled);
+        let reported_callback = Arc::clone(&reported);
+        let reported_error = Arc::clone(&reported);
+        let done_tx_error = done_tx.clone();
+        let mut position = 0usize;
 
         let stream = device
             .build_output_stream(
                 &config,
                 move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    // 同步锁，在音频回调中不能用 async
-                    let mut pos = position_clone.blocking_lock();
+                    if cancelled_callback.load(Ordering::Acquire) {
+                        output.fill(0.0);
+                        if !reported_callback.swap(true, Ordering::AcqRel) {
+                            let _ = done_tx.send(PlaybackEnd::Cancelled);
+                        }
+                        return;
+                    }
                     for sample in output.iter_mut() {
-                        if *pos < total {
-                            *sample = samples_clone[*pos];
-                            *pos += 1;
+                        if position < total {
+                            *sample = samples[position];
+                            position += 1;
                         } else {
                             *sample = 0.0;
                         }
                     }
-                    if *pos >= total {
-                        let _ = done_tx_clone.send(());
+                    if position >= total && !reported_callback.swap(true, Ordering::AcqRel) {
+                        let _ = done_tx.send(PlaybackEnd::Completed);
                     }
                 },
                 move |err| {
-                    log::warn!("[AudioDecoder] playback error: {}", err);
+                    if !reported_error.swap(true, Ordering::AcqRel) {
+                        let _ = done_tx_error
+                            .send(PlaybackEnd::Failed(playback_err("音频输出流运行失败", err)));
+                    }
                 },
                 None,
             )
@@ -288,11 +311,24 @@ impl AudioDecoder {
             .play()
             .map_err(|e| playback_err("启动音频播放失败", e))?;
 
-        // 等待播放完成
-        let _ = done_rx.recv();
-
-        // 给一点时间让最后的 buffer flush
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        loop {
+            match done_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(PlaybackEnd::Completed) => {
+                    // 等最后一个 buffer 交给系统音频设备。
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    break;
+                }
+                Ok(PlaybackEnd::Cancelled) => break,
+                Ok(PlaybackEnd::Failed(error)) => return Err(error.into()),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    if cancelled.load(Ordering::Acquire) =>
+                {
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(error) => return Err(playback_err("等待音频播放结束失败", error).into()),
+            }
+        }
 
         drop(stream);
         Ok(())
@@ -302,8 +338,23 @@ impl AudioDecoder {
     ///
     /// 在 async 上下文中使用，播放部分自动 spawn_blocking。
     pub async fn play_source(source: &AudioSource, format_hint: Option<&str>) -> Result<()> {
+        Self::play_source_cancelable(source, format_hint, Arc::new(AtomicBool::new(false))).await
+    }
+
+    /// 一站式解码并播放到结束或取消。
+    pub async fn play_source_cancelable(
+        source: &AudioSource,
+        format_hint: Option<&str>,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<()> {
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let audio = Self::decode_source(source, format_hint).await?;
-        tokio::task::spawn_blocking(move || Self::play(&audio))
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        tokio::task::spawn_blocking(move || Self::play_cancelable(&audio, cancelled))
             .await
             .map_err(|e| playback_err("播放任务 panic", e))?
     }

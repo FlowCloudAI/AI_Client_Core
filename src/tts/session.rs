@@ -36,6 +36,7 @@ impl TTSSession {
     /// 发送 TTSRequest，返回解码后的音频数据。
     /// 插件通过 pipeline 自动做请求/响应映射。
     pub async fn synthesize(&self, req: &TTSRequest) -> Result<TTSResult> {
+        req.validate()?;
         // 序列化 → 插件映射 → 直接得到请求体字符串
         let body = self.pipeline.prepare_request_body(req)?;
 

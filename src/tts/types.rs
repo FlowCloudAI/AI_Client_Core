@@ -1,4 +1,9 @@
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
+
+use crate::error::{ClientError, ErrorCode};
+
+const MAX_TTS_TEXT_CHARACTERS: usize = 10_000;
 
 // ─────────────────────── 请求类型 ───────────────────────
 
@@ -75,6 +80,28 @@ impl TTSRequest {
         }
     }
 
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.text.trim().is_empty() {
+            return Err(
+                ClientError::new(ErrorCode::ValidationMissingField, "TTS 文本不能为空")
+                    .with_kv("field", "text")
+                    .into(),
+            );
+        }
+        let characters = self.text.chars().count();
+        if characters > MAX_TTS_TEXT_CHARACTERS {
+            return Err(ClientError::new(
+                ErrorCode::ValidationFormatError,
+                format!("TTS 文本不能超过 {MAX_TTS_TEXT_CHARACTERS} 个字符"),
+            )
+            .with_kv("field", "text")
+            .with_kv("characters", characters)
+            .with_kv("max_characters", MAX_TTS_TEXT_CHARACTERS)
+            .into());
+        }
+        Ok(())
+    }
+
     pub fn format(mut self, format: AudioFormat) -> Self {
         let setting = self.audio_setting.get_or_insert(AudioSetting::default());
         setting.format = Some(format);
@@ -107,6 +134,37 @@ impl TTSRequest {
     pub fn output_hex(mut self) -> Self {
         self.output_format = Some(OutputFormat::Hex);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TTSRequest;
+    use crate::error::{ClientError, ErrorCode};
+
+    #[test]
+    fn tts_文本在共享请求边界校验字符数() {
+        assert!(
+            TTSRequest::new("model", &"角".repeat(10_000), "voice")
+                .validate()
+                .is_ok()
+        );
+
+        let error = TTSRequest::new("model", &"角".repeat(10_001), "voice")
+            .validate()
+            .unwrap_err();
+        assert_eq!(
+            ClientError::from_anyhow(&error).map(|error| error.code),
+            Some(ErrorCode::ValidationFormatError),
+        );
+
+        let error = TTSRequest::new("model", "   ", "voice")
+            .validate()
+            .unwrap_err();
+        assert_eq!(
+            ClientError::from_anyhow(&error).map(|error| error.code),
+            Some(ErrorCode::ValidationMissingField),
+        );
     }
 }
 
