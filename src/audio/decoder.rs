@@ -28,6 +28,34 @@ enum PlaybackEnd {
     Failed(ClientError),
 }
 
+const PLAYBACK_PREROLL_MS: u32 = 40;
+const PLAYBACK_FADE_MS: u32 = 12;
+
+fn playback_sample(
+    samples: &[f32],
+    output_position: usize,
+    sample_rate: u32,
+    channels: u16,
+) -> Option<f32> {
+    let channels = usize::from(channels);
+    let preroll = sample_rate as usize * channels * PLAYBACK_PREROLL_MS as usize / 1000;
+    if output_position < preroll {
+        return Some(0.0);
+    }
+
+    let source_position = output_position - preroll;
+    let sample = *samples.get(source_position)?;
+    let fade = sample_rate as usize * channels * PLAYBACK_FADE_MS as usize / 1000;
+    if fade == 0 {
+        return Some(sample);
+    }
+
+    let fade_in = (source_position / channels) as f32 / (fade / channels).max(1) as f32;
+    let remaining = (samples.len() / channels).saturating_sub(source_position / channels);
+    let fade_out = remaining as f32 / (fade / channels).max(1) as f32;
+    Some(sample * fade_in.min(fade_out).min(1.0))
+}
+
 // ─────────────────────── 音频来源 ──────────────────────────
 
 /// 音频数据来源。
@@ -298,8 +326,20 @@ impl AudioDecoder {
             buffer_size: cpal::BufferSize::Default,
         };
 
+        let sample_rate = audio.sample_rate;
+        let channels = audio.channels;
         let samples = Arc::new(audio.samples.clone());
-        let total = samples.len();
+        let preroll =
+            sample_rate as usize * usize::from(channels) * PLAYBACK_PREROLL_MS as usize / 1000;
+        let total = preroll + samples.len();
+        log::info!(
+            "[audio:playback] 输出流开始 sample_rate={} channels={} samples={} preroll_ms={} fade_ms={}",
+            sample_rate,
+            channels,
+            samples.len(),
+            PLAYBACK_PREROLL_MS,
+            PLAYBACK_FADE_MS,
+        );
 
         let (done_tx, done_rx) = std::sync::mpsc::channel::<PlaybackEnd>();
         let reported = Arc::new(AtomicBool::new(false));
@@ -322,7 +362,8 @@ impl AudioDecoder {
                     }
                     for sample in output.iter_mut() {
                         if position < total {
-                            *sample = samples[position];
+                            *sample = playback_sample(&samples, position, sample_rate, channels)
+                                .unwrap_or(0.0);
                             position += 1;
                         } else {
                             *sample = 0.0;
@@ -397,7 +438,7 @@ impl AudioDecoder {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioDecoder, AudioSource};
+    use super::{AudioDecoder, AudioSource, playback_sample};
 
     #[tokio::test]
     async fn 裸_pcm_无需探测容器格式即可解码() {
@@ -415,5 +456,19 @@ mod tests {
         assert_eq!(audio.sample_rate, 24_000);
         assert_eq!(audio.channels, 1);
         assert_eq!(audio.samples, vec![0.0, 32767.0 / 32768.0, -1.0]);
+    }
+
+    #[test]
+    fn 播放启动先静音并淡入以避免设备唤醒爆音() {
+        let samples = vec![1.0; 2_000];
+        assert_eq!(playback_sample(&samples, 39, 1_000, 1), Some(0.0));
+        assert_eq!(playback_sample(&samples, 40, 1_000, 1), Some(0.0));
+        assert_eq!(playback_sample(&samples, 52, 1_000, 1), Some(1.0));
+
+        let stereo = vec![1.0; 2_000];
+        assert_eq!(
+            playback_sample(&stereo, 2_078, 1_000, 2),
+            playback_sample(&stereo, 2_079, 1_000, 2),
+        );
     }
 }
