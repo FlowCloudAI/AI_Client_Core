@@ -24,5 +24,5 @@
 ## 相关的跨仓文档（在根 `docs/`）
 
 - `docs/agreement-version-1.md` — 插件协议 `agreement-version = 1` 规范本体。同时约束 `tool_fcplug` 与 `plugins`，因此留在根目录
-- `docs/mobile_plugin_pulley_issue.md` — 移动端 wasmtime 页对齐 `SIGABRT` 根因。**结论是硬约束：移动端目标必须用 Pulley 解释器，不能用 JIT**（iOS 禁 JIT / 16KB 页）
+- `docs/devlog/2026-06-04-移动端插件-页对齐-sigabrt.md` — 移动端 wasmtime 页对齐 `SIGABRT` 根因。**结论是硬约束：移动端目标必须用 Pulley 解释器，不能用 JIT**（iOS 禁 JIT / 16KB 页）
 - `docs/archive/architecture-2026-05/Architecture_Core_AI_Client_Audit.md` — 2026-06-12 全库架构审查（归档）
